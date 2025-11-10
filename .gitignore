@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+datasets
+run.sh
+*.txt
+models
+outputs
+to_delete
+*.pt
+*.json
+uv.lock
