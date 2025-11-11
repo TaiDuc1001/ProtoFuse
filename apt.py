@@ -8,7 +8,7 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, Subset
 import random
-from collections import defaultdict
+from collections import defaultdict, Counter
 import argparse
 import datetime
 import json
@@ -16,6 +16,30 @@ import os
 from decode import APTDecoder
 import cv2
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import multiprocessing as mp
+from functools import partial
+
+def generate_confusion_matrix_plot(args):
+    cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir = args
+    
+    sub_cm = cm[start_row:end_row, start_col:end_col]
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sns.heatmap(sub_cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
+                xticklabels=[str(j) for j in range(start_col, end_col)], 
+                yticklabels=[str(j) for j in range(start_row, end_row)],
+                annot_kws={"size": 6})
+    ax.set_title(f'Confusion Matrix - Epoch {epoch} (True: {start_row}-{end_row-1}, Pred: {start_col}-{end_col-1})', fontsize=10)
+    ax.set_xlabel('Predicted Label', fontsize=8)
+    ax.set_ylabel('True Label', fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
+    plt.close()
 
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim, num_heads, dropout):
@@ -312,6 +336,8 @@ class StandaloneAPT:
         total = 0
         running_loss = 0.0
         steps = 0
+        all_preds = []
+        all_labels_list = []
         old_mode = None
         if isinstance(self.model, nn.Module) and isinstance(self.model.cfg, dict):
             old_mode = self.model.cfg.get('mode', None)
@@ -335,13 +361,15 @@ class StandaloneAPT:
                 _, predicted = torch.max(logits.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels_list.extend(labels.cpu().numpy())
 
         if old_mode is not None:
             self.model.cfg['mode'] = old_mode
         
         accuracy = 100 * correct / total
         avg_loss = running_loss / max(1, steps)
-        return {"accuracy": accuracy, "loss": avg_loss}
+        return {"accuracy": accuracy, "loss": avg_loss, "predictions": all_preds, "true_labels": all_labels_list}
     
     def predict(self, images, return_features=False):
         self.model.eval()
@@ -416,54 +444,66 @@ class StandaloneAPT:
             self.gradients = grad_output[0].detach()
 
     def generate_gradcam(self, images, target_classes):
-        self.model.eval()
+        original_mode = self.model.training
+        self.model.train()
+        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(True)
+            
         images = images.to(self.device)
         images.requires_grad_(True)
         
-        hook_a = self.model.vis_encoder.transformer.register_forward_hook(self.save_activation)
-        hook_g = self.model.vis_encoder.transformer.register_full_backward_hook(self.save_gradient)
-        
-        logits = self.model(images)
+        unpooled_images, _ = self.model.vis_encoder(images)
+        unpooled_images.retain_grad()
         
         batch_size = images.shape[0]
         gradcams = []
         
         for i in range(batch_size):
-            self.gradients = None
-            self.activations = None
-            
             target_class = target_classes[i]
-            score = logits[i, target_class]
+            
+            unpooled_single = unpooled_images[i:i+1]
+            unpooled_single = unpooled_single.permute(1, 0, 2)
+            
+            text_features = self.model.text_features.clone()
+            text_features = text_features.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
+            
+            for layer in self.model.prompt_learner:
+                text_features, _ = layer(unpooled_single, text_features)
+            
+            text_features = text_features.permute(1, 0, 2)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            
+            image_features = unpooled_images[i:i+1, 0, :]
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = image_features.unsqueeze(1)
+            
+            logit_scale = self.model.logit_scale.exp()
+            logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
+            
+            score = logits[0, target_class]
             
             self.model.zero_grad()
             score.backward(retain_graph=True)
             
-            if self.gradients is None or self.activations is None:
-                print(f"Image {i}: No gradients or activations captured!")
+            if unpooled_images.grad is None:
+                print(f"Image {i}: No gradients captured!")
                 gradcams.append(np.zeros((8, 8)))
                 continue
-                
-            gradients = self.gradients[i]
-            activations = self.activations[i]
+            gradients = unpooled_images.grad[i]
+            activations = unpooled_images[i]
             
-            print(f"Image {i}: Gradients shape: {gradients.shape}, Activations shape: {activations.shape}")
-            print(f"Image {i}: Gradients mean: {gradients.mean().item():.6f}, std: {gradients.std().item():.6f}")
-            print(f"Image {i}: Activations mean: {activations.mean().item():.6f}, std: {activations.std().item():.6f}")
-            
-            weights = torch.mean(gradients, dim=0)
-            cam = torch.sum(weights * activations, dim=-1)
+            weights = torch.mean(gradients[1:], dim=0)
+            cam = torch.sum(activations[1:] * weights, dim=-1)
             cam = F.relu(cam)
             
-            cam_before = cam[1:].detach().cpu().numpy()
-            print(f"Image {i}: Raw CAM mean: {cam_before.mean():.6f}, min: {cam_before.min():.6f}, max: {cam_before.max():.6f}")
+            cam_before = cam.detach().cpu().numpy()
             
             if cam_before.size > 0:
                 cam = (cam_before - cam_before.min()) / (cam_before.max() - cam_before.min() + 1e-8)
-                print(f"Image {i}: Normalized CAM mean: {cam.mean():.6f}, min: {cam.min():.6f}, max: {cam.max():.6f}")
                 
                 num_patches = cam.size
                 grid_size = int(np.sqrt(num_patches))
-                print(f"Image {i}: Patches: {num_patches}, Grid size: {grid_size}x{grid_size}")
                 
                 if grid_size * grid_size == num_patches:
                     cam = cam.reshape(grid_size, grid_size)
@@ -471,13 +511,12 @@ class StandaloneAPT:
                     cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
             else:
                 cam = np.zeros((8, 8))
-                print(f"Image {i}: Empty CAM, using zeros")
             
             gradcams.append(cam)
         
-        hook_a.remove()
-        hook_g.remove()
-        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(False)
+        self.model.train(original_mode)
         return gradcams
 
     def decode_adapted_prompts(self, images, entry_length=30, temperature=1.0, batch_decode_size=32):
@@ -573,10 +612,6 @@ if __name__ == "__main__":
     run_dir = os.path.join(args.output_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(run_dir)
     
-    vis_dir = os.path.join(run_dir, args.vis_dir)
-    if (args.visualize_attention or args.visualize_gradcam) and not os.path.exists(vis_dir):
-        os.makedirs(vis_dir)
-    
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=4)
     
@@ -670,6 +705,81 @@ if __name__ == "__main__":
         results = trainer.evaluate(val_loader)
         val_acc = results['accuracy']
         val_loss = results['loss']
+        all_preds = results['predictions']
+        all_labels = results['true_labels']
+        
+        epoch_dir = os.path.join(run_dir, f'epoch_{epoch:03d}')
+        os.makedirs(epoch_dir, exist_ok=True)
+        maps_dir = os.path.join(epoch_dir, 'maps')
+        os.makedirs(maps_dir, exist_ok=True)
+        cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
+        os.makedirs(cm_dir, exist_ok=True)
+        
+        cm = confusion_matrix(all_labels, all_preds)
+        
+        num_classes = cm.shape[0]
+        if num_classes > 50:
+            block_size = 50
+            step = 50
+            num_blocks_per_dim = (num_classes - block_size) // step + 1
+            
+            plot_args = []
+            for row_idx in range(num_blocks_per_dim):
+                for col_idx in range(num_blocks_per_dim):
+                    start_row = row_idx * step
+                    start_col = col_idx * step
+                    end_row = start_row + block_size
+                    end_col = start_col + block_size
+                    plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir))
+            
+            with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
+                pool.map(generate_confusion_matrix_plot, plot_args)
+        else:
+            fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
+                        xticklabels=[str(i) for i in range(num_classes)], yticklabels=[str(i) for i in range(num_classes)],
+                        annot_kws={"size": 16})
+            ax.set_title(f'Confusion Matrix - Epoch {epoch}', fontsize=12)
+            ax.set_xlabel('Predicted Label', fontsize=12)
+            ax.set_ylabel('True Label', fontsize=12)
+            plt.tight_layout()
+            plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        gt_counts = Counter(all_labels)
+        pred_counts = Counter(all_preds)
+        
+        classes = sorted(set(gt_counts.keys()) | set(pred_counts.keys()))
+        gt_values = [gt_counts.get(cls, 0) for cls in classes]
+        pred_values = [pred_counts.get(cls, 0) for cls in classes]
+        
+        fig, ax = plt.subplots(figsize=(max(12, len(classes) * 0.5), 8))
+        x = np.arange(len(classes))
+        width = 0.35
+        
+        bars1 = ax.bar(x - width/2, gt_values, width, label='Ground Truth', color='skyblue', alpha=0.8)
+        bars2 = ax.bar(x + width/2, pred_values, width, label='Predictions', color='salmon', alpha=0.8)
+        
+        ax.set_xlabel('Class', fontsize=12)
+        ax.set_ylabel('Count', fontsize=12)
+        ax.set_title(f'Class Distribution - Epoch {epoch}', fontsize=14)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(cls) for cls in classes], rotation=45, ha='right')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        for bar in bars1:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + max(gt_values + pred_values) * 0.01,
+                    f'{int(height)}', ha='center', va='bottom', fontsize=8)
+        for bar in bars2:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + max(gt_values + pred_values) * 0.01,
+                    f'{int(height)}', ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(epoch_dir, 'class_distribution.pdf'), dpi=150, bbox_inches='tight')
+        plt.close()
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -857,10 +967,10 @@ if __name__ == "__main__":
                     superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0)
                     
                     save_name = f"epoch_{epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
-                    save_path = os.path.join(vis_dir, save_name)
+                    save_path = os.path.join(maps_dir, save_name)
                     cv2.imwrite(save_path, superimposed_img)
 
-                vis_log_str = f"Saved {len(vis_images)} attention visualizations to {vis_dir}"
+                vis_log_str = f"Saved {len(vis_images)} attention visualizations to {maps_dir}"
                 print(vis_log_str)
                 with open(log_file, 'a') as f:
                     f.write(vis_log_str + '\n')
@@ -900,10 +1010,10 @@ if __name__ == "__main__":
                             superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0) # type: ignore
 
                             save_name = f"gradcam_epoch_{epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
-                            save_path = os.path.join(vis_dir, save_name)
+                            save_path = os.path.join(maps_dir, save_name)
                             cv2.imwrite(save_path, superimposed_img)
 
-                    gradcam_log_str = f"Saved {len(gradcams)} GradCAM visualizations to {vis_dir}"
+                    gradcam_log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
                     print(gradcam_log_str)
                     with open(log_file, 'a') as f:
                         f.write(gradcam_log_str + '\n')
