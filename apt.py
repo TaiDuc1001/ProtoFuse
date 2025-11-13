@@ -1,4 +1,5 @@
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,23 +42,64 @@ def generate_confusion_matrix_plot(args):
     plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
     plt.close()
 
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4, alpha=1.0, bias=False):
+        super().__init__()
+        self.r = r
+        self.alpha = alpha
+        if r > 0:
+            self.A = nn.Linear(in_features, r, bias=False)
+            self.B = nn.Linear(r, out_features, bias=bias)
+            nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.B.weight)
+        else:
+            self.A = None
+            self.B = None
+
+    def forward(self, x):
+        if self.A is None or self.B is None or self.r <= 0:
+            return torch.zeros_like(x)
+        return self.B(self.A(x)) * (self.alpha / self.r)
+
 class CrossAttention(nn.Module):
-    def __init__(self, feature_dim, num_heads, dropout):
-        super(CrossAttention, self).__init__()
-        self.cross_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads)
+    def __init__(self, feature_dim, num_heads, dropout, lora_rank=4, lora_alpha=1.0, use_lora=True):
+        super().__init__()
+        self.use_lora = use_lora and lora_rank > 0
+        self.cross_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=False)
         self.norm1 = nn.LayerNorm(feature_dim)
         self.norm2 = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
         self.feed_forward = nn.Linear(feature_dim, feature_dim)
+        if self.use_lora:
+            for p in self.cross_attn.parameters():
+                p.requires_grad = False
+            for p in self.feed_forward.parameters():
+                p.requires_grad = False
+            self.lora_q = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+            self.lora_k = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+            self.lora_v = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+            self.lora_ff = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=True)
+        else:
+            self.lora_q = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
+            self.lora_k = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
+            self.lora_v = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
+            self.lora_ff = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=True)
 
     def forward(self, unpooled, text_features):
-        cross_attn_output, attn_weights = self.cross_attn(text_features, unpooled, unpooled)
-        text_features = self.norm1(self.dropout(text_features + cross_attn_output))
-
+        if self.use_lora:
+            q = text_features + self.lora_q(text_features)
+            k = unpooled + self.lora_k(unpooled)
+            v = unpooled + self.lora_v(unpooled)
+            out, w = self.cross_attn(q, k, v)
+            text_features = self.norm1(self.dropout(text_features + out))
+            ff = self.feed_forward(text_features) + self.lora_ff(text_features)
+            text_features = self.norm2(self.dropout(text_features + ff))
+            return text_features, w
+        out, w = self.cross_attn(text_features, unpooled, unpooled)
+        text_features = self.norm1(self.dropout(text_features + out))
         ff = self.feed_forward(text_features)
         text_features = self.norm2(self.dropout(text_features + ff))
-        
-        return text_features, attn_weights 
+        return text_features, w
 
 class ImageEncoder(nn.Module):
     def __init__(self, clip_model):
@@ -145,11 +187,18 @@ class CustomCLIP(nn.Module):
         self.cfg = cfg
         self.device = device
 
+        use_lora = cfg.get('use_lora', False)
+        lora_rank = cfg.get('lora_rank', 4)
+        lora_alpha = cfg.get('lora_alpha', 1.0)
         self.prompt_learner = nn.ModuleList(
-            [CrossAttention(feature_dim=self.clip_model.text_projection.shape[1],
-                            num_heads=cfg.get('num_heads', 8),
-                            dropout=cfg.get('dropout', 0.1))
-                            for _ in range(cfg.get('num_layers', 1))]
+            [CrossAttention(
+                feature_dim=self.clip_model.text_projection.shape[1],
+                num_heads=cfg.get('num_heads', 8),
+                dropout=cfg.get('dropout', 0.1),
+                lora_rank=lora_rank if use_lora else 0,
+                lora_alpha=lora_alpha,
+                use_lora=use_lora
+            ) for _ in range(cfg.get('num_layers', 1))]
         )
         
         if cfg.get('precision', 'fp32') == 'fp16':
@@ -587,6 +636,9 @@ if __name__ == "__main__":
     parser.add_argument('--visualize_gradcam', action='store_true', help='Generate and save GradCAM heatmaps')
     parser.add_argument('--vis_dir', type=str, default='attention_maps', help='Directory to save attention maps (default: attention_maps)')
     parser.add_argument('--use_cutout', action='store_true', help='Use Cutout (RandomErasing) augmentation')
+    parser.add_argument('--use_lora', action='store_true', help='Enable LoRA adaptation in prompt learner')
+    parser.add_argument('--lora_rank', type=int, default=4, help='LoRA rank (default: 4)')
+    parser.add_argument('--lora_alpha', type=float, default=1.0, help='LoRA alpha scaling (default: 1.0)')
 
     args = parser.parse_args()
 
@@ -604,7 +656,10 @@ if __name__ == "__main__":
         'run_decoder': args.run_decoder,
         'visualize_attention': args.visualize_attention,
         'visualize_gradcam': args.visualize_gradcam,
-        'use_cutout': args.use_cutout
+        'use_cutout': args.use_cutout,
+        'use_lora': args.use_lora,
+        'lora_rank': args.lora_rank,
+        'lora_alpha': args.lora_alpha
     }
 
     if not os.path.exists(args.output_dir):
