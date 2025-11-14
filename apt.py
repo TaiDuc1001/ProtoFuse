@@ -14,16 +14,18 @@ import argparse
 import datetime
 import json
 import os
+import itertools
 from decode import APTDecoder
 import cv2
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import multiprocessing as mp
-from functools import partial
+import copy
+from thop import profile, clever_format
 
 def generate_confusion_matrix_plot(args):
     cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir = args
@@ -62,47 +64,46 @@ class LoRALinear(nn.Module):
         return self.B(self.A(x)) * (self.alpha / self.r)
 
 class CrossAttention(nn.Module):
-    def __init__(self, feature_dim, num_heads, dropout, lora_rank=4, lora_alpha=1.0, use_lora=True):
+    def __init__(self, feature_dim, num_heads, dropout):
         super().__init__()
-        self.use_lora = use_lora and lora_rank > 0
-        self.cross_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads, batch_first=False)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads)
         self.norm1 = nn.LayerNorm(feature_dim)
         self.norm2 = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
         self.feed_forward = nn.Linear(feature_dim, feature_dim)
-        if self.use_lora:
-            for p in self.cross_attn.parameters():
-                p.requires_grad = False
-            for p in self.feed_forward.parameters():
-                p.requires_grad = False
-            self.lora_q = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
-            self.lora_k = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
-            self.lora_v = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
-            self.lora_ff = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=True)
-        else:
-            self.lora_q = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
-            self.lora_k = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
-            self.lora_v = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=False)
-            self.lora_ff = LoRALinear(feature_dim, feature_dim, r=0, alpha=lora_alpha, bias=True)
 
     def forward(self, unpooled, text_features):
-        if self.use_lora:
-            q = text_features + self.lora_q(text_features)
-            k = unpooled + self.lora_k(unpooled)
-            v = unpooled + self.lora_v(unpooled)
-            out, w = self.cross_attn(q, k, v)
-            text_features = self.norm1(self.dropout(text_features + out))
-            ff = self.feed_forward(text_features) + self.lora_ff(text_features)
-            text_features = self.norm2(self.dropout(text_features + ff))
-            return text_features, w
-        out, w = self.cross_attn(text_features, unpooled, unpooled)
+        out, attn_weights = self.cross_attn(text_features, unpooled, unpooled)
         text_features = self.norm1(self.dropout(text_features + out))
         ff = self.feed_forward(text_features)
         text_features = self.norm2(self.dropout(text_features + ff))
-        return text_features, w
+        return text_features, attn_weights
+
+
+class LoRACrossAttention(CrossAttention):
+    def __init__(self, feature_dim, num_heads, dropout, lora_rank=4, lora_alpha=1.0):
+        super().__init__(feature_dim, num_heads, dropout)
+        self.use_lora = lora_rank > 0
+        self.lora_q = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+        self.lora_k = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+        self.lora_v = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=False)
+        self.lora_ff = LoRALinear(feature_dim, feature_dim, r=lora_rank, alpha=lora_alpha, bias=True)
+
+    def forward(self, unpooled, text_features):
+        if not self.use_lora:
+            return super().forward(unpooled, text_features)
+
+        q = text_features + self.lora_q(text_features)
+        k = unpooled + self.lora_k(unpooled)
+        v = unpooled + self.lora_v(unpooled)
+        out, attn_weights = self.cross_attn(q, k, v)
+        text_features = self.norm1(self.dropout(text_features + out))
+        ff = self.feed_forward(text_features) + self.lora_ff(text_features)
+        text_features = self.norm2(self.dropout(text_features + ff))
+        return text_features, attn_weights
 
 class ImageEncoder(nn.Module):
-    def __init__(self, clip_model):
+    def __init__(self, clip_model, selected_layers=None):
         super().__init__()
         visual = clip_model.visual
 
@@ -114,31 +115,54 @@ class ImageEncoder(nn.Module):
         self.ln_post = visual.ln_post
         self.proj = visual.proj
 
+        selected_layers = selected_layers or []
+        self.selected_layers = sorted(set(selected_layers))
+        self._selected_layers_set = set(self.selected_layers)
+
     def forward(self, x):
         x = x.type(self.conv1.weight.dtype)
         x = self.conv1(x)
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)
 
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], 
-                                                                        dtype=x.dtype, device=x.device), x], dim=1)
+        cls_tokens = self.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+        )
+        x = torch.cat([cls_tokens, x], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
-        
+
         x = self.ln_pre(x)
-
         x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2) 
 
-        x = self.ln_post(x)
+        collected_levels = []
+        for idx, block in enumerate(self.transformer.resblocks):
+            x = block(x)
+            if self._selected_layers_set and idx in self._selected_layers_set:
+                collected_levels.append(x.clone())
+
+        final_unpooled = x.permute(1, 0, 2)
+        final_unpooled = self.ln_post(final_unpooled)
 
         if self.proj is not None:
-            x = x @ self.proj
-        
-        unpooled = x
-        x = x[:, 0, :]
+            final_unpooled = final_unpooled @ self.proj
 
-        return unpooled, x
+        global_feature = final_unpooled[:, 0, :]
+
+        if self._selected_layers_set:
+            processed_levels = []
+            for level in collected_levels:
+                level = level.permute(1, 0, 2)
+                level = self.ln_post(level)
+                if self.proj is not None:
+                    level = level @ self.proj
+                processed_levels.append(level)
+
+            if not processed_levels:
+                processed_levels.append(final_unpooled)
+
+            return processed_levels, global_feature
+
+        return final_unpooled, global_feature
 
 CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -187,27 +211,90 @@ class CustomCLIP(nn.Module):
         self.cfg = cfg
         self.device = device
 
+        self.use_multilevel = cfg.get('use_multilevel', False)
+        self.fusion_strategy = cfg.get('multilevel_fusion', 'mean')
+
         use_lora = cfg.get('use_lora', False)
         lora_rank = cfg.get('lora_rank', 4)
         lora_alpha = cfg.get('lora_alpha', 1.0)
-        self.prompt_learner = nn.ModuleList(
-            [CrossAttention(
-                feature_dim=self.clip_model.text_projection.shape[1],
-                num_heads=cfg.get('num_heads', 8),
-                dropout=cfg.get('dropout', 0.1),
-                lora_rank=lora_rank if use_lora else 0,
-                lora_alpha=lora_alpha,
-                use_lora=use_lora
-            ) for _ in range(cfg.get('num_layers', 1))]
-        )
-        
+        prompt_dim = self.clip_model.text_projection.shape[1]
+        num_heads = cfg.get('num_heads', 8)
+        dropout = cfg.get('dropout', 0.1)
+
+        if self.use_multilevel:
+            if use_lora and lora_rank > 0:
+                raise ValueError("LoRA and multi-level APT cannot be enabled simultaneously.")
+
+            selected_layers = cfg.get('multilevel_layers', [])
+            if isinstance(selected_layers, str):
+                selected_layers = [s.strip() for s in selected_layers.split(',') if s.strip()]
+            if selected_layers is None:
+                selected_layers = []
+            parsed_layers = []
+            total_blocks = len(self.clip_model.visual.transformer.resblocks)
+            for layer in selected_layers:
+                try:
+                    idx = int(layer)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < total_blocks:
+                    parsed_layers.append(idx)
+            if not parsed_layers:
+                default_candidates = [2, 6, 10]
+                parsed_layers = [idx for idx in default_candidates if idx < total_blocks]
+            if not parsed_layers:
+                parsed_layers = [max(0, total_blocks - 1)]
+            last_idx = total_blocks - 1
+            if last_idx not in parsed_layers:
+                parsed_layers.append(last_idx)
+            self.selected_layers = sorted(set(parsed_layers))
+            self.cfg['multilevel_layers'] = self.selected_layers
+
+            self.prompt_learner = CrossAttention(
+                feature_dim=prompt_dim,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+
+            if self.fusion_strategy == 'weighted':
+                self.fusion_logits = nn.Parameter(torch.zeros(len(self.selected_layers)))
+            else:
+                self.fusion_logits = None
+        else:
+            prompt_layers = []
+            for _ in range(cfg.get('num_layers', 1)):
+                if use_lora and lora_rank > 0:
+                    prompt_layers.append(
+                        LoRACrossAttention(
+                            feature_dim=prompt_dim,
+                            num_heads=num_heads,
+                            dropout=dropout,
+                            lora_rank=lora_rank,
+                            lora_alpha=lora_alpha
+                        )
+                    )
+                else:
+                    prompt_layers.append(
+                        CrossAttention(
+                            feature_dim=prompt_dim,
+                            num_heads=num_heads,
+                            dropout=dropout
+                        )
+                    )
+            self.prompt_learner = nn.ModuleList(prompt_layers)
+            self.selected_layers = []
+            self.fusion_logits = None
+
         if cfg.get('precision', 'fp32') == 'fp16':
             self.prompt_learner = self.prompt_learner.half()
 
         for param in self.clip_model.parameters():
             param.requires_grad = False
 
-        self.vis_encoder = ImageEncoder(clip_model)
+        self.vis_encoder = ImageEncoder(
+            self.clip_model,
+            selected_layers=self.selected_layers if self.use_multilevel else None
+        )
         self.logit_scale = clip_model.logit_scale
 
         self.text_features, self.prompts = self._init_text_feats(cfg, classnames)
@@ -226,20 +313,44 @@ class CustomCLIP(nn.Module):
 
     def forward(self, image, label=None):
         with torch.no_grad():
-            unpooled_images, image_features = self.vis_encoder(image)
-            unpooled_images = unpooled_images.permute(1, 0, 2)
-
-            text_features = self.text_features.clone()
-            text_features = text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+            if self.use_multilevel:
+                unpooled_levels, image_features = self.vis_encoder(image)
+            else:
+                single_unpooled, image_features = self.vis_encoder(image)
+                unpooled_levels = [single_unpooled]
+            base_text_features = self.text_features.clone()
 
         attn_maps = []
 
-        for layer in self.prompt_learner:
-            text_features, attn_weights = layer(unpooled_images, text_features)
-            attn_maps.append(attn_weights)
+        if self.use_multilevel:
+            adapted_outputs = []
+            for level_idx, level in enumerate(unpooled_levels):
+                unpooled_level = level.permute(1, 0, 2)
+                text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_level.shape[1], -1)
+                text_features, attn_weights = self.prompt_learner(unpooled_level, text_features)
+                adapted_outputs.append(text_features)
+                attn_maps.append(attn_weights)
+
+            if self.fusion_strategy == 'weighted' and self.fusion_logits is not None and len(adapted_outputs) > 1:
+                weights = F.softmax(self.fusion_logits[:len(adapted_outputs)], dim=0)
+                fused = torch.zeros_like(adapted_outputs[0])
+                for w, out in zip(weights, adapted_outputs):
+                    fused = fused + w * out
+                text_features = fused
+            elif self.fusion_strategy == 'weighted' and self.fusion_logits is not None:
+                text_features = adapted_outputs[0]
+            else:
+                stacked = torch.stack(adapted_outputs, dim=0)
+                text_features = stacked.mean(dim=0)
+        else:
+            unpooled_images = unpooled_levels[0].permute(1, 0, 2)
+            text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+
+            for layer in self._prompt_layers_iter():
+                text_features, attn_weights = layer(unpooled_images, text_features)
+                attn_maps.append(attn_weights)
 
         text_features = text_features.permute(1, 0, 2)
-
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         
@@ -261,6 +372,22 @@ class CustomCLIP(nn.Module):
             return logits, attn_maps
 
         return logits
+
+    def _prompt_layers_iter(self):
+        if isinstance(self.prompt_learner, nn.ModuleList):
+            return self.prompt_learner
+        return [self.prompt_learner]
+
+    def trainable_parameters(self):
+        if self.use_multilevel and self.fusion_strategy == 'weighted' and self.fusion_logits is not None:
+            return itertools.chain(self.prompt_learner.parameters(), [self.fusion_logits])
+        return self.prompt_learner.parameters()
+
+    def get_trainable_parameter_names(self):
+        names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
+        if self.use_multilevel and self.fusion_strategy == 'weighted' and self.fusion_logits is not None:
+            names.append('fusion_logits')
+        return names
 
 def load_clip_to_cpu(backbone_name):
     url = clip._MODELS[backbone_name]
@@ -310,22 +437,64 @@ class StandaloneAPT:
 
         self.model = CustomCLIP(self.cfg, self.classnames, clip_model, self.device)
 
-        msg = "Turning off gradients in both the image and the text encoder"
+        total_params = sum(p.numel() for p in self.model.parameters())
+        learnable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        def format_params(num):
+            if num >= 1e9:
+                return f"{num/1e9:.2f}B"
+            elif num >= 1e6:
+                return f"{num/1e6:.2f}M"
+            elif num >= 1e3:
+                return f"{num/1e3:.2f}K"
+            else:
+                return str(num)
+        
+        flops_results = {}
+        self.model.to(self.device)
+        self.model.eval()
+        for param in self.model.parameters():
+            if param.device != self.device:
+                param.data = param.data.to(self.device)
+        
+        input_tensor = torch.randn(1, 3, 224, 224, device=self.device, dtype=torch.float32)
+        
+        flops_results = {}
+        with torch.no_grad():
+            model_copy = copy.deepcopy(self.model)
+            model_copy.to(self.device)
+            result = profile(model_copy, inputs=(input_tensor,), verbose=False)
+            if isinstance(result, (list, tuple)):
+                macs = result[0] if len(result) > 0 else 0
+            else:
+                macs = result
+            gflops_thop = macs / 1e9
+            flops_results['thop'] = gflops_thop
+            del model_copy
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        msg = f"Learnable parameters: {format_params(learnable_params)} / Total parameters: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)"
         print(msg)
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
+
+        msg = "Turning off gradients in both the image and the text encoder"
+        # print(msg)
+        if self.log_file:
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
         
+        trainable_names = set(self.model.get_trainable_parameter_names())
         for name, param in self.model.named_parameters():
-            if 'prompt_learner' not in name:
-                param.requires_grad_(False)
+            param.requires_grad_(name in trainable_names)
         
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
         msg = f"Parameters to be updated: {enabled}"
-        print(msg)
+        # print(msg)
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
@@ -335,13 +504,28 @@ class StandaloneAPT:
     def setup_optimizer(self):
         lr = self.cfg.get('learning_rate', 0.002)
         weight_decay = self.cfg.get('weight_decay', 0.0005)
+        optimizer_type = self.cfg.get('optimizer', 'SGD')
+        trainable_params = list(self.model.trainable_parameters())
         
-        self.optimizer = torch.optim.SGD(
-            self.model.prompt_learner.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=0.9
-        )
+        if optimizer_type == 'AdamW':
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=lr,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type == 'Adam':
+            self.optimizer = torch.optim.Adam(
+                trainable_params,
+                lr=lr,
+                weight_decay=weight_decay
+            )
+        else:
+            self.optimizer = torch.optim.SGD(
+                trainable_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=0.9
+            )
         
         num_epochs = self.cfg.get('num_epochs', 100)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -434,6 +618,7 @@ class StandaloneAPT:
     
     def save_model(self, path):
         checkpoint = {
+            'model_state_dict': self.model.state_dict(),
             'prompt_learner_state_dict': self.model.prompt_learner.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -448,7 +633,11 @@ class StandaloneAPT:
     
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'])
+        model_state = checkpoint.get('model_state_dict')
+        if model_state is not None:
+            self.model.load_state_dict(model_state, strict=False)
+        if 'prompt_learner_state_dict' in checkpoint:
+            self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         msg = f"Model loaded from {path}"
@@ -502,8 +691,15 @@ class StandaloneAPT:
         images = images.to(self.device)
         images.requires_grad_(True)
         
-        unpooled_images, _ = self.model.vis_encoder(images)
-        unpooled_images.retain_grad()
+        encoder_output = self.model.vis_encoder(images)
+        if self.model.use_multilevel:
+            unpooled_levels, _ = encoder_output
+            target_unpooled = unpooled_levels[-1]
+        else:
+            target_unpooled, _ = encoder_output
+            unpooled_levels = [target_unpooled]
+
+        target_unpooled.retain_grad()
         
         batch_size = images.shape[0]
         gradcams = []
@@ -511,19 +707,36 @@ class StandaloneAPT:
         for i in range(batch_size):
             target_class = target_classes[i]
             
-            unpooled_single = unpooled_images[i:i+1]
-            unpooled_single = unpooled_single.permute(1, 0, 2)
-            
-            text_features = self.model.text_features.clone()
-            text_features = text_features.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
-            
-            for layer in self.model.prompt_learner:
-                text_features, _ = layer(unpooled_single, text_features)
-            
+            base_text = self.model.text_features.clone()
+
+            if self.model.use_multilevel:
+                per_level_outputs = []
+                for level in unpooled_levels:
+                    unpooled_single = level[i:i+1].permute(1, 0, 2)
+                    text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
+                    text_features, _ = self.model.prompt_learner(unpooled_single, text_features)
+                    per_level_outputs.append(text_features)
+
+                if self.model.fusion_strategy == 'weighted' and self.model.fusion_logits is not None and len(per_level_outputs) > 1:
+                    weights = F.softmax(self.model.fusion_logits[:len(per_level_outputs)], dim=0)
+                    fused = torch.zeros_like(per_level_outputs[0])
+                    for w, out in zip(weights, per_level_outputs):
+                        fused = fused + w * out
+                    text_features = fused
+                elif self.model.fusion_strategy == 'weighted' and self.model.fusion_logits is not None:
+                    text_features = per_level_outputs[0]
+                else:
+                    text_features = torch.stack(per_level_outputs, dim=0).mean(dim=0)
+            else:
+                unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
+                text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
+                for layer in self.model._prompt_layers_iter():
+                    text_features, _ = layer(unpooled_single, text_features)
+
             text_features = text_features.permute(1, 0, 2)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             
-            image_features = unpooled_images[i:i+1, 0, :]
+            image_features = target_unpooled[i:i+1, 0, :]
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             image_features = image_features.unsqueeze(1)
             
@@ -535,12 +748,12 @@ class StandaloneAPT:
             self.model.zero_grad()
             score.backward(retain_graph=True)
             
-            if unpooled_images.grad is None:
+            if target_unpooled.grad is None:
                 print(f"Image {i}: No gradients captured!")
                 gradcams.append(np.zeros((8, 8)))
                 continue
-            gradients = unpooled_images.grad[i]
-            activations = unpooled_images[i]
+            gradients = target_unpooled.grad[i]
+            activations = target_unpooled[i]
             
             weights = torch.mean(gradients[1:], dim=0)
             cam = torch.sum(activations[1:] * weights, dim=-1)
@@ -562,6 +775,8 @@ class StandaloneAPT:
                 cam = np.zeros((8, 8))
             
             gradcams.append(cam)
+            if target_unpooled.grad is not None:
+                target_unpooled.grad.zero_()
         
         for param in self.model.vis_encoder.parameters():
             param.requires_grad_(False)
@@ -573,14 +788,34 @@ class StandaloneAPT:
         images = images.to(self.device)
 
         with torch.no_grad():
-            unpooled_images, image_features = self.model.vis_encoder(images)
-            unpooled_images = unpooled_images.permute(1, 0, 2)
+            encoder_output = self.model.vis_encoder(images)
+            if self.model.use_multilevel:
+                unpooled_levels, _ = encoder_output
+                base_text = self.model.text_features.clone()
+                adapted_outputs = []
+                for level in unpooled_levels:
+                    level_unpooled = level.permute(1, 0, 2)
+                    text_features = base_text.unsqueeze(1).expand(-1, level_unpooled.shape[1], -1)
+                    text_features, _ = self.model.prompt_learner(level_unpooled, text_features)
+                    adapted_outputs.append(text_features)
 
-            text_features = self.model.text_features.clone()
-            text_features = text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+                if self.model.fusion_strategy == 'weighted' and self.model.fusion_logits is not None and len(adapted_outputs) > 1:
+                    weights = F.softmax(self.model.fusion_logits[:len(adapted_outputs)], dim=0)
+                    fused = torch.zeros_like(adapted_outputs[0])
+                    for w, out in zip(weights, adapted_outputs):
+                        fused = fused + w * out
+                    text_features = fused
+                elif self.model.fusion_strategy == 'weighted' and self.model.fusion_logits is not None:
+                    text_features = adapted_outputs[0]
+                else:
+                    text_features = torch.stack(adapted_outputs, dim=0).mean(dim=0)
+            else:
+                unpooled_images = encoder_output[0].permute(1, 0, 2)
+                text_features = self.model.text_features.clone()
+                text_features = text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
 
-            for layer in self.model.prompt_learner:
-                text_features, _ = layer(unpooled_images, text_features)
+                for layer in self.model._prompt_layers_iter():
+                    text_features, _ = layer(unpooled_images, text_features)
 
             adapted = text_features.permute(1, 0, 2)
             
@@ -639,8 +874,26 @@ if __name__ == "__main__":
     parser.add_argument('--use_lora', action='store_true', help='Enable LoRA adaptation in prompt learner')
     parser.add_argument('--lora_rank', type=int, default=4, help='LoRA rank (default: 4)')
     parser.add_argument('--lora_alpha', type=float, default=1.0, help='LoRA alpha scaling (default: 1.0)')
+    parser.add_argument('--use_multilevel', action='store_true', help='Enable multi-level prompt adaptation')
+    parser.add_argument('--multilevel_layers', type=str, default='', help='Comma-separated ViT layer indices for multi-level adaptation')
+    parser.add_argument('--multilevel_fusion', type=str, default='mean', choices=['mean', 'weighted'], help='Fusion strategy for multi-level outputs (default: mean)')
+    parser.add_argument('--confusion_matrix', action='store_true', help='generate confusion matrices')
+    parser.add_argument('--optimizer', type=str, default='SGD', choices=['SGD', 'Adam', 'AdamW'], help='Optimizer type (default: SGD)')
 
     args = parser.parse_args()
+
+    if args.multilevel_layers:
+        multilevel_layers = []
+        for item in args.multilevel_layers.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                multilevel_layers.append(int(item))
+            except ValueError:
+                continue
+    else:
+        multilevel_layers = []
 
     cfg = {
         'backbone': args.backbone,
@@ -659,7 +912,12 @@ if __name__ == "__main__":
         'use_cutout': args.use_cutout,
         'use_lora': args.use_lora,
         'lora_rank': args.lora_rank,
-        'lora_alpha': args.lora_alpha
+        'lora_alpha': args.lora_alpha,
+        'use_multilevel': args.use_multilevel,
+        'multilevel_layers': multilevel_layers,
+        'multilevel_fusion': args.multilevel_fusion,
+        'generate_confusion_matrix': args.confusion_matrix,
+        'optimizer': args.optimizer
     }
 
     if not os.path.exists(args.output_dir):
@@ -767,39 +1025,41 @@ if __name__ == "__main__":
         os.makedirs(epoch_dir, exist_ok=True)
         maps_dir = os.path.join(epoch_dir, 'maps')
         os.makedirs(maps_dir, exist_ok=True)
-        cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
-        os.makedirs(cm_dir, exist_ok=True)
         
-        cm = confusion_matrix(all_labels, all_preds)
-        
-        num_classes = cm.shape[0]
-        if num_classes > 50:
-            block_size = 50
-            step = 50
-            num_blocks_per_dim = (num_classes - block_size) // step + 1
+        if cfg.get('generate_confusion_matrix', True):
+            cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
+            os.makedirs(cm_dir, exist_ok=True)
             
-            plot_args = []
-            for row_idx in range(num_blocks_per_dim):
-                for col_idx in range(num_blocks_per_dim):
-                    start_row = row_idx * step
-                    start_col = col_idx * step
-                    end_row = start_row + block_size
-                    end_col = start_col + block_size
-                    plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir))
+            cm = confusion_matrix(all_labels, all_preds)
             
-            with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
-                pool.map(generate_confusion_matrix_plot, plot_args)
-        else:
-            fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
-                        xticklabels=[str(i) for i in range(num_classes)], yticklabels=[str(i) for i in range(num_classes)],
-                        annot_kws={"size": 16})
-            ax.set_title(f'Confusion Matrix - Epoch {epoch}', fontsize=12)
-            ax.set_xlabel('Predicted Label', fontsize=12)
-            ax.set_ylabel('True Label', fontsize=12)
-            plt.tight_layout()
-            plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
-            plt.close()
+            num_classes = cm.shape[0]
+            if num_classes > 50:
+                block_size = 50
+                step = 50
+                num_blocks_per_dim = (num_classes - block_size) // step + 1
+                
+                plot_args = []
+                for row_idx in range(num_blocks_per_dim):
+                    for col_idx in range(num_blocks_per_dim):
+                        start_row = row_idx * step
+                        start_col = col_idx * step
+                        end_row = start_row + block_size
+                        end_col = start_col + block_size
+                        plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir))
+                
+                with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
+                    pool.map(generate_confusion_matrix_plot, plot_args)
+            else:
+                fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
+                            xticklabels=[str(i) for i in range(num_classes)], yticklabels=[str(i) for i in range(num_classes)],
+                            annot_kws={"size": 16})
+                ax.set_title(f'Confusion Matrix - Epoch {epoch}', fontsize=12)
+                ax.set_xlabel('Predicted Label', fontsize=12)
+                ax.set_ylabel('True Label', fontsize=12)
+                plt.tight_layout()
+                plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
+                plt.close()
         
         gt_counts = Counter(all_labels)
         pred_counts = Counter(all_preds)
