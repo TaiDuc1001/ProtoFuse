@@ -696,6 +696,7 @@ class APT:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train APT model")
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use (default: cuda:0)')
+    parser.add_argument('--dataset_root', type=str, default='./datasets/cub-200-2011-renamed', help='Path to dataset root')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size (default: 8)')
     parser.add_argument('--kshot', type=int, default=16, help='K-shot (default: 16)')
     parser.add_argument('--backbone', type=str, default='ViT-B/32', help='CLIP backbone (default: ViT-B/32)')
@@ -736,6 +737,7 @@ if __name__ == "__main__":
         'use_cutout': args.use_cutout,
         'generate_confusion_matrix': args.confusion_matrix,
         'optimizer': args.optimizer,
+        'dataset_root': args.dataset_root,
     }
 
     if not os.path.exists(args.output_dir):
@@ -746,7 +748,7 @@ if __name__ == "__main__":
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=4)
     
-    dataset_root = "./datasets/cub-200-2011-renamed"
+    dataset_root = args.dataset_root
     batch_size = args.batch_size
     num_epochs = args.num_epochs
     K_SHOT = args.kshot
