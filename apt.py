@@ -42,6 +42,53 @@ def generate_confusion_matrix_plot(args):
     plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
     plt.close()
 
+def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
+    if not indices:
+        return defaultdict(list)
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    entropy_per_class = defaultdict(list)
+    position = 0
+    eps = 1e-12
+
+    trainer.model.eval()
+
+    with torch.no_grad():
+        for images, labels in loader:
+            batch_size_local = images.size(0)
+            batch_indices = indices[position:position + batch_size_local]
+            position += batch_size_local
+
+            images = images.to(trainer.device)
+            logits = trainer.model(images)
+
+            if isinstance(logits, (list, tuple)):
+                logits = logits[0]
+
+            probs = torch.softmax(logits, dim=1)
+            entropy = -(probs * torch.log(probs + eps)).sum(dim=1)
+
+            for ent, lbl, idx in zip(entropy.cpu().tolist(), labels.cpu().tolist(), batch_indices):
+                entropy_per_class[int(lbl)].append((float(ent), int(idx)))
+
+    return entropy_per_class
+
+def select_high_entropy_indices(entropy_per_class, nshot):
+    if nshot <= 0:
+        return []
+
+    selected = []
+    for class_id in sorted(entropy_per_class.keys()):
+        scores = entropy_per_class[class_id]
+        if not scores:
+            continue
+        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
+        selected.extend(idx for _, idx in sorted_scores[:nshot])
+
+    return selected
+
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim, num_heads, dropout):
         super().__init__()
@@ -513,7 +560,6 @@ class APT:
         }
         torch.save(checkpoint, path)
         msg = f"Model saved to {path}"
-        print(msg)
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
@@ -717,8 +763,27 @@ if __name__ == "__main__":
     parser.add_argument('--use_cutout', action='store_true', help='Use Cutout (RandomErasing) augmentation')
     parser.add_argument('--confusion_matrix', action='store_true', help='generate confusion matrices')
     parser.add_argument('--optimizer', type=str, default='SGD', choices=['SGD', 'Adam', 'AdamW'], help='Optimizer type (default: SGD)')
+    parser.add_argument('--active_learning', type=str, default=None, choices=['entropy'], help='Active learning strategy to use (default: None)')
+    parser.add_argument('--nshot', type=int, default=0, help='Number of additional samples per class to acquire each round')
+    parser.add_argument('--val_size', type=float, default=0.2, help='Validation split size. Accepts fraction (0-1) or percentage (0-100).')
+    parser.add_argument('--rounds', type=int, default=1, help='Number of active learning rounds to run')
+    parser.add_argument('--init_per_round', action='store_true', help='Initialize a fresh model for each active learning round (instead of continuing training)')
+    parser.add_argument('--incr_epochs', type=int, default=0, help='Increase epochs by this amount for each successive round (default: 0, no increase)')
 
     args = parser.parse_args()
+
+    dataset_root = args.dataset_root
+    batch_size = args.batch_size
+    num_epochs = args.num_epochs
+    kshot = args.kshot
+    num_workers = 4
+    rounds = max(1, args.rounds)
+
+    val_fraction = args.val_size
+    if val_fraction > 1.0:
+        val_fraction = val_fraction / 100.0
+    if val_fraction < 0 or val_fraction >= 1.0:
+        raise ValueError("--val_size must be in [0, 1) or specified as 0-100 percentage.")
 
     cfg = {
         'backbone': args.backbone,
@@ -729,7 +794,7 @@ if __name__ == "__main__":
         'precision': args.precision,
         'learning_rate': args.learning_rate,
         'weight_decay': args.weight_decay,
-        'num_epochs': args.num_epochs,
+        'num_epochs': num_epochs,
         'mode': args.mode,
         'run_decoder': args.run_decoder,
         'visualize_attention': args.visualize_attention,
@@ -737,22 +802,19 @@ if __name__ == "__main__":
         'use_cutout': args.use_cutout,
         'generate_confusion_matrix': args.confusion_matrix,
         'optimizer': args.optimizer,
-        'dataset_root': args.dataset_root,
+        'dataset_root': dataset_root,
+        'active_learning': args.active_learning,
+        'nshot': args.nshot,
+        'val_size': val_fraction,
+        'rounds': rounds,
+        'initial_kshot': kshot,
+        'init_per_round': args.init_per_round,
     }
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     run_dir = os.path.join(args.output_dir, datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(run_dir)
-    
-    with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump(cfg, f, indent=4)
-    
-    dataset_root = args.dataset_root
-    batch_size = args.batch_size
-    num_epochs = args.num_epochs
-    K_SHOT = args.kshot
-    num_workers = 4
 
     clip_mean = [0.48145466, 0.4578275, 0.40821073]
     clip_std = [0.26862954, 0.26130258, 0.27577711]
@@ -780,385 +842,551 @@ if __name__ == "__main__":
     samples_by_class_idx = defaultdict(list)
     for i, (path, class_idx) in enumerate(dataset.samples):
         samples_by_class_idx[class_idx].append(i)
-    
-    random.seed(42)
-    train_indices = []
+
+    rng = random.Random(42)
     val_indices = []
+    labeled_indices = []
+    unlabeled_indices = []
 
-    for class_idx, indices in samples_by_class_idx.items():
-        random.shuffle(indices)
-        k = min(len(indices), K_SHOT)
-        train_indices.extend(indices[:k])
-        val_indices.extend(indices[k:])
+    for class_idx in sorted(samples_by_class_idx.keys()):
+        class_samples = list(samples_by_class_idx[class_idx])
+        class_samples.sort()
+        rng.shuffle(class_samples)
 
-    train_ds = Subset(dataset, train_indices)
-    val_ds = Subset(dataset, val_indices)
+        val_count = int(math.floor(len(class_samples) * val_fraction))
+        if val_fraction > 0 and val_count == 0 and len(class_samples) > 0:
+            val_count = 1
 
-    print(f"Dataset loaded: {len(dataset)} total images.")
-    print(f"Created non-episodic split: {len(train_ds)} train images ({K_SHOT}-shot), {len(val_ds)} val images.")
+        val_part = class_samples[:val_count]
+        remaining = class_samples[val_count:]
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        labeled_count = min(len(remaining), kshot)
+        labeled_part = remaining[:labeled_count]
+        unlabeled_part = remaining[labeled_count:]
+
+        val_indices.extend(val_part)
+        labeled_indices.extend(labeled_part)
+        unlabeled_indices.extend(unlabeled_part)
+
+    train_pool_size = len(labeled_indices) + len(unlabeled_indices)
+    val_percentage_actual = (len(val_indices) / len(dataset) * 100.0) if len(dataset) > 0 else 0.0
 
     classnames = dataset.classes
     cfg['classnames'] = classnames
-    
-    log_file = os.path.join(run_dir, 'training.log')
-    trainer = APT(cfg, classnames, device=args.device, log_file=log_file)
+    cfg['num_classes'] = len(classnames)
+    cfg['initial_labeled_size'] = len(labeled_indices)
+    cfg['initial_unlabeled_size'] = len(unlabeled_indices)
+    cfg['val_size_count'] = len(val_indices)
+    cfg['train_pool_size'] = train_pool_size
 
-    metrics = []
-    best_val_acc = 0
-    
+    config_path = os.path.join(run_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(cfg, f, indent=4)
+
+    print(f"Dataset loaded: {len(dataset)} total images.")
+    print(f"Validation split: {len(val_indices)} images ({val_percentage_actual:.2f}%).")
+    print(f"Train pool size: {train_pool_size} images ({len(labeled_indices)} labeled, {len(unlabeled_indices)} unlabeled).")
+
+    val_loader = None
+    if len(val_indices) > 0:
+        val_ds = Subset(dataset, val_indices)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    else:
+        print("Warning: validation split is empty; skipping validation metrics.")
+
+    if len(labeled_indices) == 0:
+        print("No labeled samples available after split. Adjust --kshot or --val-size.")
+        exit()
+
+    log_file = os.path.join(run_dir, 'training.log')
     with open(log_file, 'w') as f:
         f.write(f"Config: {cfg}\n\n")
         f.write('='*50 + '\n')
         f.write(f"Dataset loaded: {len(dataset)} total images.\n")
-        f.write(f"Created non-episodic split: {len(train_ds)} train images ({K_SHOT}-shot), {len(val_ds)} val images.\n")
+        f.write(f"Validation split: {len(val_indices)} images ({val_percentage_actual:.2f}%).\n")
+        f.write(f"Train pool size: {train_pool_size} images ({len(labeled_indices)} labeled, {len(unlabeled_indices)} unlabeled).\n")
         if cfg.get('use_cutout', False):
             f.write("Using Cutout (RandomErasing) augmentation.\n")
         f.write('\n')
         f.write('='*50 + '\n')
 
+    trainer = APT(cfg, classnames, device=args.device, log_file=log_file)
+
+    metrics = []
+    best_val_acc = -float('inf')
+    global_epoch = 0
+    sample_images = None
+    sample_labels = None
+    sample_paths = []
+    decoded_prompts = None
+    completed_rounds = 0
+
     print('\n')
     print('='*50)
-    for epoch in range(1, num_epochs + 1):
-        start_time = time.time()
-        trainer.model.train()
-        running_loss = 0.0
-        running_accuracy = 0.0
-        steps = 0
-        for batch_idx, batch in enumerate(train_loader, start=1):
-            loss_dict = trainer.train_step(batch)
-            running_loss += loss_dict['loss']
-            running_accuracy += loss_dict['accuracy']
-            steps += 1
 
-        avg_loss = running_loss / max(1, steps)
-        avg_acc = running_accuracy / max(1, steps)
-        results = trainer.evaluate(val_loader)
-        val_acc = results['accuracy']
-        val_loss = results['loss']
-        all_preds = results['predictions']
-        all_labels = results['true_labels']
-        
-        epoch_dir = os.path.join(run_dir, f'epoch_{epoch:03d}')
-        os.makedirs(epoch_dir, exist_ok=True)
-        maps_dir = os.path.join(epoch_dir, 'maps')
-        os.makedirs(maps_dir, exist_ok=True)
-        
-        if cfg.get('generate_confusion_matrix', True):
-            cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
-            os.makedirs(cm_dir, exist_ok=True)
-            
-            cm = confusion_matrix(all_labels, all_preds)
-            
-            num_classes = cm.shape[0]
-            if num_classes > 50:
-                block_size = 50
-                step = 50
-                num_blocks_per_dim = (num_classes - block_size) // step + 1
-                
-                plot_args = []
-                for row_idx in range(num_blocks_per_dim):
-                    for col_idx in range(num_blocks_per_dim):
-                        start_row = row_idx * step
-                        start_col = col_idx * step
-                        end_row = start_row + block_size
-                        end_col = start_col + block_size
-                        plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir))
-                
-                with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
-                    pool.map(generate_confusion_matrix_plot, plot_args)
+    for round_idx in range(1, rounds + 1):
+        round_dir = os.path.join(run_dir, f'round_{round_idx:02d}')
+        os.makedirs(round_dir, exist_ok=True)
+
+        if args.init_per_round:
+            if round_idx == 1:
+                pass
             else:
-                fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
-                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
-                            xticklabels=[str(i) for i in range(num_classes)], yticklabels=[str(i) for i in range(num_classes)],
-                            annot_kws={"size": 16})
-                ax.set_title(f'Confusion Matrix - Epoch {epoch}', fontsize=12)
-                ax.set_xlabel('Predicted Label', fontsize=12)
-                ax.set_ylabel('True Label', fontsize=12)
-                plt.tight_layout()
-                plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
-                plt.close()
-        
-        gt_counts = Counter(all_labels)
-        pred_counts = Counter(all_preds)
-        
-        classes = sorted(set(gt_counts.keys()) | set(pred_counts.keys()))
-        gt_values = [gt_counts.get(cls, 0) for cls in classes]
-        pred_values = [pred_counts.get(cls, 0) for cls in classes]
-        
-        fig, ax = plt.subplots(figsize=(max(12, len(classes) * 0.5), 8))
-        x = np.arange(len(classes))
-        width = 0.35
-        
-        bars1 = ax.bar(x - width/2, gt_values, width, label='Ground Truth', color='skyblue', alpha=0.8)
-        bars2 = ax.bar(x + width/2, pred_values, width, label='Predictions', color='salmon', alpha=0.8)
-        
-        ax.set_xlabel('Class', fontsize=12)
-        ax.set_ylabel('Count', fontsize=12)
-        ax.set_title(f'Class Distribution - Epoch {epoch}', fontsize=14)
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(cls) for cls in classes], rotation=45, ha='right')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        for bar in bars1:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + max(gt_values + pred_values) * 0.01,
-                    f'{int(height)}', ha='center', va='bottom', fontsize=8)
-        for bar in bars2:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + max(gt_values + pred_values) * 0.01,
-                    f'{int(height)}', ha='center', va='bottom', fontsize=8)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(epoch_dir, 'class_distribution.pdf'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            trainer.save_model(os.path.join(run_dir, 'best.pt'))
-        epoch_time = time.time() - start_time
-        metrics.append({
-            'epoch': epoch,
-            'train_loss': avg_loss,
-            'train_acc': avg_acc,
-            'val_loss': val_loss,
-            'val_acc': val_acc,
-            'time': epoch_time
-        })
-        epoch_str = f"Epoch {epoch} - train_loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - val_loss={val_loss:.4f} - val_acc={val_acc:.2f}% - time={epoch_time:.2f}s"
-        print(epoch_str)
+                reinit_msg = f"Re-initializing model for round {round_idx} (fresh start)"
+                print(reinit_msg)
+                with open(log_file, 'a') as f:
+                    f.write(reinit_msg + '\n')
+                trainer = APT(cfg, classnames, device=args.device, log_file=log_file)
 
+        if len(labeled_indices) == 0:
+            no_data_msg = f"Round {round_idx}: no labeled samples available; stopping training."
+            print(no_data_msg)
+            with open(log_file, 'a') as f:
+                f.write(no_data_msg + '\n')
+            completed_rounds = round_idx - 1
+            break
+
+        train_subset = Subset(dataset, list(labeled_indices))
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+        round_msg = f"Starting round {round_idx}/{rounds}: {len(labeled_indices)} labeled | {len(unlabeled_indices)} unlabeled"
+        print(round_msg)
         with open(log_file, 'a') as f:
-            f.write(epoch_str + '\n')
+            f.write(round_msg + '\n')
 
-        trainer.scheduler.step()
+        epochs_this_round = num_epochs + (round_idx - 1) * args.incr_epochs
+        round_epochs_msg = f"  Epochs this round: {epochs_this_round} (base: {num_epochs} + {(round_idx - 1)} * {args.incr_epochs})"
+        with open(log_file, 'a') as f:
+            f.write(round_epochs_msg + '\n')
 
-        num_display = min(10, len(classnames), len(val_indices))
-        selected_indices = []
-        seen_classes = set()
-        for idx in val_indices:
-            cls_idx = dataset.samples[idx][1]
-            if cls_idx not in seen_classes:
-                seen_classes.add(cls_idx)
-                selected_indices.append(idx)
-            if len(selected_indices) >= num_display:
-                break
+        for epoch_in_round in range(1, epochs_this_round + 1):
+            global_epoch += 1
+            start_time = time.time()
+            trainer.model.train()
+            running_loss = 0.0
+            running_accuracy = 0.0
+            steps = 0
 
-        if len(selected_indices) == 0:
-            try:
-                batch_data = next(iter(val_loader))
-                if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
-                    sample_images, sample_labels = batch_data[0], batch_data[1]
-                    batch_indices = val_indices[:len(sample_images)]
-                    sample_paths = [os.path.abspath(dataset.samples[idx][0]) for idx in batch_indices]
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                loss_dict = trainer.train_step(batch)
+                running_loss += loss_dict['loss']
+                running_accuracy += loss_dict['accuracy']
+                steps += 1
+
+            avg_loss = running_loss / max(1, steps)
+            avg_acc = running_accuracy / max(1, steps)
+
+            if val_loader is not None:
+                results = trainer.evaluate(val_loader)
+                val_acc = results['accuracy']
+                val_loss = results['loss']
+                all_preds = results['predictions']
+                all_labels = results['true_labels']
+            else:
+                val_acc = 0.0
+                val_loss = 0.0
+                all_preds = []
+                all_labels = []
+
+            epoch_dir = os.path.join(round_dir, f'epoch_{epoch_in_round:03d}')
+            os.makedirs(epoch_dir, exist_ok=True)
+            maps_dir = os.path.join(epoch_dir, 'maps')
+            os.makedirs(maps_dir, exist_ok=True)
+
+            if cfg.get('generate_confusion_matrix', True) and all_labels:
+                cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
+                os.makedirs(cm_dir, exist_ok=True)
+
+                cm = confusion_matrix(all_labels, all_preds)
+
+                num_classes = cm.shape[0]
+                if num_classes > 50:
+                    block_size = 50
+                    step = 50
+                    num_blocks_per_dim = (num_classes - block_size) // step + 1
+
+                    plot_args = []
+                    for row_idx in range(num_blocks_per_dim):
+                        for col_idx in range(num_blocks_per_dim):
+                            start_row = row_idx * step
+                            start_col = col_idx * step
+                            end_row = start_row + block_size
+                            end_col = start_col + block_size
+                            plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, global_epoch, cm_dir))
+
+                    with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
+                        pool.map(generate_confusion_matrix_plot, plot_args)
                 else:
-                    sample_images, sample_labels = batch_data, None
-                    sample_paths = []
-            except StopIteration:
-                sample_images = None
-                sample_labels = None
-                sample_paths = []
-                print("Validation loader is empty, skipping prompt decoding.")
-                with open(log_file, 'a') as f:
-                    f.write("Validation loader is empty, skipping prompt decoding.\n")
-        else:
-            sample_images_list = []
-            sample_labels_list = []
-            sample_paths = []
-            for idx in selected_indices:
-                img, lbl = dataset[idx]
-                sample_images_list.append(img)
-                sample_labels_list.append(lbl)
-                sample_paths.append(os.path.abspath(dataset.samples[idx][0]))
+                    fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
+                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
+                                xticklabels=[str(i) for i in range(num_classes)], yticklabels=[str(i) for i in range(num_classes)],
+                                annot_kws={"size": 16})
+                    ax.set_title(f'Confusion Matrix - Epoch {global_epoch}', fontsize=12)
+                    ax.set_xlabel('Predicted Label', fontsize=12)
+                    ax.set_ylabel('True Label', fontsize=12)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
+                    plt.close()
 
-            sample_images = torch.stack(sample_images_list)
-            sample_labels = torch.tensor(sample_labels_list)
+            if all_labels:
+                gt_counts = Counter(all_labels)
+                pred_counts = Counter(all_preds)
 
-        if sample_images is not None:
-            if args.run_decoder:
-                decoded_prompts = trainer.decode_adapted_prompts(sample_images, entry_length=30, temperature=1.0)
+                classes = sorted(set(gt_counts.keys()) | set(pred_counts.keys()))
+                gt_values = [gt_counts.get(cls, 0) for cls in classes]
+                pred_values = [pred_counts.get(cls, 0) for cls in classes]
 
-                if decoded_prompts is not None:
-                    prompt_str = f"Generated captions from learned prompts for epoch {epoch}:"
-                    print(prompt_str)
+                fig, ax = plt.subplots(figsize=(max(12, len(classes) * 0.5), 8))
+                x = np.arange(len(classes))
+                width = 0.35
 
-                    with open(log_file, 'a') as f:
-                        f.write(prompt_str + '\n')
-                        for i in range(len(decoded_prompts)):
-                            image_prompts = decoded_prompts[i]
-                            image_path = sample_paths[i] if i < len(sample_paths) else "Unknown path"
-                            image_label = None
-                            if sample_labels is not None:
-                                try:
-                                    image_label = int(sample_labels[i])
-                                except Exception:
-                                    image_label = None
+                bars1 = ax.bar(x - width/2, gt_values, width, label='Ground Truth', color='skyblue', alpha=0.8)
+                bars2 = ax.bar(x + width/2, pred_values, width, label='Predictions', color='salmon', alpha=0.8)
 
-                            image_str = f"Image ({image_path}):"
-                            print(image_str)
-                            f.write(image_str + '\n')
+                ax.set_xlabel('Class', fontsize=12)
+                ax.set_ylabel('Count', fontsize=12)
+                ax.set_title(f'Class Distribution - Epoch {global_epoch}', fontsize=14)
+                ax.set_xticks(x)
+                ax.set_xticklabels([str(cls) for cls in classes], rotation=45, ha='right')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
 
-                            selected_prompt = None
-                            if image_label is not None:
-                                for p in image_prompts:
-                                    if p.get('class_id') == image_label:
-                                        selected_prompt = p
-                                        break
+                max_height = max(gt_values + pred_values) if (gt_values or pred_values) else 0
+                for bar in bars1:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height + max_height * 0.01 if max_height > 0 else 0.5,
+                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
+                for bar in bars2:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height + max_height * 0.01 if max_height > 0 else 0.5,
+                            f'{int(height)}', ha='center', va='bottom', fontsize=8)
 
-                            if selected_prompt is None and len(image_prompts) > 0:
-                                selected_prompt = image_prompts[0]
+                plt.tight_layout()
+                plt.savefig(os.path.join(epoch_dir, 'class_distribution.pdf'), dpi=150, bbox_inches='tight')
+                plt.close()
 
-                            class_id = selected_prompt.get('class_id', 'unknown') if selected_prompt else 'unknown'
-                            class_name = selected_prompt.get('class_name', f"Class_{class_id}") if selected_prompt else 'unknown'
-                            caption = selected_prompt.get('generated_caption', 'No caption generated') if selected_prompt else 'No caption generated'
-                            caption_line = f"  Class {class_id} ({class_name}): {caption}"
-                            print(caption_line)
-                            f.write(caption_line + '\n')
-                        f.write('\n')
-            
-            if args.visualize_attention:
-                trainer.model.cfg['mode'] = 'map'
+            if val_loader is not None and len(val_indices) > 0:
+                num_display = min(10, len(classnames), len(val_indices))
+                selected_indices = []
+                seen_classes = set()
+                for idx in val_indices:
+                    cls_idx = dataset.samples[idx][1]
+                    if cls_idx not in seen_classes:
+                        seen_classes.add(cls_idx)
+                        selected_indices.append(idx)
+                    if len(selected_indices) >= num_display:
+                        break
 
-                device_for_model = trainer.device
-                if isinstance(sample_images, torch.Tensor):
-                    vis_images = sample_images.to(device_for_model)
-                elif isinstance(sample_images, (list, tuple)):
-                    vis_images = torch.stack([x.to(device_for_model) if isinstance(x, torch.Tensor) else torch.tensor(x).to(device_for_model) for x in sample_images])
-                else:
-                    vis_images = torch.tensor(sample_images).to(device_for_model)
-
-                vis_labels = None
-                if sample_labels is not None:
-                    if isinstance(sample_labels, torch.Tensor):
-                        vis_labels = sample_labels.to(device_for_model)
-                    else:
-                        vis_labels = torch.tensor(sample_labels).to(device_for_model)
-
-                logits, attn_maps = trainer.model(vis_images)
-                trainer.model.cfg['mode'] = cfg['mode']
-
-                attn_map_to_vis = attn_maps[0]
-
-                try:
-                    shape_info = getattr(attn_map_to_vis, 'shape', None)
-                    shape_msg = f"Epoch {epoch} attention map shape: {shape_info}"
-                    print(shape_msg)
-                    with open(log_file, 'a') as lf:
-                        lf.write(shape_msg + '\n')
-                except Exception:
-                    pass
-
-                for i in range(len(vis_images)):
-                    image_path = sample_paths[i]
-                    label = int(vis_labels[i].item()) if vis_labels is not None else None
-
-                    if label is None:
-                        print(f"No label for image {i}, skipping attention visualization.")
-                        continue
-
+                if len(selected_indices) == 0:
                     try:
-                        weights = attn_map_to_vis[i, label, :]
-                    except Exception:
-                        warn_msg = f"Warning: unable to index attention map for image {i}, label {label} with expected strategy a[i, label, :]. Skipping visualization."
+                        batch_data = next(iter(val_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            sample_images, sample_labels = batch_data[0], batch_data[1]
+                            batch_indices = val_indices[:len(sample_images)]
+                            sample_paths = [os.path.abspath(dataset.samples[idx][0]) for idx in batch_indices]
+                        else:
+                            sample_images, sample_labels = batch_data, None
+                            sample_paths = []
+                    except StopIteration:
+                        sample_images = None
+                        sample_labels = None
+                        sample_paths = []
+                        warn_msg = "Validation loader is empty, skipping prompt decoding."
                         print(warn_msg)
-                        with open(log_file, 'a') as lf:
-                            lf.write(warn_msg + '\n')
-                        continue
-
-                    if weights is None:
-                        print(f"Warning: unable to index attention map for image {i}, label {label}. Skipping visualization.")
-                        continue
-
-                    if weights.dim() > 1:
-                        mean_weights = weights.mean(dim=0).detach().cpu().numpy()
-                    else:
-                        mean_weights = weights.detach().cpu().numpy()
-
-                    patch_weights = mean_weights[1:]
-
-                    stats_msg = f"Epoch {epoch} image {i} label {label} attention stats: mean={mean_weights.mean():.6f} min={mean_weights.min():.6f} max={mean_weights.max():.6f}"
-                    print(stats_msg)
-                    with open(log_file, 'a') as lf:
-                        lf.write(stats_msg + '\n')
-                    num_patches = patch_weights.shape[0]
-                    h = w = int(np.sqrt(num_patches))
-
-                    if h * w != num_patches:
-                        print(f"Warning: Cannot reshape {num_patches} patches into a square grid. Skipping visualization for image {i}.")
-                        continue
-                        
-                    heatmap = patch_weights.reshape(h, w)
-                    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())
-                    heatmap = (heatmap * 255).astype(np.uint8)
-                    
-                    original_img = cv2.imread(image_path)
-                    original_img = cv2.resize(original_img, (224, 224)) # type: ignore
-                    
-                    heatmap_img = cv2.applyColorMap(cv2.resize(heatmap, (224, 224)), cv2.COLORMAP_JET)
-                    
-                    superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0)
-                    
-                    save_name = f"epoch_{epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
-                    save_path = os.path.join(maps_dir, save_name)
-                    cv2.imwrite(save_path, superimposed_img)
-
-                vis_log_str = f"Saved {len(vis_images)} attention visualizations to {maps_dir}"
-                print(vis_log_str)
-                with open(log_file, 'a') as f:
-                    f.write(vis_log_str + '\n')
-            
-            if args.visualize_gradcam:
-                device_for_model = trainer.device
-                if isinstance(sample_images, torch.Tensor):
-                    vis_images = sample_images.to(device_for_model)
-                elif isinstance(sample_images, (list, tuple)):
-                    vis_images = torch.stack([x.to(device_for_model) if isinstance(x, torch.Tensor) else torch.tensor(x).to(device_for_model) for x in sample_images])
+                        with open(log_file, 'a') as f:
+                            f.write(warn_msg + '\n')
                 else:
-                    vis_images = torch.tensor(sample_images).to(device_for_model)
+                    sample_images_list = []
+                    sample_labels_list = []
+                    sample_paths = []
+                    for idx in selected_indices:
+                        img, lbl = dataset[idx]
+                        sample_images_list.append(img)
+                        sample_labels_list.append(lbl)
+                        sample_paths.append(os.path.abspath(dataset.samples[idx][0]))
 
-                vis_labels = None
-                if sample_labels is not None:
-                    if isinstance(sample_labels, torch.Tensor):
-                        vis_labels = sample_labels.to(device_for_model)
-                    else:
-                        vis_labels = torch.tensor(sample_labels).to(device_for_model)
+                    sample_images = torch.stack(sample_images_list)
+                    sample_labels = torch.tensor(sample_labels_list)
 
-                if vis_labels is not None:
-                    gradcams = trainer.generate_gradcam(vis_images, vis_labels)
+                if sample_images is not None:
+                    if args.run_decoder:
+                        decoded_prompts = trainer.decode_adapted_prompts(sample_images, entry_length=30, temperature=1.0)
 
-                    for i, gradcam in enumerate(gradcams):
-                        image_path = sample_paths[i]
-                        label = int(vis_labels[i].item())
+                        if decoded_prompts is not None:
+                            prompt_str = f"Generated captions from learned prompts for epoch {global_epoch}:"
+                            print(prompt_str)
 
-                        heatmap = gradcam.astype(np.float32)
-                        heatmap = (heatmap * 255).astype(np.uint8)
+                            with open(log_file, 'a') as f:
+                                f.write(prompt_str + '\n')
+                                for i in range(len(decoded_prompts)):
+                                    image_prompts = decoded_prompts[i]
+                                    image_path = sample_paths[i] if i < len(sample_paths) else "Unknown path"
+                                    image_label = None
+                                    if sample_labels is not None:
+                                        try:
+                                            image_label = int(sample_labels[i])
+                                        except Exception:
+                                            image_label = None
 
-                        original_img = cv2.imread(image_path)
-                        if original_img is not None:
+                                    image_str = f"Image ({image_path}):"
+                                    print(image_str)
+                                    f.write(image_str + '\n')
+
+                                    selected_prompt = None
+                                    if image_label is not None:
+                                        for p in image_prompts:
+                                            if p.get('class_id') == image_label:
+                                                selected_prompt = p
+                                                break
+
+                                    if selected_prompt is None and len(image_prompts) > 0:
+                                        selected_prompt = image_prompts[0]
+
+                                    class_id = selected_prompt.get('class_id', 'unknown') if selected_prompt else 'unknown'
+                                    class_name = selected_prompt.get('class_name', f"Class_{class_id}") if selected_prompt else 'unknown'
+                                    caption = selected_prompt.get('generated_caption', 'No caption generated') if selected_prompt else 'No caption generated'
+                                    caption_line = f"  Class {class_id} ({class_name}): {caption}"
+                                    print(caption_line)
+                                    f.write(caption_line + '\n')
+                                f.write('\n')
+
+                    if args.visualize_attention:
+                        trainer.model.cfg['mode'] = 'map'
+
+                        device_for_model = trainer.device
+                        if isinstance(sample_images, torch.Tensor):
+                            vis_images = sample_images.to(device_for_model)
+                        elif isinstance(sample_images, (list, tuple)):
+                            vis_images = torch.stack([x.to(device_for_model) if isinstance(x, torch.Tensor) else torch.tensor(x).to(device_for_model) for x in sample_images])
+                        else:
+                            vis_images = torch.tensor(sample_images).to(device_for_model)
+
+                        vis_labels = None
+                        if sample_labels is not None:
+                            if isinstance(sample_labels, torch.Tensor):
+                                vis_labels = sample_labels.to(device_for_model)
+                            else:
+                                vis_labels = torch.tensor(sample_labels).to(device_for_model)
+
+                        logits, attn_maps = trainer.model(vis_images)
+                        trainer.model.cfg['mode'] = cfg['mode']
+
+                        attn_map_to_vis = attn_maps[0]
+
+                        try:
+                            shape_info = getattr(attn_map_to_vis, 'shape', None)
+                            shape_msg = f"Epoch {global_epoch} attention map shape: {shape_info}"
+                            print(shape_msg)
+                            with open(log_file, 'a') as lf:
+                                lf.write(shape_msg + '\n')
+                        except Exception:
+                            pass
+
+                        for i in range(len(vis_images)):
+                            image_path = sample_paths[i]
+                            label = int(vis_labels[i].item()) if vis_labels is not None else None
+
+                            if label is None:
+                                msg = f"No label for image {i}, skipping attention visualization."
+                                print(msg)
+                                with open(log_file, 'a') as lf:
+                                    lf.write(msg + '\n')
+                                continue
+
+                            try:
+                                weights = attn_map_to_vis[i, label, :]
+                            except Exception:
+                                warn_msg = f"Warning: unable to index attention map for image {i}, label {label} with expected strategy a[i, label, :]. Skipping visualization."
+                                print(warn_msg)
+                                with open(log_file, 'a') as lf:
+                                    lf.write(warn_msg + '\n')
+                                continue
+
+                            if weights is None:
+                                warn_msg = f"Warning: unable to index attention map for image {i}, label {label}. Skipping visualization."
+                                print(warn_msg)
+                                with open(log_file, 'a') as lf:
+                                    lf.write(warn_msg + '\n')
+                                continue
+
+                            if weights.dim() > 1:
+                                mean_weights = weights.mean(dim=0).detach().cpu().numpy()
+                            else:
+                                mean_weights = weights.detach().cpu().numpy()
+
+                            patch_weights = mean_weights[1:]
+
+                            stats_msg = f"Epoch {global_epoch} image {i} label {label} attention stats: mean={mean_weights.mean():.6f} min={mean_weights.min():.6f} max={mean_weights.max():.6f}"
+                            print(stats_msg)
+                            with open(log_file, 'a') as lf:
+                                lf.write(stats_msg + '\n')
+                            num_patches = patch_weights.shape[0]
+                            h = w = int(np.sqrt(num_patches))
+
+                            if h * w != num_patches:
+                                warn_msg = f"Warning: Cannot reshape {num_patches} patches into a square grid. Skipping visualization for image {i}."
+                                print(warn_msg)
+                                with open(log_file, 'a') as lf:
+                                    lf.write(warn_msg + '\n')
+                                continue
+
+                            heatmap = patch_weights.reshape(h, w)
+                            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+                            heatmap = (heatmap * 255).astype(np.uint8)
+
+                            original_img = cv2.imread(image_path)
                             original_img = cv2.resize(original_img, (224, 224)) # type: ignore
 
                             heatmap_img = cv2.applyColorMap(cv2.resize(heatmap, (224, 224)), cv2.COLORMAP_JET)
 
-                            superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0) # type: ignore
+                            superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0)
 
-                            save_name = f"gradcam_epoch_{epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
+                            save_name = f"epoch_{global_epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
                             save_path = os.path.join(maps_dir, save_name)
                             cv2.imwrite(save_path, superimposed_img)
 
-                    gradcam_log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
-                    print(gradcam_log_str)
+                        vis_log_str = f"Saved {len(vis_images)} attention visualizations to {maps_dir}"
+                        print(vis_log_str)
+                        with open(log_file, 'a') as f:
+                            f.write(vis_log_str + '\n')
+
+                    if args.visualize_gradcam:
+                        device_for_model = trainer.device
+                        if isinstance(sample_images, torch.Tensor):
+                            vis_images = sample_images.to(device_for_model)
+                        elif isinstance(sample_images, (list, tuple)):
+                            vis_images = torch.stack([x.to(device_for_model) if isinstance(x, torch.Tensor) else torch.tensor(x).to(device_for_model) for x in sample_images])
+                        else:
+                            vis_images = torch.tensor(sample_images).to(device_for_model)
+
+                        vis_labels = None
+                        if sample_labels is not None:
+                            if isinstance(sample_labels, torch.Tensor):
+                                vis_labels = sample_labels.to(device_for_model)
+                            else:
+                                vis_labels = torch.tensor(sample_labels).to(device_for_model)
+
+                        if vis_labels is not None:
+                            gradcams = trainer.generate_gradcam(vis_images, vis_labels)
+
+                            for i, gradcam in enumerate(gradcams):
+                                image_path = sample_paths[i]
+                                label = int(vis_labels[i].item())
+
+                                heatmap = gradcam.astype(np.float32)
+                                heatmap = (heatmap * 255).astype(np.uint8)
+
+                                original_img = cv2.imread(image_path)
+                                if original_img is not None:
+                                    original_img = cv2.resize(original_img, (224, 224)) # type: ignore
+
+                                    heatmap_img = cv2.applyColorMap(cv2.resize(heatmap, (224, 224)), cv2.COLORMAP_JET)
+
+                                    superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0) # type: ignore
+
+                                    save_name = f"gradcam_epoch_{global_epoch:03d}_img_{i}_class_{label}_{classnames[int(label)]}.jpg"
+                                    save_path = os.path.join(maps_dir, save_name)
+                                    cv2.imwrite(save_path, superimposed_img)
+
+                            gradcam_log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
+                            with open(log_file, 'a') as f:
+                                f.write(gradcam_log_str + '\n')
+
+            epoch_time = time.time() - start_time
+            val_loss_for_metrics = val_loss if val_loader is not None else None
+            val_acc_for_metrics = val_acc if val_loader is not None else None
+            metrics.append({
+                'round': round_idx,
+                'epoch_in_round': epoch_in_round,
+                'epoch_global': global_epoch,
+                'train_loss': avg_loss,
+                'train_acc': avg_acc,
+                'val_loss': val_loss_for_metrics,
+                'val_acc': val_acc_for_metrics,
+                'time': epoch_time,
+                'labeled_size': len(labeled_indices),
+                'unlabeled_size': len(unlabeled_indices)
+            })
+
+            if val_loader is not None and val_acc > best_val_acc:
+                best_val_acc = val_acc
+                trainer.save_model(os.path.join(run_dir, 'best.pt'))
+
+            val_loss_display = f"{val_loss:.4f}" if val_loader is not None else "N/A"
+            val_acc_display = f"{val_acc:.2f}%" if val_loader is not None else "N/A"
+            epoch_str = (
+                f"Epoch {global_epoch} (round {round_idx}/{rounds}, step {epoch_in_round}/{epochs_this_round}) - "
+                f"train_loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
+                f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
+            )
+            print(epoch_str)
+
+            with open(log_file, 'a') as f:
+                f.write(epoch_str + '\n')
+
+            trainer.scheduler.step()
+
+        if args.active_learning == 'entropy' and args.nshot > 0 and round_idx < rounds and len(unlabeled_indices) > 0:
+            entropy_scores = compute_entropy_scores(trainer, dataset, unlabeled_indices, batch_size, num_workers)
+            selected_indices = select_high_entropy_indices(entropy_scores, args.nshot)
+            selected_indices = [idx for idx in selected_indices if idx in unlabeled_indices]
+
+            if selected_indices:
+                existing_labeled = set(labeled_indices)
+                new_indices = [idx for idx in selected_indices if idx not in existing_labeled]
+                skipped_duplicates = len(selected_indices) - len(new_indices)
+
+                if not new_indices:
+                    dupe_msg = (
+                        f"Active learning selection (round {round_idx} -> {round_idx + 1}): "
+                        "all suggested samples were already labeled; no update performed."
+                    )
+                    print(dupe_msg)
                     with open(log_file, 'a') as f:
-                        f.write(gradcam_log_str + '\n')
-    
+                        f.write(dupe_msg + '\n')
+                else:
+                    selected_set = set(new_indices)
+                    labeled_indices.extend(new_indices)
+                    unlabeled_indices = [idx for idx in unlabeled_indices if idx not in selected_set]
+
+                    if skipped_duplicates > 0:
+                        duplicate_msg = f"  Skipped {skipped_duplicates} already-labeled samples from selection."
+                        with open(log_file, 'a') as f:
+                            f.write(duplicate_msg + '\n')
+
+                    detail_limit = 20
+                    selection_details = []
+                    for idx in new_indices[:detail_limit]:
+                        cls_id = dataset.samples[idx][1]
+                        class_name = classnames[cls_id] if cls_id < len(classnames) else f"Class_{cls_id}"
+                        selection_details.append(
+                            f"  idx={idx} class={cls_id} ({class_name}) path={os.path.abspath(dataset.samples[idx][0])}"
+                        )
+                    if len(new_indices) > detail_limit:
+                        selection_details.append(f"  ... and {len(new_indices) - detail_limit} more")
+                    with open(log_file, 'a') as f:
+                        for line in selection_details:
+                            f.write(line + '\n')
+            else:
+                al_msg = f"Active learning selection (round {round_idx} -> {round_idx + 1}): no samples selected."
+                print(al_msg)
+                with open(log_file, 'a') as f:
+                    f.write(al_msg + '\n')
+
+            completed_rounds = round_idx
+
+    cfg['final_labeled_size'] = len(labeled_indices)
+    cfg['final_unlabeled_size'] = len(unlabeled_indices)
+    cfg['completed_rounds'] = completed_rounds
+    with open(config_path, 'w') as f:
+        json.dump(cfg, f, indent=4)
+
     with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=4)
     
     trainer.save_model(os.path.join(run_dir, 'last.pt'))
     
-    if args.run_decoder and sample_images is not None and 'decoded_prompts' in locals():
+    if args.run_decoder and sample_images is not None and decoded_prompts is not None:
         final_prompts = []
         for i in range(len(decoded_prompts)):
             image_prompts = decoded_prompts[i]
