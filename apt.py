@@ -222,6 +222,22 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
 
         self.text_features, self.prompts, self.text_tokens = self._init_text_feats(cfg, classnames)
+        self.base_text_features = self.text_features.clone().detach()
+
+        self.use_join_embeddings = cfg.get('join_start_embeddings', False)
+        self.join_tuned_embeddings = None
+        self.join_self_attn = None
+        if self.use_join_embeddings:
+            join_heads = cfg.get('join_num_heads', num_heads)
+            join_dropout = cfg.get('join_dropout', dropout)
+            self.join_self_attn = nn.MultiheadAttention(
+                embed_dim=prompt_dim,
+                num_heads=join_heads,
+                dropout=join_dropout
+            )
+            self.join_self_attn = self.join_self_attn.to(device=self.device, dtype=self.text_features.dtype)
+            if cfg.get('precision', 'fp32') == 'fp16':
+                self.join_self_attn = self.join_self_attn.half()
 
     def _init_text_feats(self, cfg, classnames):
         dataset_name = cfg.get('dataset_name', 'ImageNet')
@@ -237,6 +253,38 @@ class CustomCLIP(nn.Module):
         tokens = None
         return text_features, prompts, tokens
 
+    def update_text_features(self, tuned_embeddings, add_to_start=False, join=None):
+        if tuned_embeddings is None:
+            return
+
+        target = tuned_embeddings.to(self.device)
+        target = target.to(self.base_text_features.dtype)
+
+        if target.shape != self.text_features.shape:
+            raise ValueError(
+                f"Tuned embeddings shape {target.shape} does not match expected {self.text_features.shape}."
+            )
+
+        use_join = self.use_join_embeddings if join is None else bool(join)
+
+        if add_to_start and use_join:
+            raise ValueError("Cannot use both add_to_start and join strategies for text embeddings.")
+
+        if use_join:
+            if self.join_self_attn is None:
+                raise ValueError("Join start embeddings requested but join_self_attn module is not initialized.")
+            self.join_tuned_embeddings = target.detach().clone()
+            updated = target
+        else:
+            self.join_tuned_embeddings = None
+            if add_to_start:
+                base = self.base_text_features.to(self.device)
+                updated = base + target
+            else:
+                updated = target
+
+        self.text_features = updated.detach()
+
     def forward(self, image, label=None):
         with torch.no_grad():
             visual_output = self.vis_encoder(image)
@@ -247,7 +295,7 @@ class CustomCLIP(nn.Module):
 
         attn_maps = []
 
-        base_text_features = self.text_features.clone()
+        base_text_features = self._prepare_text_features()
 
         unpooled_images = unpooled_levels[0].permute(1, 0, 2)
         text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
@@ -283,11 +331,35 @@ class CustomCLIP(nn.Module):
             return self.prompt_learner
         return [self.prompt_learner]
 
+    def _prepare_text_features(self):
+        if (
+            self.use_join_embeddings
+            and self.join_self_attn is not None
+            and self.join_tuned_embeddings is not None
+        ):
+            base_features = self.base_text_features.to(self.device)
+            tuned_features = self.join_tuned_embeddings.to(self.device)
+            return self._apply_join_attention(base_features, tuned_features)
+        return self.text_features.clone()
+
+    def _apply_join_attention(self, base_features, tuned_features):
+        if self.join_self_attn is None:
+            raise RuntimeError("Join self-attention module is not initialized.")
+        attn_input = torch.stack([base_features, tuned_features], dim=0)
+        attn_dtype = self.join_self_attn.in_proj_weight.dtype if self.join_self_attn is not None else attn_input.dtype
+        attn_input = attn_input.to(device=self.device, dtype=attn_dtype)
+        fused, _ = self.join_self_attn(attn_input, attn_input, attn_input)
+        return fused.mean(dim=0).clone()
+
     def trainable_parameters(self):
-        return self.prompt_learner.parameters()
+        if self.join_self_attn is None:
+            return self.prompt_learner.parameters()
+        return itertools.chain(self.prompt_learner.parameters(), self.join_self_attn.parameters())
 
     def get_trainable_parameter_names(self):
         names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
+        if self.join_self_attn is not None:
+            names.extend(f"join_self_attn.{name}" for name, _ in self.join_self_attn.named_parameters())
         return names
 
     def _reshape_attn_map(self, attn_map, batch_size):
@@ -521,7 +593,7 @@ class APT:
                 if isinstance(logits, (list, tuple)):
                     logits = logits[0]
 
-                loss = F.cross_entropy(logits, labels)
+                loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
                 running_loss += loss.item()
                 steps += 1
 
@@ -549,6 +621,54 @@ class APT:
             else:
                 logits = self.model(images)
                 return logits
+
+    def compute_average_text_embeddings(self, dataloader):
+        if dataloader is None:
+            raise ValueError("Dataloader must not be None when computing average text embeddings.")
+
+        self.model.eval()
+
+        old_mode = self.model.cfg.get('mode', None)
+        self.model.cfg['mode'] = 'features'
+
+        num_classes = len(self.classnames)
+        embed_dim = self.model.text_features.shape[-1]
+        dtype = self.model.text_features.dtype
+
+        sums = torch.zeros((num_classes, embed_dim), device=self.device, dtype=dtype)
+        counts = torch.zeros(num_classes, device=self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for images, labels in dataloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                _, text_features = self.model(images)
+                text_features = text_features.to(dtype)
+
+                batch_size = labels.size(0)
+                batch_indices = torch.arange(batch_size, device=self.device)
+                selected = text_features[batch_indices, labels]
+
+                sums.index_add_(0, labels, selected)
+                counts.index_add_(0, labels, torch.ones_like(labels, dtype=torch.float32))
+
+        if old_mode is not None:
+            self.model.cfg['mode'] = old_mode
+        else:
+            self.model.cfg.pop('mode', None)
+
+        mean_embeddings = torch.zeros_like(sums)
+        valid_mask = counts > 0
+        if valid_mask.any():
+            divisor = counts[valid_mask].unsqueeze(1).to(sums.dtype)
+            mean_embeddings[valid_mask] = sums[valid_mask] / divisor
+
+        if (~valid_mask).any():
+            base_fallback = self.model.base_text_features.to(self.device).to(sums.dtype)
+            mean_embeddings[~valid_mask] = base_fallback[~valid_mask]
+
+        return mean_embeddings.detach()
     
     def save_model(self, path):
         checkpoint = {
@@ -636,7 +756,7 @@ class APT:
         for i in range(batch_size):
             target_class = target_classes[i]
             
-            base_text = self.model.text_features.clone()
+            base_text = self.model._prepare_text_features()
 
             unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
             text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
@@ -700,7 +820,7 @@ class APT:
         with torch.no_grad():
             encoder_output = self.model.vis_encoder(images)
             unpooled_images = encoder_output[0].permute(1, 0, 2)
-            text_features = self.model.text_features.clone()
+            text_features = self.model._prepare_text_features()
             text_features = text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
 
             for layer in self.model._prompt_layers_iter():
@@ -769,8 +889,16 @@ if __name__ == "__main__":
     parser.add_argument('--rounds', type=int, default=1, help='Number of active learning rounds to run')
     parser.add_argument('--init_per_round', action='store_true', help='Initialize a fresh model for each active learning round (instead of continuing training)')
     parser.add_argument('--incr_epochs', type=int, default=0, help='Increase epochs by this amount for each successive round (default: 0, no increase)')
+    parser.add_argument('--use_last_tuned_embeddings', action='store_true', help='Use averaged tuned text embeddings from previous round at the start of a new round')
+    parser.add_argument('--add_to_start_embeddings', action='store_true', help='Add averaged tuned embeddings to the original text embeddings instead of replacing them')
+    parser.add_argument('--join_start_embeddings', action='store_true', help='Concatenate base and tuned embeddings and fuse them with self-attention before cross attention')
+    parser.add_argument('--join_num_heads', type=int, default=8, help='Number of heads in join self-attention (default: 8)')
+    parser.add_argument('--join_dropout', type=float, default=0.1, help='Dropout rate in join self-attention (default: 0.1)')
 
     args = parser.parse_args()
+
+    if args.add_to_start_embeddings and args.join_start_embeddings:
+        raise ValueError("--add_to_start_embeddings and --join_start_embeddings cannot be enabled at the same time.")
 
     dataset_root = args.dataset_root
     batch_size = args.batch_size
@@ -809,6 +937,11 @@ if __name__ == "__main__":
         'rounds': rounds,
         'initial_kshot': kshot,
         'init_per_round': args.init_per_round,
+        'use_last_tuned_embeddings': args.use_last_tuned_embeddings,
+        'add_to_start_embeddings': args.add_to_start_embeddings,
+        'join_start_embeddings': args.join_start_embeddings,
+        'join_num_heads': args.join_num_heads,
+        'join_dropout': args.join_dropout,
     }
 
     if not os.path.exists(args.output_dir):
@@ -920,6 +1053,7 @@ if __name__ == "__main__":
     sample_paths = []
     decoded_prompts = None
     completed_rounds = 0
+    previous_round_embeddings = None
 
     print('\n')
     print('='*50)
@@ -938,6 +1072,27 @@ if __name__ == "__main__":
                     f.write(reinit_msg + '\n')
                 trainer = APT(cfg, classnames, device=args.device, log_file=log_file)
 
+        if cfg.get('use_last_tuned_embeddings', False) and previous_round_embeddings is not None:
+            try:
+                trainer.model.update_text_features(
+                    previous_round_embeddings,
+                    add_to_start=cfg.get('add_to_start_embeddings', False),
+                    join=cfg.get('join_start_embeddings', False)
+                )
+                embed_msg = (
+                    f"Applied tuned text embeddings from round {round_idx - 1}"
+                    f" (add_to_start={cfg.get('add_to_start_embeddings', False)}, "
+                    f"join_start={cfg.get('join_start_embeddings', False)})"
+                )
+                print(embed_msg)
+                with open(log_file, 'a') as f:
+                    f.write(embed_msg + '\n')
+            except ValueError as exc:
+                warn_msg = f"Failed to apply tuned embeddings for round {round_idx}: {exc}"
+                print(warn_msg)
+                with open(log_file, 'a') as f:
+                    f.write(warn_msg + '\n')
+
         if len(labeled_indices) == 0:
             no_data_msg = f"Round {round_idx}: no labeled samples available; stopping training."
             print(no_data_msg)
@@ -948,6 +1103,9 @@ if __name__ == "__main__":
 
         train_subset = Subset(dataset, list(labeled_indices))
         train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        train_eval_loader = None
+        if cfg.get('use_last_tuned_embeddings', False):
+            train_eval_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
         round_msg = f"Starting round {round_idx}/{rounds}: {len(labeled_indices)} labeled | {len(unlabeled_indices)} unlabeled"
         print(round_msg)
@@ -1325,6 +1483,24 @@ if __name__ == "__main__":
                 f.write(epoch_str + '\n')
 
             trainer.scheduler.step()
+
+        if cfg.get('use_last_tuned_embeddings', False) and train_eval_loader is not None:
+            try:
+                averaged_embeddings = trainer.compute_average_text_embeddings(train_eval_loader)
+                previous_round_embeddings = averaged_embeddings.detach().cpu()
+                torch.save(previous_round_embeddings, os.path.join(round_dir, 'tuned_text_embeddings.pt'))
+                avg_msg = (
+                    f"Stored averaged tuned text embeddings for round {round_idx}"
+                    f" (shape={tuple(previous_round_embeddings.shape)})"
+                )
+                print(avg_msg)
+                with open(log_file, 'a') as f:
+                    f.write(avg_msg + '\n')
+            except Exception as exc:
+                err_msg = f"Failed to compute tuned text embeddings for round {round_idx}: {exc}"
+                print(err_msg)
+                with open(log_file, 'a') as f:
+                    f.write(err_msg + '\n')
 
         if args.active_learning == 'entropy' and args.nshot > 0 and round_idx < rounds and len(unlabeled_indices) > 0:
             entropy_scores = compute_entropy_scores(trainer, dataset, unlabeled_indices, batch_size, num_workers)
