@@ -1,0 +1,42 @@
+model:
+  backbone: "ViT-B/32"
+  dataset_name: "CUBirds"
+  num_heads: 8
+  num_layers: 1
+  dropout: 0.2
+
+training:
+  device: "cuda:0"
+  batch_size: 8
+  epochs: 150
+  increment_epochs: 0
+  precision: "fp32"
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  mode: "logits"
+  run_decoder: false
+  visualize_attention: false
+  visualize_gradcam: false
+  use_cutout: false
+  confusion_matrix: false
+  optimizer:
+    name: "SGD"
+    learning_rate: 0.001
+    weight_decay: 0.0005
+
+data:
+  root: "./datasets/cub-200-2011-renamed"
+  kshot: 16
+  val_size: 0.2
+  num_workers: 4
+  seed: 42
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+
+active_learning:
+  rounds: 1
+  strategy: null
+  nshot: 0
+
+logging:
+  output_dir: "outputs"
