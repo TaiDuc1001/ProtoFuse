@@ -27,6 +27,47 @@ from thop import profile
 from typing import Any, Dict, List, Optional
 from sklearn.metrics import confusion_matrix
 
+# ==========================================
+# 1. LoRA Implementation & Utilities
+# ==========================================
+
+class LoRALinear(nn.Linear):
+    def __init__(self, in_features, out_features, r=4, alpha=1, bias=True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        self.lora_A = nn.Parameter(torch.zeros((r, in_features)))
+        self.lora_B = nn.Parameter(torch.zeros((out_features, r)))
+        self.disable_lora = False
+        self.reset_lora_parameters()
+
+    def reset_lora_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        result = super().forward(x)
+        if not self.disable_lora and self.r > 0:
+            lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+            result += lora_out
+        return result
+
+def apply_lora_to_transformer(transformer, rank=4, alpha=1):
+    for block in transformer.resblocks:
+        if hasattr(block, 'mlp'):
+            c_fc = block.mlp[0]
+            new_c_fc = LoRALinear(c_fc.in_features, c_fc.out_features, r=rank, alpha=alpha, bias=True)
+            new_c_fc.weight = c_fc.weight
+            new_c_fc.bias = c_fc.bias
+            block.mlp[0] = new_c_fc
+
+            c_proj = block.mlp[2]
+            new_c_proj = LoRALinear(c_proj.in_features, c_proj.out_features, r=rank, alpha=alpha, bias=True)
+            new_c_proj.weight = c_proj.weight
+            new_c_proj.bias = c_proj.bias
+            block.mlp[2] = new_c_proj
+
 def generate_confusion_matrix_plot(args):
     cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir = args
     sub_cm = cm[start_row:end_row, start_col:end_col]
@@ -41,6 +82,58 @@ def generate_confusion_matrix_plot(args):
     plt.tight_layout()
     plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
     plt.close()
+
+# ==========================================
+# 2. Active Learning Scores
+# ==========================================
+
+def compute_conflict_scores(trainer, dataset, indices, batch_size, num_workers):
+    if not indices:
+        return defaultdict(list)
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    conflict_per_class = defaultdict(list)
+    position = 0
+    trainer.model.eval()
+
+    with torch.no_grad():
+        for images, labels in loader:
+            batch_size_local = images.size(0)
+            batch_indices = indices[position:position + batch_size_local]
+            position += batch_size_local
+            images = images.to(trainer.device)
+
+            # Conservative Prediction (Frozen features)
+            trainer.model.set_lora_enabled(False)
+            logits_conservative = trainer.model(images)
+            if isinstance(logits_conservative, (list, tuple)): logits_conservative = logits_conservative[0]
+            probs_conservative = torch.softmax(logits_conservative, dim=1)
+
+            # Aggressive Prediction (Tuned LoRA features)
+            trainer.model.set_lora_enabled(True)
+            logits_aggressive = trainer.model(images)
+            if isinstance(logits_aggressive, (list, tuple)): logits_aggressive = logits_aggressive[0]
+            probs_aggressive = torch.softmax(logits_aggressive, dim=1)
+
+            kl_div = F.kl_div(probs_conservative.log(), probs_aggressive, reduction='none', log_target=False).sum(dim=1)
+
+            for score, lbl, idx in zip(kl_div.cpu().tolist(), labels.cpu().tolist(), batch_indices):
+                conflict_per_class[int(lbl)].append((float(score), int(idx)))
+    
+    trainer.model.set_lora_enabled(True)
+    return conflict_per_class
+
+def select_conflict_indices(conflict_per_class, nshot):
+    if nshot <= 0: return []
+    selected = []
+    for class_id in sorted(conflict_per_class.keys()):
+        scores = conflict_per_class[class_id]
+        if not scores: continue
+        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
+        selected.extend(idx for _, idx in sorted_scores[:nshot])
+    return selected
 
 def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
     if not indices:
@@ -89,14 +182,12 @@ def select_high_entropy_indices(entropy_per_class, nshot):
 
     return selected
 
-
 def _group_indices_by_class(dataset, indices):
     grouped = defaultdict(list)
     for idx in indices:
         _, class_idx = dataset.samples[idx]
         grouped[int(class_idx)].append(int(idx))
     return grouped
-
 
 def select_random_indices(dataset, indices, nshot, seed=None):
     if nshot <= 0 or not indices:
@@ -118,7 +209,6 @@ def select_random_indices(dataset, indices, nshot, seed=None):
         selected.extend(chosen)
 
     return selected
-
 
 def compute_coreset_embeddings(trainer, dataset, indices, batch_size, num_workers):
     if not indices:
@@ -182,7 +272,6 @@ def compute_coreset_embeddings(trainer, dataset, indices, batch_size, num_worker
 
     return embeddings
 
-
 def _coreset_greedy_selection(candidates, centers, embeddings, k):
     if k <= 0 or not candidates:
         return []
@@ -213,7 +302,6 @@ def _coreset_greedy_selection(candidates, centers, embeddings, k):
 
     return selected
 
-
 def select_coreset_indices(trainer, dataset, labeled_indices, unlabeled_indices, nshot, batch_size, num_workers):
     if nshot <= 0 or not unlabeled_indices:
         return []
@@ -237,6 +325,9 @@ def select_coreset_indices(trainer, dataset, labeled_indices, unlabeled_indices,
 
     return selected
 
+# ==========================================
+# 3. Config Parsing
+# ==========================================
 
 def infer_override_value(raw):
     lowered = raw.lower()
@@ -257,7 +348,6 @@ def infer_override_value(raw):
     except ValueError:
         return raw
 
-
 def set_nested_value(config, keys, value):
     current = config
     for key in keys[:-1]:
@@ -265,7 +355,6 @@ def set_nested_value(config, keys, value):
             current[key] = {}
         current = current[key]
     current[keys[-1]] = value
-
 
 def parse_override_arguments(tokens):
     overrides = {}
@@ -294,7 +383,6 @@ def parse_override_arguments(tokens):
         i += 1
     return overrides
 
-
 def merge_configs(base, override):
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -303,16 +391,13 @@ def merge_configs(base, override):
             base[key] = value
     return base
 
-
 def load_config_file(path):
     import yaml
-
     with open(path, 'r') as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError("Configuration root must be a mapping.")
     return data
-
 
 def get_config_value(config, path, default=None):
     current = config
@@ -322,14 +407,12 @@ def get_config_value(config, path, default=None):
         current = current[key]
     return current
 
-
 def coerce_to_str(value, default, key=None):
     if value is None:
         return str(default)
     if isinstance(value, (list, dict)):
         raise ValueError(f"Configuration value for {key or 'unknown'} must be a string.")
     return str(value)
-
 
 def coerce_to_int(value, default, key=None):
     if value is None:
@@ -348,7 +431,6 @@ def coerce_to_int(value, default, key=None):
                 raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.") from exc
     raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.")
 
-
 def coerce_to_float(value, default, key=None):
     if value is None:
         return float(default)
@@ -362,6 +444,10 @@ def coerce_to_float(value, default, key=None):
         except ValueError as exc:
             raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.") from exc
     raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.")
+
+# ==========================================
+# 4. Model Architecture (CLIP + APT)
+# ==========================================
 
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim, num_heads, dropout):
@@ -493,10 +579,23 @@ class CustomCLIP(nn.Module):
             param.requires_grad = False
 
         self.vis_encoder = ImageEncoder(self.clip_model)
+        
+        # Apply LoRA if configured
+        if cfg.get('use_lora', True):
+            lora_rank = cfg.get('lora_rank', 4)
+            lora_alpha = cfg.get('lora_alpha', 1)
+            apply_lora_to_transformer(self.vis_encoder.transformer, rank=lora_rank, alpha=lora_alpha)
+            print(f"Applied LoRA with rank={lora_rank}, alpha={lora_alpha} (Zero-Init) to ImageEncoder.")
+
         self.logit_scale = clip_model.logit_scale
 
         self.text_features, self.prompts, self.text_tokens = self._init_text_feats(cfg, classnames)
         self.base_text_features = self.text_features.clone().detach()
+    
+    def set_lora_enabled(self, enabled: bool):
+        for module in self.vis_encoder.modules():
+            if isinstance(module, LoRALinear):
+                module.disable_lora = not enabled
 
     def _init_text_feats(self, cfg, classnames):
         dataset_name = cfg.get('dataset_name', 'ImageNet')
@@ -527,7 +626,9 @@ class CustomCLIP(nn.Module):
 
     def forward(self, image, label=None):
         with torch.no_grad():
-            visual_output = self.vis_encoder(image)
+            pass
+
+        visual_output = self.vis_encoder(image)
 
         unpooled_levels, image_features = visual_output
         if not isinstance(unpooled_levels, list):
@@ -575,10 +676,19 @@ class CustomCLIP(nn.Module):
         return self.text_features.clone()
 
     def trainable_parameters(self):
-        return self.prompt_learner.parameters()
+        params = list(self.prompt_learner.parameters())
+        # Add LoRA parameters
+        for name, param in self.vis_encoder.named_parameters():
+            if 'lora_' in name:
+                params.append(param)
+        return params
 
     def get_trainable_parameter_names(self):
         names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
+        # Add LoRA parameter names
+        for name, _ in self.vis_encoder.named_parameters():
+            if 'lora_' in name:
+                names.append(f"vis_encoder.{name}")
         return names
 
     def _reshape_attn_map(self, attn_map, batch_size):
@@ -626,6 +736,10 @@ def load_clip_to_cpu(backbone_name):
 
     model = clip.build_model(state_dict or model.state_dict())
     return model
+
+# ==========================================
+# 5. Trainer Class (APT)
+# ==========================================
 
 class APT:
     def __init__(self, cfg, classnames, device="cuda", log_file=None):
@@ -727,30 +841,36 @@ class APT:
         self.model.to(self.device)
     
     def setup_optimizer(self):
-        lr = self.cfg.get('learning_rate', 0.002)
+        base_lr = self.cfg.get('learning_rate', 0.002)
         weight_decay = self.cfg.get('weight_decay', 0.0005)
         optimizer_type = self.cfg.get('optimizer', 'SGD')
-        trainable_params = list(self.model.trainable_parameters())
+        
+        # --- DIFFERENTIAL LEARNING RATES IMPLEMENTATION ---
+        lora_params = []
+        other_params = []
+        
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'lora_' in name:
+                lora_params.append(param)
+            else:
+                other_params.append(param)
+        
+        # LoRA LR ratio (e.g., 0.1 means LoRA learns 10x slower)
+        lora_lr_ratio = self.cfg.get('lora_lr_ratio', 0.1)
+        
+        param_groups = [
+            {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
+            {'params': lora_params, 'lr': base_lr * lora_lr_ratio, 'weight_decay': weight_decay}
+        ]
         
         if optimizer_type == 'AdamW':
-            self.optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
+            self.optimizer = torch.optim.AdamW(param_groups)
         elif optimizer_type == 'Adam':
-            self.optimizer = torch.optim.Adam(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
+            self.optimizer = torch.optim.Adam(param_groups)
         else:
-            self.optimizer = torch.optim.SGD(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay,
-                momentum=0.9
-            )
+            self.optimizer = torch.optim.SGD(param_groups, momentum=0.9)
         
         num_epochs = self.cfg.get('num_epochs', 100)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -759,36 +879,8 @@ class APT:
         )
     
     def reset_optimizer_scheduler(self):
-        lr = self.cfg.get('learning_rate', 0.002)
-        weight_decay = self.cfg.get('weight_decay', 0.0005)
-        optimizer_type = self.cfg.get('optimizer', 'SGD')
-        trainable_params = list(self.model.trainable_parameters())
-        
-        if optimizer_type == 'AdamW':
-            self.optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
-        elif optimizer_type == 'Adam':
-            self.optimizer = torch.optim.Adam(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
-        else:
-            self.optimizer = torch.optim.SGD(
-                trainable_params,
-                lr=lr,
-                weight_decay=weight_decay,
-                momentum=0.9
-            )
-        
-        num_epochs = self.cfg.get('num_epochs', 100)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=num_epochs
-        )
+        # Re-implementation to support differential LR on reset as well
+        self.setup_optimizer()
     
     def train_step(self, batch):
         images, labels = batch
@@ -798,19 +890,58 @@ class APT:
         self.model.train()
         self.model.prompt_learner.train()
         
+        # --- TETHERED TUNING: GET TEACHER (FROZEN) FEATURES ---
+        # We need the features from the original CLIP image encoder (before LoRA effect)
+        # or effectively "frozen" features to calculate consistency loss.
+        # Since LoRA is additive, we can just disable it to get the original features.
+        with torch.no_grad():
+            self.model.set_lora_enabled(False)
+            visual_output_old = self.model.vis_encoder(images)
+            z_old = visual_output_old[1] # global feature
+            z_old = F.normalize(z_old, dim=-1).detach()
+            self.model.set_lora_enabled(True)
+        # ------------------------------------------------------
+
         precision = self.cfg.get('precision', 'fp32')
         
         if precision == 'amp':
             with autocast():
-                loss, logits = self.model(images, labels)
+                # Standard Cross-Entropy
+                loss_ce, logits = self.model(images, labels)
+                
+                # --- CONSISTENCY LOSS ---
+                # Re-compute student features (with LoRA enabled)
+                # We call vis_encoder explicitly to get the embedding before text interaction
+                visual_output_new = self.model.vis_encoder(images)
+                z_new = visual_output_new[1]
+                z_new = F.normalize(z_new, dim=-1)
+                
+                # Consistency Loss (MSE)
+                lambda_distill = self.cfg.get('distill_weight', 10.0)
+                loss_distill = F.mse_loss(z_new, z_old)
+                
+                total_loss = loss_ce + (lambda_distill * loss_distill)
+
             self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward() # type: ignore
+            self.scaler.scale(total_loss).backward() # type: ignore
             self.scaler.step(self.optimizer) # type: ignore
             self.scaler.update() # type: ignore
         else:
-            loss, logits = self.model(images, labels)
+            # Standard Cross-Entropy
+            loss_ce, logits = self.model(images, labels)
+            
+            # --- CONSISTENCY LOSS ---
+            visual_output_new = self.model.vis_encoder(images)
+            z_new = visual_output_new[1]
+            z_new = F.normalize(z_new, dim=-1)
+            
+            lambda_distill = self.cfg.get('distill_weight', 10.0)
+            loss_distill = F.mse_loss(z_new, z_old)
+            
+            total_loss = loss_ce + (lambda_distill * loss_distill)
+
             self.optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             self.optimizer.step()
         
         _, predicted = torch.max(logits.data, 1)
@@ -818,7 +949,12 @@ class APT:
         total = labels.size(0)
         accuracy = 100 * correct / total
         
-        return {"loss": loss.item(), "accuracy": accuracy}
+        return {
+            "loss": total_loss.item(), 
+            "loss_ce": loss_ce.item(),
+            "loss_distill": loss_distill.item(),
+            "accuracy": accuracy
+        }
     
     def evaluate(self, dataloader):
         self.model.eval()
@@ -1109,6 +1245,9 @@ class APT:
         
         return batch_out
 
+# ==========================================
+# 6. Pipeline
+# ==========================================
 
 class ActiveLearningPipeline:
     def __init__(self, config):
@@ -1149,8 +1288,8 @@ class ActiveLearningPipeline:
         if strategy_value is not None and not isinstance(strategy_value, str):
             raise ValueError("active_learning.strategy must be a string or null.")
         self.strategy = strategy_value
-        if self.strategy not in (None, "entropy", "random", "coreset"):
-            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', or 'coreset'.")
+        if self.strategy not in (None, "entropy", "random", "coreset", "conflict"):
+            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'conflict'.")
         nshot_value = self.active_cfg.get("nshot", None)
         self.nshot = coerce_to_int(nshot_value, 0, key="active_learning.nshot")
 
@@ -1370,6 +1509,11 @@ class ActiveLearningPipeline:
             'train_pool_size': stats['labeled_count'] + stats['unlabeled_count'],
             'al_selection_log': self.selection_log_path,
             'val_percentage_actual': val_percentage,
+            'use_lora': True,
+            'lora_rank': 8,
+            'lora_alpha': 1,
+            'distill_weight': 10.0,
+            'lora_lr_ratio': 0.1
         }
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
@@ -1422,10 +1566,163 @@ class ActiveLearningPipeline:
         for epoch_in_round in range(1, epochs_this_round + 1):
             self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
 
-        if self.strategy in ('entropy', 'random', 'coreset') and round_idx < self.rounds:
+        if self.strategy in ('entropy', 'random', 'coreset', 'conflict') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)
 
         self.trainer_cfg['completed_rounds'] = round_idx
+
+    def _perform_active_selection(self, round_idx):
+        if self.dataset is None or self.trainer is None:
+            raise RuntimeError("Pipeline not initialized before active selection.")
+
+        strategy = self.strategy
+        if strategy not in ('entropy', 'random', 'coreset', 'conflict'):
+            return
+
+        if not self.unlabeled_indices:
+            skip_msg = (
+                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (no unlabeled samples)."
+            )
+            print(skip_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(skip_msg + '\n')
+            with open(self.selection_log_path, 'a') as f:
+                f.write(f"round {round_idx}: none" + '\n')
+            return
+
+        if self.nshot <= 0:
+            no_shot_msg = (
+                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (nshot={self.nshot})."
+            )
+            print(no_shot_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(no_shot_msg + '\n')
+            with open(self.selection_log_path, 'a') as f:
+                f.write(f"round {round_idx}: none" + '\n')
+            return
+
+        raw_selected = []
+
+        if strategy == 'entropy':
+            entropy_scores = compute_entropy_scores(
+                self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
+            )
+            raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
+        elif strategy == 'random':
+            seed = self.seed + round_idx
+            raw_selected = select_random_indices(
+                self.dataset, self.unlabeled_indices, self.nshot, seed=seed
+            )
+        elif strategy == 'coreset':
+            raw_selected = select_coreset_indices(
+                self.trainer,
+                self.dataset,
+                self.labeled_indices,
+                self.unlabeled_indices,
+                self.nshot,
+                self.batch_size,
+                self.num_workers
+            )
+        elif strategy == 'conflict':
+            conflict_scores = compute_conflict_scores(
+                self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
+            )
+            raw_selected = select_conflict_indices(conflict_scores, self.nshot)
+
+        if not raw_selected:
+            empty_msg = (
+                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) selected no samples."
+            )
+            print(empty_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(empty_msg + '\n')
+            with open(self.selection_log_path, 'a') as f:
+                f.write(f"round {round_idx}: none" + '\n')
+            return
+
+        unlabeled_set = set(self.unlabeled_indices)
+        seen = set()
+        selected_indices = []
+        for idx in raw_selected:
+            if idx in unlabeled_set and idx not in seen:
+                seen.add(idx)
+                selected_indices.append(idx)
+
+        if not selected_indices:
+            duplicate_msg = (
+                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
+                "suggested samples were already labeled."
+            )
+            print(duplicate_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(duplicate_msg + '\n')
+            with open(self.selection_log_path, 'a') as f:
+                f.write(f"round {round_idx}: none" + '\n')
+            return
+
+        existing_labeled = set(self.labeled_indices)
+        new_indices = [idx for idx in selected_indices if idx not in existing_labeled]
+
+        if not new_indices:
+            no_new_msg = (
+                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
+                "all suggested samples were already labeled."
+            )
+            print(no_new_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(no_new_msg + '\n')
+            with open(self.selection_log_path, 'a') as f:
+                f.write(f"round {round_idx}: none" + '\n')
+            return
+
+        prev_labeled = len(self.labeled_indices)
+        prev_unlabeled = len(self.unlabeled_indices)
+
+        new_set = set(new_indices)
+        self.labeled_indices.extend(new_indices)
+        self.unlabeled_indices = [idx for idx in self.unlabeled_indices if idx not in new_set]
+
+        after_labeled = len(self.labeled_indices)
+        after_unlabeled = len(self.unlabeled_indices)
+
+        selection_details = []
+        detail_limit = 20
+        for idx in new_indices[:detail_limit]:
+            class_id = self.dataset.samples[idx][1]
+            class_name = self.classnames[class_id] if class_id < len(self.classnames) else f"Class_{class_id}"
+            selection_details.append(
+                f"  idx={idx} class={class_id} ({class_name}) path={os.path.abspath(self.dataset.samples[idx][0])}"
+            )
+        if len(new_indices) > detail_limit:
+            selection_details.append(f"  ... and {len(new_indices) - detail_limit} more")
+
+        header = f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}):"
+        print(header)
+        with open(self.log_file, 'a') as f:
+            f.write(header + '\n')
+            for line in selection_details:
+                f.write(line + '\n')
+            summary = (
+                f"Selected {len(new_indices)} new samples. "
+                f"Labeled: {after_labeled} (was {prev_labeled}), "
+                f"Unlabeled: {after_unlabeled} (was {prev_unlabeled})."
+            )
+            f.write(summary + '\n')
+            f.write(
+                f"Strategy: {strategy} | round {round_idx}->{round_idx + 1} | nshot={self.nshot}\n"
+            )
+
+        round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
+        with open(self.selection_log_path, 'a') as f:
+            line = ';'.join(round_selected_paths) if round_selected_paths else f"round {round_idx}: none"
+            f.write(line + '\n')
+
+        if bool(get_config_value(self.training_cfg, 'reset_optimizer_per_round', False)):
+            reset_msg = "Resetting optimizer and scheduler for new active samples."
+            print(reset_msg)
+            with open(self.log_file, 'a') as f:
+                f.write(reset_msg + '\n')
+            self.trainer.reset_optimizer_scheduler()
 
     def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
         if self.trainer is None:
@@ -1434,16 +1731,19 @@ class ActiveLearningPipeline:
         start_time = time.time()
         self.trainer.model.train()
         running_loss = 0.0
+        running_distill = 0.0
         running_accuracy = 0.0
         steps = 0
 
         for batch in train_loader:
             loss_dict = self.trainer.train_step(batch)
             running_loss += loss_dict['loss']
+            running_distill += loss_dict['loss_distill']
             running_accuracy += loss_dict['accuracy']
             steps += 1
 
         avg_loss = running_loss / max(1, steps)
+        avg_distill = running_distill / max(1, steps)
         avg_acc = running_accuracy / max(1, steps)
 
         if self.val_loader is not None:
@@ -1488,6 +1788,7 @@ class ActiveLearningPipeline:
             'epoch_in_round': epoch_in_round,
             'epoch_global': self.global_epoch,
             'train_loss': avg_loss,
+            'train_distill_loss': avg_distill,
             'train_acc': avg_acc,
             'val_loss': val_loss_for_metrics,
             'val_acc': val_acc_for_metrics,
@@ -1506,7 +1807,7 @@ class ActiveLearningPipeline:
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
         epoch_str = (
             f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}, step {epoch_in_round}/{epochs_this_round}) - "
-            f"train_loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
+            f"loss={avg_loss:.4f} (distill={avg_distill:.4f}) - train_acc={avg_acc:.2f}% - "
             f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
         )
         print(epoch_str)
@@ -1878,123 +2179,6 @@ class ActiveLearningPipeline:
         log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
         with open(self.log_file, 'a') as f:
             f.write(log_str + '\n')
-
-    def _perform_active_selection(self, round_idx):
-        if self.dataset is None or self.trainer is None:
-            raise RuntimeError("Pipeline not initialized before active selection.")
-        if self.nshot <= 0 or len(self.unlabeled_indices) == 0:
-            skip_msg = (
-                f"Active learning selection ({self.strategy}) (round {round_idx} -> {round_idx + 1}) skipped "
-                f"(nshot={self.nshot}, unlabeled={len(self.unlabeled_indices)})."
-            )
-            print(skip_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(skip_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none\n")
-            return
-
-        if self.strategy == 'entropy':
-            entropy_scores = compute_entropy_scores(
-                self.trainer,
-                self.dataset,
-                self.unlabeled_indices,
-                self.batch_size,
-                self.num_workers
-            )
-            raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
-        elif self.strategy == 'random':
-            raw_selected = select_random_indices(
-                self.dataset,
-                self.unlabeled_indices,
-                self.nshot,
-                seed=self.seed + round_idx
-            )
-        else:
-            raw_selected = select_coreset_indices(
-                self.trainer,
-                self.dataset,
-                self.labeled_indices,
-                self.unlabeled_indices,
-                self.nshot,
-                self.batch_size,
-                self.num_workers
-            )
-
-        seen = set()
-        selected_indices = []
-        for idx in raw_selected:
-            if idx in self.unlabeled_indices and idx not in seen:
-                seen.add(idx)
-                selected_indices.append(int(idx))
-
-        if not selected_indices:
-            msg = (
-                f"Active learning selection ({self.strategy}) (round {round_idx} -> {round_idx + 1}): no samples selected."
-            )
-            print(msg)
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none\n")
-            return
-
-        existing_labeled = set(self.labeled_indices)
-        new_indices = [idx for idx in selected_indices if idx not in existing_labeled]
-        skipped_duplicates = len(selected_indices) - len(new_indices)
-
-        if not new_indices:
-            msg = (
-                f"Active learning selection ({self.strategy}) (round {round_idx} -> {round_idx + 1}): "
-                "all suggested samples were already labeled; no update performed."
-            )
-            print(msg)
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none\n")
-            return
-
-        selected_set = set(new_indices)
-        self.labeled_indices.extend(new_indices)
-        self.unlabeled_indices = [idx for idx in self.unlabeled_indices if idx not in selected_set]
-
-        if skipped_duplicates > 0:
-            duplicate_msg = f"  Skipped {skipped_duplicates} already-labeled samples from selection."
-            with open(self.log_file, 'a') as f:
-                f.write(duplicate_msg + '\n')
-
-        detail_limit = 20
-        selection_details = []
-        for idx in new_indices[:detail_limit]:
-            cls_id = self.dataset.samples[idx][1]
-            class_name = self.classnames[cls_id] if cls_id < len(self.classnames) else f"Class_{cls_id}"
-            selection_details.append(
-                f"  idx={idx} class={cls_id} ({class_name}) path={os.path.abspath(self.dataset.samples[idx][0])}"
-            )
-        if len(new_indices) > detail_limit:
-            selection_details.append(f"  ... and {len(new_indices) - detail_limit} more")
-
-        with open(self.log_file, 'a') as f:
-            header = f"Active learning selection ({self.strategy}) (round {round_idx} -> {round_idx + 1}):"
-            f.write(header + '\n')
-            for line in selection_details:
-                f.write(line + '\n')
-
-        selection_summary = f"Selected {len(new_indices)} new samples using {self.strategy} strategy."
-        print(selection_summary)
-        with open(self.log_file, 'a') as f:
-            f.write(selection_summary + '\n')
-            f.write(
-                f"  Total labeled samples: {len(self.labeled_indices)} (was {len(self.labeled_indices) - len(new_indices)})\n"
-            )
-            f.write(
-                f"  Total unlabeled samples: {len(self.unlabeled_indices)} (was {len(self.unlabeled_indices) + len(new_indices)})\n"
-            )
-
-        round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
-        with open(self.selection_log_path, 'a') as f:
-            f.write(';'.join(round_selected_paths) + '\n')
 
     def _finalize(self):
         if self.trainer is None:
