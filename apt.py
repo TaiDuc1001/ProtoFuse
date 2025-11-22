@@ -9,23 +9,24 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
-from collections import defaultdict, Counter
+from collections import defaultdict
 import argparse
 import datetime
 import json
 import os
 from decode import APTDecoder
-import cv2
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
-import multiprocessing as mp
 import copy
 from thop import profile
 from typing import Any, Dict, List, Optional
-from sklearn.metrics import confusion_matrix
+from utils import (
+    log_decoded_prompts,
+    run_dataset_eda,
+    save_class_distribution_plot,
+    save_confusion_artifacts,
+    visualize_attention_maps,
+    visualize_gradcam_maps,
+)
 
 class CacheAdapter(nn.Module):
     def __init__(self, feature_dim, num_classes, alpha=1.0, beta=1.0, temperature=10.0):
@@ -75,282 +76,6 @@ class CacheAdapter(nn.Module):
         cache_logits = self.get_cache_logits(image_features)
         final_logits = self.beta * apt_logits + self.alpha * cache_logits
         return final_logits
-
-def generate_confusion_matrix_plot(args):
-    cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir = args
-    sub_cm = cm[start_row:end_row, start_col:end_col]
-    fig, ax = plt.subplots(figsize=(8, 8))
-    sns.heatmap(sub_cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=True,
-                xticklabels=[str(j) for j in range(start_col, end_col)], 
-                yticklabels=[str(j) for j in range(start_row, end_row)],
-                annot_kws={"size": 6})
-    ax.set_title(f'Confusion Matrix - Epoch {epoch} (True: {start_row}-{end_row-1}, Pred: {start_col}-{end_col-1})', fontsize=10)
-    ax.set_xlabel('Predicted Label', fontsize=8)
-    ax.set_ylabel('True Label', fontsize=8)
-    plt.tight_layout()
-    plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
-    plt.close()
-
-def compute_conflict_scores_cache(trainer, dataset, indices, batch_size, num_workers):
-    if not indices:
-        return defaultdict(list)
-
-    subset = Subset(dataset, indices)
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    
-    conflict_per_class = defaultdict(list)
-    position = 0
-    trainer.model.eval()
-
-    with torch.no_grad():
-        for images, labels in loader:
-            batch_size_local = images.size(0)
-            batch_indices = indices[position:position + batch_size_local]
-            position += batch_size_local
-            images = images.to(trainer.device)
-
-            # 1. APT Logits (Text Knowledge)
-            # Note: Using original mode='logits'
-            apt_logits = trainer.model(images)
-            if isinstance(apt_logits, (list, tuple)): apt_logits = apt_logits[0]
-            prob_apt = torch.softmax(apt_logits, dim=1)
-
-            # 2. Cache Logits (Image Experience)
-            # Extract frozen image features
-            visual_out = trainer.model.vis_encoder(images)
-            img_feats = visual_out[1]
-            img_feats = F.normalize(img_feats, dim=-1)
-            
-            cache_logits_only = trainer.cache_adapter.get_cache_logits(img_feats)
-            prob_cache = torch.softmax(cache_logits_only, dim=1)
-
-            # KL Divergence: APT || Cache
-            # High KL means APT disagrees with Cache -> Hard/Interesting Sample
-            kl_div = F.kl_div(prob_apt.log(), prob_cache, reduction='none', log_target=False).sum(dim=1)
-
-            for score, lbl, idx in zip(kl_div.cpu().tolist(), labels.cpu().tolist(), batch_indices):
-                conflict_per_class[int(lbl)].append((float(score), int(idx)))
-    
-    return conflict_per_class
-
-def select_global_topk_indices(conflict_per_class, nshot):
-    if nshot <= 0: return []
-    
-    # Flatten all candidates into a single list (score, idx)
-    all_candidates = []
-    for class_id, scores in conflict_per_class.items():
-        all_candidates.extend(scores)
-    
-    if not all_candidates:
-        return []
-        
-    # Sort globally by score (descending) - Winner takes all strategy
-    # We select total_k = nshot * num_classes to match the budget
-    # If nshot is interpreted as 'per class budget', the total is nshot * num_classes
-    # If nshot is 'total budget', then k = nshot.
-    # Based on previous code, 'nshot' seemed to be per-class in random/entropy (iterating classes).
-    # But for Global Top-K, we just pick the top N regardless of class.
-    # Let's assume nshot is passed as the TOTAL budget for the round if strategy is global.
-    # However, standard AL usually defines 'nshot' as 'samples to add'.
-    # Let's calculate K based on the dictionary length to be safe, assuming nshot is per class average budget.
-    # K = nshot * len(conflict_per_class.keys())
-    
-    k = nshot * len(conflict_per_class) # Total budget
-    
-    sorted_candidates = sorted(all_candidates, key=lambda item: item[0], reverse=True)
-    selected = [idx for _, idx in sorted_candidates[:k]]
-    
-    return selected
-
-def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
-    if not indices:
-        return defaultdict(list)
-
-    subset = Subset(dataset, indices)
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    entropy_per_class = defaultdict(list)
-    position = 0
-    eps = 1e-12
-
-    trainer.model.eval()
-
-    with torch.no_grad():
-        for images, labels in loader:
-            batch_size_local = images.size(0)
-            batch_indices = indices[position:position + batch_size_local]
-            position += batch_size_local
-
-            images = images.to(trainer.device)
-            logits = trainer.model(images)
-
-            if isinstance(logits, (list, tuple)):
-                logits = logits[0]
-
-            probs = torch.softmax(logits, dim=1)
-            entropy = -(probs * torch.log(probs + eps)).sum(dim=1)
-
-            for ent, lbl, idx in zip(entropy.cpu().tolist(), labels.cpu().tolist(), batch_indices):
-                entropy_per_class[int(lbl)].append((float(ent), int(idx)))
-
-    return entropy_per_class
-
-def select_high_entropy_indices(entropy_per_class, nshot):
-    if nshot <= 0:
-        return []
-
-    selected = []
-    for class_id in sorted(entropy_per_class.keys()):
-        scores = entropy_per_class[class_id]
-        if not scores:
-            continue
-        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
-        selected.extend(idx for _, idx in sorted_scores[:nshot])
-
-    return selected
-
-def _group_indices_by_class(dataset, indices):
-    grouped = defaultdict(list)
-    for idx in indices:
-        _, class_idx = dataset.samples[idx]
-        grouped[int(class_idx)].append(int(idx))
-    return grouped
-
-def select_random_indices(dataset, indices, nshot, seed=None):
-    if nshot <= 0 or not indices:
-        return []
-
-    rng = random.Random(seed)
-    grouped = _group_indices_by_class(dataset, indices)
-    selected = []
-
-    for class_id in sorted(grouped.keys()):
-        candidates = grouped[class_id]
-        if not candidates:
-            continue
-        k = min(nshot, len(candidates))
-        if k == len(candidates):
-            chosen = list(candidates)
-        else:
-            chosen = rng.sample(candidates, k)
-        selected.extend(chosen)
-
-    return selected
-
-def compute_coreset_embeddings(trainer, dataset, indices, batch_size, num_workers):
-    if not indices:
-        return {}
-
-    subset = Subset(dataset, indices)
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    embeddings = {}
-    position = 0
-
-    original_training_state = trainer.model.training
-    trainer.model.eval()
-
-    old_mode = trainer.model.cfg.get('mode', None) if isinstance(trainer.model.cfg, dict) else None
-    if isinstance(trainer.model.cfg, dict):
-        trainer.model.cfg['mode'] = 'features'
-
-    with torch.no_grad():
-        for images, _ in loader:
-            batch_size_local = images.size(0)
-            batch_indices = indices[position:position + batch_size_local]
-            position += batch_size_local
-
-            images = images.to(trainer.device)
-
-            outputs = trainer.model(images)
-            if isinstance(outputs, (list, tuple)) and len(outputs) == 2:
-                logits, text_features = outputs
-            else:
-                raise RuntimeError("Model in 'features' mode is expected to return (logits, text_features).")
-
-            if isinstance(logits, (list, tuple)):
-                logits = logits[0]
-
-            predicted = torch.argmax(logits, dim=1)
-
-            visual_output = trainer.model.vis_encoder(images)
-            _, image_features = visual_output
-
-            image_features = image_features.to(torch.float32)
-            tuned_features = text_features[torch.arange(text_features.size(0)), predicted].to(torch.float32)
-
-            image_features = F.normalize(image_features, dim=-1)
-            tuned_features = F.normalize(tuned_features, dim=-1)
-
-            combined = torch.cat([image_features, tuned_features], dim=-1)
-
-            combined_cpu = combined.detach().cpu().to(torch.float32)
-
-            for idx, vec in zip(batch_indices, combined_cpu):
-                embeddings[int(idx)] = vec
-
-    if isinstance(trainer.model.cfg, dict):
-        if old_mode is None:
-            trainer.model.cfg.pop('mode', None)
-        else:
-            trainer.model.cfg['mode'] = old_mode
-
-    trainer.model.train(original_training_state)
-
-    return embeddings
-
-def _coreset_greedy_selection(candidates, centers, embeddings, k):
-    if k <= 0 or not candidates:
-        return []
-
-    candidate_pool = list(candidates)
-    selected = []
-
-    center_vectors = [embeddings[idx] for idx in centers if idx in embeddings]
-
-    if not center_vectors:
-        candidate_matrix = torch.stack([embeddings[idx] for idx in candidate_pool]).to(torch.float32)
-        norms = torch.norm(candidate_matrix, dim=1)
-        first_choice = int(torch.argmax(norms).item())
-        first_idx = candidate_pool.pop(first_choice)
-        selected.append(first_idx)
-        center_vectors = [embeddings[first_idx]]
-
-    center_matrix = torch.stack(center_vectors).to(torch.float32)
-
-    while candidate_pool and len(selected) < k:
-        candidate_matrix = torch.stack([embeddings[idx] for idx in candidate_pool]).to(torch.float32)
-        distances = torch.cdist(candidate_matrix, center_matrix)
-        min_distances, _ = torch.min(distances, dim=1)
-        next_choice = int(torch.argmax(min_distances).item())
-        chosen_idx = candidate_pool.pop(next_choice)
-        selected.append(chosen_idx)
-        center_matrix = torch.cat([center_matrix, embeddings[chosen_idx].unsqueeze(0).to(torch.float32)], dim=0)
-
-    return selected
-
-def select_coreset_indices(trainer, dataset, labeled_indices, unlabeled_indices, nshot, batch_size, num_workers):
-    if nshot <= 0 or not unlabeled_indices:
-        return []
-
-    grouped_unlabeled = _group_indices_by_class(dataset, unlabeled_indices)
-    grouped_labeled = _group_indices_by_class(dataset, labeled_indices)
-
-    all_needed_indices = set(unlabeled_indices) | set(labeled_indices)
-    embeddings = compute_coreset_embeddings(trainer, dataset, list(all_needed_indices), batch_size, num_workers)
-
-    selected = []
-
-    for class_id in sorted(grouped_unlabeled.keys()):
-        candidates = grouped_unlabeled[class_id]
-        if not candidates:
-            continue
-        k = min(nshot, len(candidates))
-        centers = grouped_labeled.get(class_id, [])
-        chosen = _coreset_greedy_selection(candidates, centers, embeddings, k)
-        selected.extend(chosen)
-
-    return selected
 
 def infer_override_value(raw):
     lowered = raw.lower()
@@ -1054,24 +779,17 @@ class APT:
         self.model.train(original_mode)
         return gradcams
 
-class ActiveLearningPipeline:
+class APTTrainingPipeline:
     def __init__(self, config):
         self.config = config
         self.model_cfg = get_config_value(config, "model", {}) or {}
         self.training_cfg = get_config_value(config, "training", {}) or {}
         self.data_cfg = get_config_value(config, "data", {}) or {}
-        self.active_cfg = get_config_value(config, "active_learning", {}) or {}
         self.logging_cfg = get_config_value(config, "logging", {}) or {}
 
         device_value = self.training_cfg.get("device", None)
         device_name = coerce_to_str(device_value, "cuda:0", key="training.device")
         self.device = torch.device(device_name if torch.cuda.is_available() else "cpu")
-
-        rounds_value = self.active_cfg.get("rounds", None)
-        self.rounds = max(1, coerce_to_int(rounds_value, 1, key="active_learning.rounds"))
-
-        incr_value = self.training_cfg.get("increment_epochs", None)
-        self.incr_epochs = coerce_to_int(incr_value, 0, key="training.increment_epochs")
 
         batch_value = self.training_cfg.get("batch_size", None)
         self.batch_size = coerce_to_int(batch_value, 8, key="training.batch_size")
@@ -1079,24 +797,12 @@ class ActiveLearningPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
-        kshot_value = self.data_cfg.get("kshot", None)
-        self.initial_kshot = coerce_to_int(kshot_value, 16, key="data.kshot")
-
         val_value = self.data_cfg.get("val_size", None)
         self.val_fraction = coerce_to_float(val_value, 0.2, key="data.val_size")
         if self.val_fraction > 1.0:
             self.val_fraction = self.val_fraction / 100.0
         if self.val_fraction < 0 or self.val_fraction >= 1.0:
             raise ValueError("data.val_size must be in [0, 1) or 0-100 range when expressed as percentage.")
-
-        strategy_value = self.active_cfg.get("strategy", None)
-        if strategy_value is not None and not isinstance(strategy_value, str):
-            raise ValueError("active_learning.strategy must be a string or null.")
-        self.strategy = strategy_value
-        if self.strategy not in (None, "entropy", "random", "coreset", "conflict"):
-            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'conflict'.")
-        nshot_value = self.active_cfg.get("nshot", None)
-        self.nshot = coerce_to_int(nshot_value, 0, key="active_learning.nshot")
 
         dataset_root_value = self.data_cfg.get("root", "./datasets/cub-200-2011-renamed")
         self.dataset_root = coerce_to_str(dataset_root_value, "./datasets/cub-200-2011-renamed", key="data.root")
@@ -1115,6 +821,7 @@ class ActiveLearningPipeline:
         self.best_model_path = os.path.join(self.run_dir, 'best.pt')
         self.last_model_path = os.path.join(self.run_dir, 'last.pt')
         self.log_file = os.path.join(self.run_dir, 'training.log')
+        self.eda_dir = os.path.join(self.run_dir, 'eda')
 
         self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
         self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
@@ -1122,9 +829,10 @@ class ActiveLearningPipeline:
         self.dataset: Optional[ImageFolder] = None
         self.val_loader: Optional[DataLoader] = None
         self.classnames: List[str] = []
+        self.train_indices: List[int] = []
+        self.val_indices: List[int] = []
         self.labeled_indices: List[int] = []
         self.unlabeled_indices: List[int] = []
-        self.val_indices: List[int] = []
         self.metrics: List[Dict[str, Any]] = []
         self.best_val_acc = -float('inf')
         self.global_epoch = 0
@@ -1134,18 +842,20 @@ class ActiveLearningPipeline:
 
         self.trainer: Optional[APT] = None
         self.trainer_cfg: Dict[str, Any] = {}
+        self.rounds = 1
 
     def run(self):
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
-        self._active_learning_loop()
+        self._train_epochs()
         self._finalize()
 
     def _prepare_directories(self):
         os.makedirs(self.run_dir, exist_ok=True)
-        with open(self.selection_log_path, 'w') as f:
+        os.makedirs(self.eda_dir, exist_ok=True)
+        with open(self.log_file, 'w') as f:
             f.write('')
 
     def _build_transforms(self):
@@ -1166,6 +876,7 @@ class ActiveLearningPipeline:
             self.dataset = ImageFolder(self.dataset_root, transform=transform)
         except Exception as exc:
             raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
+        run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
     def _split_dataset(self):
         if self.dataset is None:
@@ -1176,8 +887,7 @@ class ActiveLearningPipeline:
 
         rng = random.Random(self.seed)
         val_indices = []
-        labeled_indices = []
-        unlabeled_indices = []
+        train_indices = []
 
         for class_idx in sorted(samples_by_class_idx.keys()):
             class_samples = list(samples_by_class_idx[class_idx])
@@ -1189,19 +899,15 @@ class ActiveLearningPipeline:
                 val_count = 1
 
             val_part = class_samples[:val_count]
-            remaining = class_samples[val_count:]
-
-            labeled_count = min(len(remaining), self.initial_kshot)
-            labeled_part = remaining[:labeled_count]
-            unlabeled_part = remaining[labeled_count:]
+            train_part = class_samples[val_count:]
 
             val_indices.extend(val_part)
-            labeled_indices.extend(labeled_part)
-            unlabeled_indices.extend(unlabeled_part)
+            train_indices.extend(train_part)
 
         self.val_indices = val_indices
-        self.labeled_indices = labeled_indices
-        self.unlabeled_indices = unlabeled_indices
+        self.train_indices = train_indices
+        self.labeled_indices = list(train_indices)
+        self.unlabeled_indices = []
 
         if len(self.val_indices) > 0:
             val_ds = Subset(self.dataset, self.val_indices)
@@ -1214,22 +920,18 @@ class ActiveLearningPipeline:
         stats = {
             'total_images': len(self.dataset),
             'val_count': len(self.val_indices),
-            'labeled_count': len(self.labeled_indices),
-            'unlabeled_count': len(self.unlabeled_indices)
+            'train_count': len(self.train_indices)
         }
         print(f"Dataset loaded: {stats['total_images']} total images.")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
-        print(
-            f"Train pool size: {stats['labeled_count'] + stats['unlabeled_count']} images "
-            f"({stats['labeled_count']} labeled, {stats['unlabeled_count']} unlabeled)."
-        )
+        print(f"Train split size: {stats['train_count']} images.")
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
             json.dump(trainer_cfg, f, indent=4)
 
-        with open(self.log_file, 'w') as f:
+        with open(self.log_file, 'a') as f:
             f.write(f"Config: {trainer_cfg}\n\n")
             f.write('=' * 50 + '\n')
 
@@ -1264,6 +966,10 @@ class ActiveLearningPipeline:
         dropout_value = get_config_value(self.model_cfg, 'dropout', 0.2)
         dropout = coerce_to_float(dropout_value, 0.2, key='model.dropout')
 
+        cache_alpha = coerce_to_float(get_config_value(self.model_cfg, 'cache_alpha', 1.0), 1.0, key='model.cache_alpha')
+        cache_beta = coerce_to_float(get_config_value(self.model_cfg, 'cache_beta', 1.0), 1.0, key='model.cache_beta')
+        cache_temp = coerce_to_float(get_config_value(self.model_cfg, 'cache_temperature', 5.5), 5.5, key='model.cache_temperature')
+
         trainer_cfg = {
             'backbone': backbone,
             'dataset_name': dataset_name,
@@ -1282,24 +988,19 @@ class ActiveLearningPipeline:
             'generate_confusion_matrix': bool(get_config_value(self.training_cfg, 'confusion_matrix', False)),
             'optimizer': coerce_to_str(optimizer_name, 'SGD', key='training.optimizer.name'),
             'dataset_root': self.dataset_root,
-            'active_learning': self.strategy,
-            'nshot': self.nshot,
             'val_size': self.val_fraction,
             'rounds': self.rounds,
-            'initial_kshot': self.initial_kshot,
             'classnames': self.classnames,
             'num_classes': len(self.classnames),
-            'initial_labeled_size': stats['labeled_count'],
-            'initial_unlabeled_size': stats['unlabeled_count'],
+            'train_size': stats['train_count'],
             'val_size_count': stats['val_count'],
-            'train_pool_size': stats['labeled_count'] + stats['unlabeled_count'],
-            'al_selection_log': self.selection_log_path,
+            'train_pool_size': stats['train_count'],
             'val_percentage_actual': val_percentage,
-            'use_cache': True,
-            'cache_alpha': 1.0,
-            'cache_beta': 1.0,
-            'cache_temperature': 5.5,
-            'reset_optimizer_per_round': True
+            'use_cache': bool(get_config_value(self.training_cfg, 'use_cache', True)),
+            'cache_alpha': cache_alpha,
+            'cache_beta': cache_beta,
+            'cache_temperature': cache_temp,
+            'reset_optimizer_per_round': False
         }
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
@@ -1309,176 +1010,27 @@ class ActiveLearningPipeline:
             raise RuntimeError("Class names unavailable before trainer initialization.")
         self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device), log_file=self.log_file)
 
-    def _active_learning_loop(self):
-        print('\n')
-        print('=' * 50)
-
-        self.trainer.update_cache_memory(self.dataset, self.labeled_indices) # type: ignore
-        
-        for round_idx in range(1, self.rounds + 1):
-            self._run_round(round_idx)
-
-    def _run_round(self, round_idx):
+    def _train_epochs(self):
         if self.dataset is None or self.trainer is None:
-            raise RuntimeError("Pipeline not initialized before running rounds.")
-        round_dir = os.path.join(self.run_dir, f'round_{round_idx:02d}')
+            raise RuntimeError("Pipeline not initialized before training.")
+        if not self.train_indices:
+            raise RuntimeError("No training samples available.")
+
+        round_dir = os.path.join(self.run_dir, 'round_01')
         os.makedirs(round_dir, exist_ok=True)
-
-        if len(self.labeled_indices) == 0:
-            msg = f"Round {round_idx}: no labeled samples available; stopping training."
-            print(msg)
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
-            self.trainer_cfg['completed_rounds'] = round_idx - 1
-            return
-
-        train_subset = Subset(self.dataset, list(self.labeled_indices))
+        train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
-        msg = (
-            f"Starting round {round_idx}/{self.rounds}: {len(self.labeled_indices)} labeled | "
-            f"{len(self.unlabeled_indices)} unlabeled"
-        )
-        print(msg)
-        with open(self.log_file, 'a') as f:
-            f.write(msg + '\n')
+        epochs_value = self.training_cfg.get('epochs', None)
+        epochs_total = coerce_to_int(epochs_value, 150, key='training.epochs')
 
-        base_epochs_value = self.training_cfg.get('epochs', None)
-        base_epochs = coerce_to_int(base_epochs_value, 150, key='training.epochs')
-        epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
-        
-        with open(self.log_file, 'a') as f:
-            f.write(f"  Epochs this round: {epochs_this_round} (base: {base_epochs})\n")
+        if self.trainer.cache_adapter is not None:
+            self.trainer.update_cache_memory(self.dataset, self.train_indices)
 
-        for epoch_in_round in range(1, epochs_this_round + 1):
-            self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
+        for epoch_idx in range(1, epochs_total + 1):
+            self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
 
-        if self.strategy in ('entropy', 'random', 'coreset', 'conflict') and round_idx < self.rounds:
-            self._perform_active_selection(round_idx)
-            self.trainer.reset_optimizer_scheduler()
-            self.trainer.update_cache_memory(self.dataset, self.labeled_indices)
-
-        self.trainer_cfg['completed_rounds'] = round_idx
-
-    def _perform_active_selection(self, round_idx):
-        if self.dataset is None or self.trainer is None:
-            raise RuntimeError("Pipeline not initialized before active selection.")
-
-        strategy = self.strategy
-        if strategy not in ('entropy', 'random', 'coreset', 'conflict'):
-            return
-
-        if not self.unlabeled_indices:
-            skip_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (no unlabeled samples)."
-            )
-            print(skip_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(skip_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
-            return
-
-        if self.nshot <= 0:
-            no_shot_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (nshot={self.nshot})."
-            )
-            print(no_shot_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(no_shot_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
-            return
-
-        raw_selected = []
-
-        if strategy == 'entropy':
-            entropy_scores = compute_entropy_scores(
-                self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
-            )
-            raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
-        elif strategy == 'random':
-            seed = self.seed + round_idx
-            raw_selected = select_random_indices(
-                self.dataset, self.unlabeled_indices, self.nshot, seed=seed
-            )
-        elif strategy == 'coreset':
-            raw_selected = select_coreset_indices(
-                self.trainer,
-                self.dataset,
-                self.labeled_indices,
-                self.unlabeled_indices,
-                self.nshot,
-                self.batch_size,
-                self.num_workers
-            )
-        elif strategy == 'conflict':
-            conflict_scores = compute_conflict_scores_cache(
-                self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
-            )
-            raw_selected = select_global_topk_indices(conflict_scores, self.nshot)
-
-        if not raw_selected:
-            empty_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) selected no samples."
-            )
-            print(empty_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(empty_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
-            return
-
-        unlabeled_set = set(self.unlabeled_indices)
-        seen = set()
-        selected_indices = []
-        for idx in raw_selected:
-            if idx in unlabeled_set and idx not in seen:
-                seen.add(idx)
-                selected_indices.append(idx)
-
-        if not selected_indices:
-            duplicate_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
-                "suggested samples were already labeled."
-            )
-            print(duplicate_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(duplicate_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
-            return
-
-        existing_labeled = set(self.labeled_indices)
-        new_indices = [idx for idx in selected_indices if idx not in existing_labeled]
-
-        if not new_indices:
-            no_new_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
-                "all suggested samples were already labeled."
-            )
-            print(no_new_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(no_new_msg + '\n')
-            with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
-            return
-
-        prev_labeled = len(self.labeled_indices)
-        new_set = set(new_indices)
-        self.labeled_indices.extend(new_indices)
-        self.unlabeled_indices = [idx for idx in self.unlabeled_indices if idx not in new_set]
-        after_labeled = len(self.labeled_indices)
-
-        summary = f"Selected {len(new_indices)} new samples. Labeled: {after_labeled} (was {prev_labeled})."
-        print(summary)
-        with open(self.log_file, 'a') as f:
-            f.write(summary + '\n')
-        
-        round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
-        with open(self.selection_log_path, 'a') as f:
-            line = ';'.join(round_selected_paths) if round_selected_paths else f"round {round_idx}: none"
-            f.write(line + '\n')
+        self.trainer_cfg['completed_rounds'] = 1
 
     def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
         if self.trainer is None:
@@ -1517,21 +1069,28 @@ class ActiveLearningPipeline:
         os.makedirs(maps_dir, exist_ok=True)
 
         if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:
-            self._generate_confusion_outputs(all_labels, all_preds, epoch_dir)
+            save_confusion_artifacts(all_labels, all_preds, self.global_epoch, epoch_dir, self.log_file)
 
         if all_labels:
-            self._generate_class_distribution(all_labels, all_preds, epoch_dir)
+            save_class_distribution_plot(
+                all_labels,
+                all_preds,
+                self.global_epoch,
+                epoch_dir,
+                self.log_file,
+                self.classnames,
+            )
 
-        self._maybe_prepare_samples(all_labels)
+        self._refresh_sample_cache(all_labels)
 
         if bool(get_config_value(self.training_cfg, 'run_decoder', False)):
-            self._maybe_decode_prompts()
+            self._decode_and_log_prompts()
 
         if bool(get_config_value(self.training_cfg, 'visualize_attention', False)):
-            self._maybe_visualize_attention(maps_dir)
+            self._export_attention_overlays(maps_dir)
 
         if bool(get_config_value(self.training_cfg, 'visualize_gradcam', False)):
-            self._maybe_visualize_gradcam(maps_dir)
+            self._export_gradcam_overlays(maps_dir)
 
         epoch_time = time.time() - start_time
         self.metrics.append({
@@ -1563,101 +1122,7 @@ class ActiveLearningPipeline:
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
 
-    def _generate_confusion_outputs(self, all_labels, all_preds, epoch_dir):
-        if self.dataset is None:
-            raise RuntimeError("Dataset not available for confusion outputs.")
-        cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
-        os.makedirs(cm_dir, exist_ok=True)
-
-        cm = confusion_matrix(all_labels, all_preds)
-
-        num_classes = cm.shape[0]
-        if num_classes > 50:
-            block_size = 50
-            step = 50
-            num_blocks_per_dim = (num_classes - block_size) // step + 1
-
-            plot_args = []
-            for row_idx in range(num_blocks_per_dim):
-                for col_idx in range(num_blocks_per_dim):
-                    start_row = row_idx * step
-                    start_col = col_idx * step
-                    end_row = start_row + block_size
-                    end_col = start_col + block_size
-                    plot_args.append((cm, row_idx, col_idx, start_row, start_col, end_row, end_col, self.global_epoch, cm_dir))
-
-            with mp.Pool(processes=min(mp.cpu_count(), 8)) as pool:
-                pool.map(generate_confusion_matrix_plot, plot_args)
-        else:
-            fig, ax = plt.subplots(figsize=(max(16, num_classes // 2), max(16, num_classes // 2)))
-            sns.heatmap(
-                cm,
-                annot=True,
-                fmt='d',
-                cmap='Blues',
-                ax=ax,
-                cbar=True,
-                xticklabels=[str(i) for i in range(num_classes)],
-                yticklabels=[str(i) for i in range(num_classes)],
-                annot_kws={"size": 16}
-            )
-            ax.set_title(f'Confusion Matrix - Epoch {self.global_epoch}', fontsize=12)
-            ax.set_xlabel('Predicted Label', fontsize=12)
-            ax.set_ylabel('True Label', fontsize=12)
-            plt.tight_layout()
-            plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
-            plt.close()
-
-    def _generate_class_distribution(self, all_labels, all_preds, epoch_dir):
-        fig, ax = plt.subplots(figsize=(12, 8))
-        gt_counts = Counter(all_labels)
-        pred_counts = Counter(all_preds)
-
-        classes = sorted(set(gt_counts.keys()) | set(pred_counts.keys()))
-        gt_values = [gt_counts.get(cls, 0) for cls in classes]
-        pred_values = [pred_counts.get(cls, 0) for cls in classes]
-
-        x = np.arange(len(classes))
-        width = 0.35
-
-        bars1 = ax.bar(x - width / 2, gt_values, width, label='Ground Truth', color='skyblue', alpha=0.8)
-        bars2 = ax.bar(x + width / 2, pred_values, width, label='Predictions', color='salmon', alpha=0.8)
-
-        ax.set_xlabel('Class', fontsize=12)
-        ax.set_ylabel('Count', fontsize=12)
-        ax.set_title(f'Class Distribution - Epoch {self.global_epoch}', fontsize=14)
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(cls) for cls in classes], rotation=45, ha='right')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        max_height = max(gt_values + pred_values) if (gt_values or pred_values) else 0
-        for bar in bars1:
-            height = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.,
-                height + max_height * 0.01 if max_height > 0 else 0.5,
-                f'{int(height)}',
-                ha='center',
-                va='bottom',
-                fontsize=8
-            )
-        for bar in bars2:
-            height = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.,
-                height + max_height * 0.01 if max_height > 0 else 0.5,
-                f'{int(height)}',
-                ha='center',
-                va='bottom',
-                fontsize=8
-            )
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(epoch_dir, 'class_distribution.pdf'), dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def _maybe_prepare_samples(self, all_labels):
+    def _refresh_sample_cache(self, all_labels):
         if self.dataset is None:
             return
         if self.val_loader is None or len(self.val_indices) == 0:
@@ -1704,7 +1169,7 @@ class ActiveLearningPipeline:
             self.sample_cache['labels'] = torch.tensor(sample_labels_list)
             self.sample_cache['paths'] = sample_paths
 
-    def _maybe_decode_prompts(self):
+    def _decode_and_log_prompts(self):
         if self.trainer is None:
             return
         images = self.sample_cache['images']
@@ -1713,218 +1178,33 @@ class ActiveLearningPipeline:
 
         decoded_prompts = self.trainer.decode_adapted_prompts(images, entry_length=30, temperature=1.0)
         self.sample_cache['decoded_prompts'] = decoded_prompts
-        if decoded_prompts is None:
-            return
+        log_decoded_prompts(decoded_prompts, self.sample_cache, self.log_file, self.global_epoch)
 
-        prompt_str = f"Generated captions from learned prompts for epoch {self.global_epoch}:"
-        print(prompt_str)
-        with open(self.log_file, 'a') as f:
-            f.write(prompt_str + '\n')
-            for i in range(len(decoded_prompts)):
-                image_prompts = decoded_prompts[i]
-                image_path = self.sample_cache['paths'][i] if i < len(self.sample_cache['paths']) else "Unknown path"
-                label_tensor = self.sample_cache['labels']
-                image_label = None
-                if label_tensor is not None:
-                    try:
-                        image_label = int(label_tensor[i])
-                    except Exception:
-                        image_label = None
-
-                image_str = f"Image ({image_path}):"
-                print(image_str)
-                f.write(image_str + '\n')
-
-                selected_prompt = None
-                if image_label is not None:
-                    for prompt in image_prompts:
-                        if prompt.get('class_id') == image_label:
-                            selected_prompt = prompt
-                            break
-
-                if selected_prompt is None and len(image_prompts) > 0:
-                    selected_prompt = image_prompts[0]
-
-                class_id = selected_prompt.get('class_id', 'unknown') if selected_prompt else 'unknown'
-                class_name = selected_prompt.get('class_name', f"Class_{class_id}") if selected_prompt else 'unknown'
-                caption = selected_prompt.get('generated_caption', 'No caption generated') if selected_prompt else 'No caption generated'
-                caption_line = f"  Class {class_id} ({class_name}): {caption}"
-                print(caption_line)
-                f.write(caption_line + '\n')
-            f.write('\n')
-
-    def _maybe_visualize_attention(self, maps_dir):
+    def _export_attention_overlays(self, maps_dir):
         if self.trainer is None:
             return
-        images = self.sample_cache['images']
-        if images is None:
-            return
+        visualize_attention_maps(
+            self.trainer,
+            self.dataset,
+            self.sample_cache,
+            self.classnames,
+            self.global_epoch,
+            maps_dir,
+            self.log_file,
+        )
 
-        labels = self.sample_cache['labels']
-        self.trainer.model.cfg['mode'] = 'map'
-
-        if isinstance(images, torch.Tensor):
-            vis_images = images.to(self.trainer.device)
-        elif isinstance(images, (list, tuple)):
-            vis_images = torch.stack([
-                x.to(self.trainer.device) if isinstance(x, torch.Tensor) else torch.tensor(x).to(self.trainer.device)
-                for x in images
-            ])
-        else:
-            vis_images = torch.tensor(images).to(self.trainer.device)
-
-        if labels is not None:
-            if isinstance(labels, torch.Tensor):
-                vis_labels = labels.to(self.trainer.device)
-            else:
-                vis_labels = torch.tensor(labels).to(self.trainer.device)
-        else:
-            vis_labels = None
-
-        logits, attn_maps = self.trainer.model(vis_images)
-        self.trainer.model.cfg['mode'] = self.trainer_cfg.get('mode', 'logits')
-
-        attn_map_to_vis = attn_maps[0]
-        try:
-            shape_info = getattr(attn_map_to_vis, 'shape', None)
-            shape_msg = f"Epoch {self.global_epoch} attention map shape: {shape_info}"
-            print(shape_msg)
-            with open(self.log_file, 'a') as lf:
-                lf.write(shape_msg + '\n')
-        except Exception:
-            pass
-
-        for i in range(len(vis_images)):
-            image_path = self.sample_cache['paths'][i]
-            if self.dataset is None:
-                continue
-            if vis_labels is None:
-                msg = f"No label for image {i}, skipping attention visualization."
-                print(msg)
-                with open(self.log_file, 'a') as lf:
-                    lf.write(msg + '\n')
-                continue
-
-            label = int(vis_labels[i].item())
-            try:
-                weights = attn_map_to_vis[i, label, :]
-            except Exception:
-                warn_msg = (
-                    f"Warning: unable to index attention map for image {i}, label {label} with expected layout."
-                    " Skipping visualization."
-                )
-                print(warn_msg)
-                with open(self.log_file, 'a') as lf:
-                    lf.write(warn_msg + '\n')
-                continue
-
-            if weights is None:
-                warn_msg = f"Warning: unable to index attention map for image {i}, label {label}. Skipping visualization."
-                print(warn_msg)
-                with open(self.log_file, 'a') as lf:
-                    lf.write(warn_msg + '\n')
-                continue
-
-            if weights.dim() > 1:
-                mean_weights = weights.mean(dim=0).detach().cpu().numpy()
-            else:
-                mean_weights = weights.detach().cpu().numpy()
-
-            patch_weights = mean_weights[1:]
-
-            stats_msg = (
-                f"Epoch {self.global_epoch} image {i} label {label} attention stats: "
-                f"mean={mean_weights.mean():.6f} min={mean_weights.min():.6f} max={mean_weights.max():.6f}"
-            )
-            print(stats_msg)
-            with open(self.log_file, 'a') as lf:
-                lf.write(stats_msg + '\n')
-
-            num_patches = patch_weights.shape[0]
-            h = w = int(np.sqrt(num_patches))
-            if h * w != num_patches:
-                warn_msg = (
-                    f"Warning: Cannot reshape {num_patches} patches into a square grid. Skipping visualization for image {i}."
-                )
-                print(warn_msg)
-                with open(self.log_file, 'a') as lf:
-                    lf.write(warn_msg + '\n')
-                continue
-
-            heatmap = patch_weights.reshape(h, w)
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-            heatmap = (heatmap * 255).astype(np.uint8)
-
-            original_img = cv2.imread(image_path)
-            if original_img is None:
-                warn_read = f"Warning: unable to read image {image_path}, skipping attention visualization."
-                print(warn_read)
-                with open(self.log_file, 'a') as lf:
-                    lf.write(warn_read + '\n')
-                continue
-            original_img = cv2.resize(original_img, (224, 224))
-            heatmap_img = cv2.applyColorMap(cv2.resize(heatmap, (224, 224)), cv2.COLORMAP_JET)
-            superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0)
-
-            class_name = self.classnames[label] if label < len(self.classnames) else f"Class_{label}"
-            save_name = f"epoch_{self.global_epoch:03d}_img_{i}_class_{label}_{class_name}.jpg"
-            save_path = os.path.join(maps_dir, save_name)
-            cv2.imwrite(save_path, superimposed_img)
-
-        log_str = f"Saved {len(vis_images)} attention visualizations to {maps_dir}"
-        print(log_str)
-        with open(self.log_file, 'a') as f:
-            f.write(log_str + '\n')
-
-    def _maybe_visualize_gradcam(self, maps_dir):
+    def _export_gradcam_overlays(self, maps_dir):
         if self.trainer is None:
             return
-        images = self.sample_cache['images']
-        labels = self.sample_cache['labels']
-        if images is None or labels is None:
-            return
-
-        if isinstance(images, torch.Tensor):
-            vis_images = images.to(self.trainer.device)
-        elif isinstance(images, (list, tuple)):
-            vis_images = torch.stack([
-                x.to(self.trainer.device) if isinstance(x, torch.Tensor) else torch.tensor(x).to(self.trainer.device)
-                for x in images
-            ])
-        else:
-            vis_images = torch.tensor(images).to(self.trainer.device)
-
-        if isinstance(labels, torch.Tensor):
-            vis_labels = labels.to(self.trainer.device)
-        else:
-            vis_labels = torch.tensor(labels).to(self.trainer.device)
-
-        gradcams = self.trainer.generate_gradcam(vis_images, vis_labels)
-
-        for i, gradcam in enumerate(gradcams):
-            image_path = self.sample_cache['paths'][i]
-            if self.dataset is None:
-                continue
-            label = int(vis_labels[i].item())
-
-            heatmap = gradcam.astype(np.float32)
-            heatmap = (heatmap * 255).astype(np.uint8)
-
-            original_img = cv2.imread(image_path)
-            if original_img is None:
-                continue
-            original_img = cv2.resize(original_img, (224, 224))
-            heatmap_img = cv2.applyColorMap(cv2.resize(heatmap, (224, 224)), cv2.COLORMAP_JET)
-            superimposed_img = cv2.addWeighted(original_img, 0.6, heatmap_img, 0.4, 0)
-
-            class_name = self.classnames[label] if label < len(self.classnames) else f"Class_{label}"
-            save_name = f"gradcam_epoch_{self.global_epoch:03d}_img_{i}_class_{label}_{class_name}.jpg"
-            save_path = os.path.join(maps_dir, save_name)
-            cv2.imwrite(save_path, superimposed_img)
-
-        log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
-        with open(self.log_file, 'a') as f:
-            f.write(log_str + '\n')
+        visualize_gradcam_maps(
+            self.trainer,
+            self.dataset,
+            self.sample_cache,
+            self.classnames,
+            self.global_epoch,
+            maps_dir,
+            self.log_file,
+        )
 
     def _finalize(self):
         if self.trainer is None:
@@ -1960,7 +1240,7 @@ def main():
     args, overrides = parse_args()
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
-    pipeline = ActiveLearningPipeline(merged)
+    pipeline = APTTrainingPipeline(merged)
     pipeline.run()
 
 if __name__ == "__main__":
