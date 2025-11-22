@@ -1,22 +1,22 @@
+import os
 import time
 import math
+import copy
+import json
 import torch
 import random
-import torch.nn as nn
+import argparse
+import datetime
+import numpy as np
 from clip import clip
+import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from collections import defaultdict
-import argparse
-import datetime
-import json
-import os
 from decode import APTDecoder
-import numpy as np
-import copy
 from thop import profile
 from typing import Any, Dict, List, Optional
 from utils import (
@@ -144,6 +144,7 @@ class CacheAdapter(nn.Module):
 
     def get_cache_logits(self, image_features):
         if not self.enabled or self.cache_keys.shape[0] == 0:
+            print("Cache is empty or disabled. Returning zero logits.")
             return torch.zeros(image_features.shape[0], self.num_classes, device=image_features.device)
 
         image_features = F.normalize(image_features, dim=-1)
@@ -462,7 +463,7 @@ class CustomCLIP(nn.Module):
         
         logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
 
-        mode = self.training_cfg.get('mode', 'logits')
+        mode = self.cfg.get('mode', self.training_cfg.get('mode', 'logits'))
 
         if self.training and label is not None:
             loss = F.cross_entropy(logits, label)
@@ -471,6 +472,8 @@ class CustomCLIP(nn.Module):
             return logits
         elif mode == "map":
             return logits, attn_maps
+        elif mode == "features":
+            return logits, text_features
 
         return logits
     def _prompt_layers_iter(self):
@@ -543,6 +546,7 @@ class APT:
             value = get_config_value(self.cfg, path, sentinel)
             if value is not sentinel:
                 return value
+            print(f"Config path '{path}' not found. Using default value: {default}")
         return default
     
     def _cfg_float(self, default, *paths):
@@ -638,9 +642,9 @@ class APT:
         self.model.to(self.device)
     
     def setup_optimizer(self):
-        lr = self._cfg_float(0.002, 'training.optimizer.learning_rate', 'training.learning_rate', 'learning_rate')
-        weight_decay = self._cfg_float(0.0005, 'training.optimizer.weight_decay', 'training.weight_decay', 'weight_decay')
-        optimizer_type = self._cfg_str('SGD', 'training.optimizer.name', 'optimizer')
+        lr = self._cfg_float(0.002, 'training.learning_rate')
+        weight_decay = self._cfg_float(0.0005, 'training.weight_decay')
+        optimizer_type = self._cfg_str('SGD', 'training.optimizer')
         trainable_params = list(self.model.trainable_parameters())
         
         if optimizer_type == 'AdamW':
@@ -692,7 +696,7 @@ class APT:
             keys = torch.cat(all_keys, dim=0)
             lbls = torch.cat(all_labels, dim=0)
             self.cache_adapter.update_cache(keys, lbls)
-            msg = f"Cache Updated: {keys.shape[0]} samples stored."
+            msg = f"Cache updated: {keys.shape[0]} samples stored."
             print(msg)
             if self.log_file:
                 with open(self.log_file, 'a') as f:
@@ -853,7 +857,6 @@ class APT:
         gradcams = []
         
         for i in range(batch_size):
-            target_class = target_classes[i]
             base_text = self.model._prepare_text_features()
             unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
             text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
@@ -875,6 +878,7 @@ class APT:
             
             if target_unpooled.grad is None:
                 gradcams.append(np.zeros((8, 8)))
+                print("Warning: Empty CAM encountered.")
                 continue
             gradients = target_unpooled.grad[i]
             activations = target_unpooled[i]
@@ -891,7 +895,9 @@ class APT:
                     cam = cam.reshape(grid_size, grid_size)
                 else:
                     cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
+                    print("Warning: CAM size is not a perfect square, padding to make it square.")
             else:
+                print("Warning: Empty CAM encountered.")
                 cam = np.zeros((8, 8))
             
             gradcams.append(cam)
@@ -936,10 +942,20 @@ class APTTrainingPipeline:
         seed_value = self.data_cfg.get("seed", None)
         self.seed = coerce_to_int(seed_value, 42, key="data.seed")
 
+        kshot_value = self.data_cfg.get("kshot", None)
+        self.kshot = coerce_to_int(kshot_value, -1, key="data.kshot")
+
+        run_eda_value = get_config_value(self.data_cfg, "run_eda", True)
+        self.run_eda = bool(True if run_eda_value is None else run_eda_value)
+
+        class_dist_value = get_config_value(self.training_cfg, "class_distribution", True)
+        self.class_distribution_enabled = bool(True if class_dist_value is None else class_dist_value)
+
         base_output_value = self.logging_cfg.get("output_dir", "outputs")
         base_output = coerce_to_str(base_output_value, "outputs", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
+        print(f"Run directory: {self.run_dir}")
         self.selection_log_path = os.path.join(self.run_dir, 'al_selected_paths.log')
         self.config_path = os.path.join(self.run_dir, 'config.json')
         self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
@@ -1002,7 +1018,8 @@ class APTTrainingPipeline:
             self.dataset = ImageFolder(self.dataset_root, transform=transform)
         except Exception as exc:
             raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
-        run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+        if self.run_eda:
+            run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
     def _split_dataset(self):
         if self.dataset is None:
@@ -1014,6 +1031,7 @@ class APTTrainingPipeline:
         rng = random.Random(self.seed)
         val_indices = []
         train_indices = []
+        unlabeled_indices = []
 
         for class_idx in sorted(samples_by_class_idx.keys()):
             class_samples = list(samples_by_class_idx[class_idx])
@@ -1025,15 +1043,22 @@ class APTTrainingPipeline:
                 val_count = 1
 
             val_part = class_samples[:val_count]
-            train_part = class_samples[val_count:]
+            train_candidates = class_samples[val_count:]
+            if self.kshot > 0:
+                labeled_part = train_candidates[:self.kshot]
+                leftover_part = train_candidates[self.kshot:]
+            else:
+                labeled_part = train_candidates
+                leftover_part = []
 
             val_indices.extend(val_part)
-            train_indices.extend(train_part)
+            train_indices.extend(labeled_part)
+            unlabeled_indices.extend(leftover_part)
 
         self.val_indices = val_indices
         self.train_indices = train_indices
         self.labeled_indices = list(train_indices)
-        self.unlabeled_indices = []
+        self.unlabeled_indices = unlabeled_indices
 
         if len(self.val_indices) > 0:
             val_ds = Subset(self.dataset, self.val_indices)
@@ -1046,12 +1071,17 @@ class APTTrainingPipeline:
         stats = {
             'total_images': len(self.dataset),
             'val_count': len(self.val_indices),
-            'train_count': len(self.train_indices)
+            'train_count': len(self.train_indices),
+            'labeled_count': len(self.train_indices),
+            'unlabeled_count': len(self.unlabeled_indices),
+            'train_pool_size': len(self.train_indices) + len(self.unlabeled_indices)
         }
         print(f"Dataset loaded: {stats['total_images']} total images.")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
         print(f"Train split size: {stats['train_count']} images.")
+        if stats['unlabeled_count'] > 0:
+            print(f"Unlabeled pool size: {stats['unlabeled_count']} images.")
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
@@ -1068,11 +1098,11 @@ class APTTrainingPipeline:
             'rounds': self.rounds,
             'classnames': self.classnames,
             'num_classes': len(self.classnames),
-            'train_size': stats['train_count'],
+            'train_size': stats.get('labeled_count', stats['train_count']),
             'val_size_count': stats['val_count'],
-            'train_pool_size': stats['train_count'],
+            'train_pool_size': stats.get('train_pool_size', stats['train_count'] + stats.get('unlabeled_count', 0)),
+            'unlabeled_pool_size': stats.get('unlabeled_count', 0),
             'val_percentage_actual': val_percentage,
-            'reset_optimizer_per_round': False,
             'completed_rounds': 0,
         }
 
@@ -1146,7 +1176,7 @@ class APTTrainingPipeline:
         if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:
             save_confusion_artifacts(all_labels, all_preds, self.global_epoch, epoch_dir, self.log_file)
 
-        if all_labels:
+        if self.class_distribution_enabled and all_labels:
             save_class_distribution_plot(
                 all_labels,
                 all_preds,
@@ -1186,7 +1216,7 @@ class APTTrainingPipeline:
         val_loss_display = f"{val_loss:.4f}" if self.val_loader is not None else "N/A"
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
         epoch_str = (
-            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}) - "
+            f"Epoch {self.global_epoch}/{self.total_epochs} (round {round_idx}/{self.rounds}) - " # type: ignore
             f"loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
             f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
         )

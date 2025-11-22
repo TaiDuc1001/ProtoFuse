@@ -1,7 +1,7 @@
 import os
 import random
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import cv2
 import matplotlib
@@ -16,6 +16,9 @@ import seaborn as sns
 import torch
 from PIL import Image
 from sklearn.metrics import confusion_matrix
+from sklearn.manifold import TSNE
+
+import umap
 
 
 def generate_confusion_matrix_plot(args):
@@ -180,6 +183,230 @@ def save_class_distribution_plot(
     if log_file is not None:
         with open(log_file, 'a') as f:
             f.write(summary + '\n')
+
+
+def _flatten_score_values(score_map: Dict[int, List[Any]]) -> List[float]:
+    values: List[float] = []
+    for entries in score_map.values():
+        for item in entries:
+            if isinstance(item, (list, tuple)) and item:
+                values.append(float(item[0]))
+            elif isinstance(item, (int, float)):
+                values.append(float(item))
+            elif isinstance(item, str):
+                try:
+                    values.append(float(item))
+                except ValueError:
+                    continue
+    return values
+
+
+def _plot_score_distribution(
+    values: List[float],
+    title: str,
+    xlabel: str,
+    output_path: str,
+    color: str,
+    log_file: Optional[str],
+) -> None:
+    if not values:
+        return
+
+    directory = os.path.dirname(output_path) or '.'
+    os.makedirs(directory, exist_ok=True)
+
+    plt.figure(figsize=(10, 6))
+    bins = min(50, max(10, len(values) // 5))
+    sns.histplot(values, bins=bins, kde=True, color=color, alpha=0.85)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel('Frequency')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+    summary = f"{title} saved to {output_path}"
+    print(summary)
+    if log_file is not None:
+        with open(log_file, 'a') as f:
+            f.write(summary + '\n')
+
+
+def plot_entropy_distribution(
+    entropy_scores: Dict[int, List[Any]],
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+) -> None:
+    values = _flatten_score_values(entropy_scores)
+    title = f"Entropy Score Distribution - Round {round_idx}"
+    _plot_score_distribution(values, title, 'Entropy', output_path, '#3b7dd8', log_file)
+
+
+def plot_conflict_distribution(
+    conflict_scores: Dict[int, List[Any]],
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+) -> None:
+    values = _flatten_score_values(conflict_scores)
+    title = f"Conflict Score Distribution - Round {round_idx}"
+    _plot_score_distribution(values, title, 'KL-Divergence', output_path, '#d83b73', log_file)
+
+
+def _prepare_coreset_embedding_matrix(
+    embeddings: Dict[int, torch.Tensor],
+    labeled_indices: Sequence[int],
+    unlabeled_indices: Sequence[int],
+    selected_indices: Sequence[int],
+):
+    if not embeddings:
+        return None, None
+
+    status_map: Dict[int, str] = {}
+    for idx in labeled_indices:
+        status_map[int(idx)] = 'labeled'
+    for idx in unlabeled_indices:
+        status_map.setdefault(int(idx), 'unlabeled')
+    for idx in selected_indices:
+        status_map[int(idx)] = 'selected'
+
+    vectors: List[np.ndarray] = []
+    statuses: List[str] = []
+    for idx, status in status_map.items():
+        vec = embeddings.get(idx)
+        if vec is None:
+            continue
+        if isinstance(vec, torch.Tensor):
+            vec_np = vec.detach().cpu().numpy()
+        else:
+            vec_np = np.asarray(vec)
+        if vec_np.ndim > 1:
+            vec_np = vec_np.reshape(-1)
+        vectors.append(vec_np.astype(np.float32))
+        statuses.append(status)
+
+    if len(vectors) < 2:
+        return None, None
+
+    matrix = np.stack(vectors)
+    return matrix, np.array(statuses)
+
+
+def _plot_embedding_projection(
+    coords: np.ndarray,
+    statuses: np.ndarray,
+    method_name: str,
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+) -> None:
+    if coords.size == 0:
+        return
+
+    directory = os.path.dirname(output_path) or '.'
+    os.makedirs(directory, exist_ok=True)
+
+    plt.figure(figsize=(10, 8))
+    order = ['labeled', 'unlabeled', 'selected']
+    style_map = {
+        'labeled': {'color': '#1f77b4', 'marker': 'o', 'size': 30, 'alpha': 0.6},
+        'unlabeled': {'color': '#7f7f7f', 'marker': 'o', 'size': 20, 'alpha': 0.4},
+        'selected': {'color': '#d62728', 'marker': 'X', 'size': 80, 'alpha': 0.9},
+    }
+
+    for status in order:
+        mask = statuses == status
+        if not np.any(mask):
+            continue
+        style = style_map.get(status, style_map['unlabeled'])
+        plt.scatter(
+            coords[mask, 0],
+            coords[mask, 1],
+            s=style['size'],
+            c=style['color'],
+            alpha=style['alpha'],
+            marker=style['marker'],
+            label=status.capitalize(),
+            edgecolors='none',
+        )
+
+    plt.title(f"Coreset Embeddings ({method_name}) - Round {round_idx}")
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=250, bbox_inches='tight')
+    plt.close()
+
+    summary = f"Coreset embedding plot ({method_name}) saved to {output_path}"
+    print(summary)
+    if log_file is not None:
+        with open(log_file, 'a') as f:
+            f.write(summary + '\n')
+
+
+def plot_coreset_embedding_umap(
+    embeddings: Dict[int, torch.Tensor],
+    labeled_indices: Sequence[int],
+    unlabeled_indices: Sequence[int],
+    selected_indices: Sequence[int],
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+    random_state: int = 42,
+) -> None:
+    if umap is None:
+        msg = "UMAP is not installed; skipping UMAP plot."
+        print(msg)
+        if log_file is not None:
+            with open(log_file, 'a') as f:
+                f.write(msg + '\n')
+        return
+
+    matrix, statuses = _prepare_coreset_embedding_matrix(
+        embeddings, labeled_indices, unlabeled_indices, selected_indices
+    )
+    if matrix is None or statuses is None:
+        print("No embeddings available for UMAP plot; skipping.")
+        return
+
+    n_neighbors = max(2, min(15, matrix.shape[0] - 1))
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=None, n_jobs=-1)
+    coords = reducer.fit_transform(matrix)
+    _plot_embedding_projection(coords, statuses, 'UMAP', round_idx, output_path, log_file) # type: ignore
+
+
+def plot_coreset_embedding_tsne(
+    embeddings: Dict[int, torch.Tensor],
+    labeled_indices: Sequence[int],
+    unlabeled_indices: Sequence[int],
+    selected_indices: Sequence[int],
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+    random_state: int = 42,
+) -> None:
+    matrix, statuses = _prepare_coreset_embedding_matrix(
+        embeddings, labeled_indices, unlabeled_indices, selected_indices
+    )
+    if matrix is None or statuses is None:
+        print("No embeddings available for t-SNE plot; skipping.")
+        return
+
+    if matrix.shape[0] < 3:
+        msg = "Not enough samples for t-SNE projection; skipping plot."
+        print(msg)
+        if log_file is not None:
+            with open(log_file, 'a') as f:
+                f.write(msg + '\n')
+        return
+
+    perplexity = max(5, min(30, matrix.shape[0] - 1))
+    reducer = TSNE(n_components=2, perplexity=perplexity, init='pca', random_state=random_state)
+    coords = reducer.fit_transform(matrix)
+    _plot_embedding_projection(coords, statuses, 't-SNE', round_idx, output_path, log_file)
 
 
 def log_decoded_prompts(

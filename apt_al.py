@@ -21,6 +21,12 @@ from apt import (
     process_parsed_args,
     set_nested_value,
 )
+from utils import (
+    plot_conflict_distribution,
+    plot_entropy_distribution,
+    plot_coreset_embedding_tsne,
+    plot_coreset_embedding_umap,
+)
 
 AL_ARG_SCHEMA = {
     **ARG_SCHEMA,
@@ -29,6 +35,10 @@ AL_ARG_SCHEMA = {
 
 def compute_conflict_scores_cache(trainer, dataset, indices, batch_size, num_workers):
     if not indices:
+        return defaultdict(list)
+
+    if trainer.cache_adapter is None:
+        print("Warning: Cache adapter is None, but conflict strategy is selected. Returning empty scores.")
         return defaultdict(list)
 
     subset = Subset(dataset, indices)
@@ -280,6 +290,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
 
         rounds_value = self.active_cfg.get("rounds", None)
         self.rounds = max(1, coerce_to_int(rounds_value, 1, key="active_learning.rounds"))
+        print(f"ActiveLearningPipeline: rounds={self.rounds}")
 
         incr_value = self.training_cfg.get("increment_epochs", None)
         self.incr_epochs = coerce_to_int(incr_value, 0, key="training.increment_epochs")
@@ -296,6 +307,12 @@ class ActiveLearningPipeline(APTTrainingPipeline):
 
         nshot_value = self.active_cfg.get("nshot", None)
         self.nshot = coerce_to_int(nshot_value, 0, key="active_learning.nshot")
+
+        self.plot_entropy_distribution = bool(self.config.get("plot_entropy_distribution", self.active_cfg.get("plot_entropy_distribution", False)))
+        self.plot_conflict_distribution = bool(self.config.get("plot_conflict_distribution", self.active_cfg.get("plot_conflict_distribution", False)))
+        self.plot_coreset_embedding_umap = bool(self.config.get("plot_coreset_embedding_umap", self.active_cfg.get("plot_coreset_embedding_umap", False)))
+        self.plot_coreset_embedding_tsne = bool(self.config.get("plot_coreset_embedding_tsne", self.active_cfg.get("plot_coreset_embedding_tsne", False)))
+        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_conflict_distribution={self.plot_conflict_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
 
     def run(self):
         self._prepare_directories()
@@ -359,13 +376,14 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             'val_count': len(self.val_indices),
             'labeled_count': len(self.labeled_indices),
             'unlabeled_count': len(self.unlabeled_indices),
-            'train_count': len(self.labeled_indices) + len(self.unlabeled_indices),
+            'train_count': len(self.labeled_indices),
+            'train_pool_size': len(self.labeled_indices) + len(self.unlabeled_indices),
         }
         print(f"Dataset loaded: {stats['total_images']} total images.")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
         print(
-            f"Train pool size: {stats['labeled_count'] + stats['unlabeled_count']} images "
+            f"Train pool size: {stats['train_pool_size']} images "
             f"({stats['labeled_count']} labeled, {stats['unlabeled_count']} unlabeled)."
         )
 
@@ -385,15 +403,25 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         meta.initial_kshot = self.initial_kshot
         meta.initial_labeled_size = stats.get('labeled_count', 0)
         meta.initial_unlabeled_size = stats.get('unlabeled_count', 0)
-        meta.train_pool_size = stats.get('train_count', meta.get('train_pool_size', 0))
+        meta.train_pool_size = stats.get('train_pool_size', stats.get('train_count', meta.get('train_pool_size', 0)))
         meta.al_selection_log = self.selection_log_path
-        meta.reset_optimizer_per_round = True
+        meta.reset_optimizer_per_round = self.active_cfg.get('reset_optimizer_per_round', True)
+
+        if self.strategy == 'conflict':
+            if 'model' not in trainer_cfg:
+                trainer_cfg['model'] = ConfigNode()
+            trainer_cfg.model.use_cache = True
+
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
 
     def _active_learning_loop(self):
         print('\n')
         print('=' * 50)
+
+        base_epochs = coerce_to_int(self.training_cfg.get('epochs', None), 150, key='training.epochs')
+        incr_epochs = self.incr_epochs
+        self.total_epochs = sum(base_epochs + (r - 1) * incr_epochs for r in range(1, self.rounds + 1))
 
         self.trainer.update_cache_memory(self.dataset, self.labeled_indices)  # type: ignore
 
@@ -472,12 +500,29 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 f.write(f"round {round_idx}: none" + '\n')
             return
 
+        need_entropy_plot = self.plot_entropy_distribution and strategy == 'entropy'
+        need_conflict_plot = self.plot_conflict_distribution and strategy == 'conflict'
+        need_coreset_plot = (
+            (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy == 'coreset'
+        )
+
+        selection_plot_dir = None
+        if need_entropy_plot or need_conflict_plot or need_coreset_plot:
+            selection_plot_dir = os.path.join(self.run_dir, f'round_{round_idx:02d}', 'selection_plots')
+            os.makedirs(selection_plot_dir, exist_ok=True)
+
         raw_selected = []
+        coreset_embeddings = None
 
         if strategy == 'entropy':
             entropy_scores = compute_entropy_scores(
                 self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
             )
+            if need_entropy_plot and selection_plot_dir is not None:
+                entropy_plot_path = os.path.join(
+                    selection_plot_dir, f'entropy_distribution_round_{round_idx:02d}.pdf'
+                )
+                plot_entropy_distribution(entropy_scores, round_idx, entropy_plot_path, self.log_file)
             raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
         elif strategy == 'random':
             seed = self.seed + round_idx
@@ -494,10 +539,46 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 self.batch_size,
                 self.num_workers
             )
+            if need_coreset_plot and selection_plot_dir is not None:
+                combined_indices = list(dict.fromkeys(self.labeled_indices + self.unlabeled_indices))
+                coreset_embeddings = compute_coreset_embeddings(
+                    self.trainer,
+                    self.dataset,
+                    combined_indices,
+                    self.batch_size,
+                    self.num_workers
+                )
+                plot_base = os.path.join(selection_plot_dir, f'coreset_round_{round_idx:02d}')
+                if coreset_embeddings:
+                    if self.plot_coreset_embedding_umap:
+                        plot_coreset_embedding_umap(
+                            coreset_embeddings,
+                            self.labeled_indices,
+                            self.unlabeled_indices,
+                            raw_selected,
+                            round_idx,
+                            f"{plot_base}_umap.pdf",
+                            self.log_file,
+                        )
+                    if self.plot_coreset_embedding_tsne:
+                        plot_coreset_embedding_tsne(
+                            coreset_embeddings,
+                            self.labeled_indices,
+                            self.unlabeled_indices,
+                            raw_selected,
+                            round_idx,
+                            f"{plot_base}_tsne.pdf",
+                            self.log_file,
+                        )
         elif strategy == 'conflict':
             conflict_scores = compute_conflict_scores_cache(
                 self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
             )
+            if need_conflict_plot and selection_plot_dir is not None:
+                conflict_plot_path = os.path.join(
+                    selection_plot_dir, f'conflict_distribution_round_{round_idx:02d}.pdf'
+                )
+                plot_conflict_distribution(conflict_scores, round_idx, conflict_plot_path, self.log_file)
             raw_selected = select_global_topk_indices(conflict_scores, self.nshot)
 
         if not raw_selected:
