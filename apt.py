@@ -28,6 +28,131 @@ from utils import (
     visualize_gradcam_maps,
 )
 
+CONFIG_SCHEMA = {
+    'model': {
+        'backbone': {'type': str, 'default': 'ViT-B/32'},
+        'dataset_name': {'type': str, 'default': 'CUBirds'},
+        'num_heads': {'type': int, 'default': 8},
+        'num_layers': {'type': int, 'default': 1},
+        'dropout': {'type': float, 'default': 0.2},
+        'cache_alpha': {'type': float, 'default': 1.0},
+        'cache_beta': {'type': float, 'default': 1.0},
+        'cache_temperature': {'type': float, 'default': 5.5},
+    },
+    'training': {
+        'precision': {'type': str, 'default': 'fp32'},
+        'learning_rate': {'type': float, 'default': 0.001},
+        'weight_decay': {'type': float, 'default': 0.0005},
+        'epochs': {'type': int, 'default': 150},
+        'mode': {'type': str, 'default': 'logits'},
+        'optimizer': {'type': str, 'default': 'SGD', 'nested': {'name': str, 'learning_rate': float, 'weight_decay': float}},
+        'run_decoder': {'type': bool, 'default': False},
+        'visualize_attention': {'type': bool, 'default': False},
+        'visualize_gradcam': {'type': bool, 'default': False},
+        'use_cutout': {'type': bool, 'default': False},
+        'confusion_matrix': {'type': bool, 'default': False},
+        'use_cache': {'type': bool, 'default': True},
+    }
+}
+
+ARG_SCHEMA = {
+    'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
+    'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
+    'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
+}
+
+def build_dynamic_config(base_config, schema, stats=None, extra_values=None):
+    config = {}
+    extra_values = extra_values or {}
+    
+    def coerce_bool(value, default, key=None):
+        return bool(value) if value is not None else bool(default)
+    
+    coerce_funcs = {
+        str: coerce_to_str,
+        int: coerce_to_int,
+        float: coerce_to_float,
+        bool: coerce_bool
+    }
+    
+    for section, fields in schema.items():
+        section_config = base_config.get(section, {})
+        
+        for field, spec in fields.items():
+            key_path = f"{section}.{field}"
+            
+            if field == 'optimizer' and isinstance(section_config.get('optimizer'), dict):
+                optimizer_section = section_config['optimizer']
+                config['optimizer'] = coerce_to_str(
+                    optimizer_section.get('name', spec['default']), 
+                    spec['default'], 
+                    key=f"{key_path}.name"
+                )
+                config['learning_rate'] = coerce_to_float(
+                    optimizer_section.get('learning_rate', section_config.get('learning_rate', 0.001)),
+                    0.001, 
+                    key=f"{key_path}.learning_rate"
+                )
+                config['weight_decay'] = coerce_to_float(
+                    optimizer_section.get('weight_decay', section_config.get('weight_decay', 0.0005)),
+                    0.0005, 
+                    key=f"{key_path}.weight_decay"
+                )
+            else:
+                raw_value = get_config_value(base_config, key_path, spec['default'])
+                coerce_func = coerce_funcs[spec['type']]
+                config[field] = coerce_func(raw_value, spec['default'], key=key_path)
+    
+    config.update(extra_values)
+    return config
+
+def create_argument_parser(description, arg_schema):
+    parser = argparse.ArgumentParser(description=description)
+    
+    for arg_name, spec in arg_schema.items():
+        kwargs = {
+            'type': spec['type'],
+            'help': spec['help']
+        }
+        if spec.get('required'):
+            kwargs['required'] = True
+        else:
+            kwargs['default'] = None
+            
+        parser.add_argument(f'--{arg_name}', **kwargs)
+    
+    return parser
+
+def process_parsed_args(parsed_args, arg_schema, overrides):
+    for arg_name, spec in arg_schema.items():
+        value = getattr(parsed_args, arg_name)
+        if value is not None and 'config_path' in spec:
+            keys = spec['config_path'].split('.')
+            set_nested_value(overrides, keys, value)
+    return overrides
+
+def extend_config_schema(base_schema, extensions):
+    extended = dict(base_schema)
+    for section, fields in extensions.items():
+        if section in extended:
+            extended[section] = {**extended[section], **fields}
+        else:
+            extended[section] = fields
+    return extended
+
+def add_argument_to_schema(base_schema, arg_name, arg_type, help_text, config_path=None, required=False):
+    extended = dict(base_schema)
+    spec = {
+        'type': arg_type,
+        'help': help_text
+    }
+    if config_path:
+        spec['config_path'] = config_path
+    if required:
+        spec['required'] = True
+    extended[arg_name] = spec
+    return extended
+
 class CacheAdapter(nn.Module):
     def __init__(self, feature_dim, num_classes, alpha=1.0, beta=1.0, temperature=10.0):
         super().__init__()
@@ -936,57 +1061,7 @@ class APTTrainingPipeline:
             f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
-        optimizer_section = self.training_cfg.get('optimizer', {})
-        if isinstance(optimizer_section, dict):
-            optimizer_name = optimizer_section.get('name', 'SGD')
-            lr_value = optimizer_section.get('learning_rate', self.training_cfg.get('learning_rate', 0.001))
-            wd_value = optimizer_section.get('weight_decay', self.training_cfg.get('weight_decay', 0.0005))
-        else:
-            optimizer_name = optimizer_section if isinstance(optimizer_section, str) else 'SGD'
-            lr_value = self.training_cfg.get('learning_rate', 0.001)
-            wd_value = self.training_cfg.get('weight_decay', 0.0005)
-
-        learning_rate = coerce_to_float(lr_value, 0.001, key='training.optimizer.learning_rate')
-        weight_decay = coerce_to_float(wd_value, 0.0005, key='training.optimizer.weight_decay')
-        precision_value = self.training_cfg.get('precision', 'fp32')
-        precision = coerce_to_str(precision_value, 'fp32', key='training.precision')
-        mode_value = self.training_cfg.get('mode', 'logits')
-        mode = coerce_to_str(mode_value, 'logits', key='training.mode')
-        epochs_value = self.training_cfg.get('epochs', 150)
-        num_epochs = coerce_to_int(epochs_value, 150, key='training.epochs')
-
-        backbone_value = get_config_value(self.model_cfg, 'backbone', 'ViT-B/32')
-        backbone = coerce_to_str(backbone_value, 'ViT-B/32', key='model.backbone')
-        dataset_name_value = get_config_value(self.model_cfg, 'dataset_name', 'CUBirds')
-        dataset_name = coerce_to_str(dataset_name_value, 'CUBirds', key='model.dataset_name')
-        num_heads_value = get_config_value(self.model_cfg, 'num_heads', 8)
-        num_heads = coerce_to_int(num_heads_value, 8, key='model.num_heads')
-        num_layers_value = get_config_value(self.model_cfg, 'num_layers', 1)
-        num_layers = coerce_to_int(num_layers_value, 1, key='model.num_layers')
-        dropout_value = get_config_value(self.model_cfg, 'dropout', 0.2)
-        dropout = coerce_to_float(dropout_value, 0.2, key='model.dropout')
-
-        cache_alpha = coerce_to_float(get_config_value(self.model_cfg, 'cache_alpha', 1.0), 1.0, key='model.cache_alpha')
-        cache_beta = coerce_to_float(get_config_value(self.model_cfg, 'cache_beta', 1.0), 1.0, key='model.cache_beta')
-        cache_temp = coerce_to_float(get_config_value(self.model_cfg, 'cache_temperature', 5.5), 5.5, key='model.cache_temperature')
-
-        trainer_cfg = {
-            'backbone': backbone,
-            'dataset_name': dataset_name,
-            'num_heads': num_heads,
-            'num_layers': num_layers,
-            'dropout': dropout,
-            'precision': precision,
-            'learning_rate': learning_rate,
-            'weight_decay': weight_decay,
-            'num_epochs': num_epochs,
-            'mode': mode,
-            'run_decoder': bool(get_config_value(self.training_cfg, 'run_decoder', False)),
-            'visualize_attention': bool(get_config_value(self.training_cfg, 'visualize_attention', False)),
-            'visualize_gradcam': bool(get_config_value(self.training_cfg, 'visualize_gradcam', False)),
-            'use_cutout': bool(get_config_value(self.training_cfg, 'use_cutout', False)),
-            'generate_confusion_matrix': bool(get_config_value(self.training_cfg, 'confusion_matrix', False)),
-            'optimizer': coerce_to_str(optimizer_name, 'SGD', key='training.optimizer.name'),
+        extra_values = {
             'dataset_root': self.dataset_root,
             'val_size': self.val_fraction,
             'rounds': self.rounds,
@@ -996,12 +1071,12 @@ class APTTrainingPipeline:
             'val_size_count': stats['val_count'],
             'train_pool_size': stats['train_count'],
             'val_percentage_actual': val_percentage,
-            'use_cache': bool(get_config_value(self.training_cfg, 'use_cache', True)),
-            'cache_alpha': cache_alpha,
-            'cache_beta': cache_beta,
-            'cache_temperature': cache_temp,
-            'reset_optimizer_per_round': False
+            'reset_optimizer_per_round': False,
+            'num_epochs': build_dynamic_config(self.config, CONFIG_SCHEMA)['epochs'],
+            'generate_confusion_matrix': build_dynamic_config(self.config, CONFIG_SCHEMA)['confusion_matrix']
         }
+        
+        trainer_cfg = build_dynamic_config(self.config, CONFIG_SCHEMA, stats, extra_values)
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
 
@@ -1224,16 +1299,10 @@ class APTTrainingPipeline:
             f.write(completion_msg + '\n')
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train APT model")
-    parser.add_argument('--config', type=str, required=True, help='Path to YAML configuration file')
-    parser.add_argument('--output_dir', type=str, default=None, help='Override logging.output_dir from config')
-    parser.add_argument('--device', type=str, default=None, help='Override training.device from config')
+    parser = create_argument_parser("Train APT model", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
-    if parsed.output_dir is not None:
-        set_nested_value(overrides, ['logging', 'output_dir'], parsed.output_dir)
-    if parsed.device is not None:
-        set_nested_value(overrides, ['training', 'device'], parsed.device)
+    overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
     return parsed, overrides
 
 def main():

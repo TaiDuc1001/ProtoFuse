@@ -11,15 +11,33 @@ from torch.utils.data import DataLoader, Subset
 
 from apt import (
     APTTrainingPipeline,
+    ARG_SCHEMA,
+    CONFIG_SCHEMA,
+    build_dynamic_config,
     coerce_to_float,
     coerce_to_int,
     coerce_to_str,
+    create_argument_parser,
     get_config_value,
     load_config_file,
     merge_configs,
     parse_override_arguments,
+    process_parsed_args,
     set_nested_value,
 )
+
+AL_CONFIG_SCHEMA = {
+    **CONFIG_SCHEMA,
+    'active_learning': {
+        'rounds': {'type': int, 'default': 1},
+        'strategy': {'type': str, 'default': None},
+        'nshot': {'type': int, 'default': 0},
+    }
+}
+
+AL_ARG_SCHEMA = {
+    **ARG_SCHEMA,
+}
 
 
 def compute_conflict_scores_cache(trainer, dataset, indices, batch_size, num_workers):
@@ -372,53 +390,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
-        optimizer_section = self.training_cfg.get('optimizer', {})
-        if isinstance(optimizer_section, dict):
-            optimizer_name = optimizer_section.get('name', 'SGD')
-            lr_value = optimizer_section.get('learning_rate', self.training_cfg.get('learning_rate', 0.001))
-            wd_value = optimizer_section.get('weight_decay', self.training_cfg.get('weight_decay', 0.0005))
-        else:
-            optimizer_name = optimizer_section if isinstance(optimizer_section, str) else 'SGD'
-            lr_value = self.training_cfg.get('learning_rate', 0.001)
-            wd_value = self.training_cfg.get('weight_decay', 0.0005)
-
-        learning_rate = coerce_to_float(lr_value, 0.001, key='training.optimizer.learning_rate')
-        weight_decay = coerce_to_float(wd_value, 0.0005, key='training.optimizer.weight_decay')
-        precision_value = self.training_cfg.get('precision', 'fp32')
-        precision = coerce_to_str(precision_value, 'fp32', key='training.precision')
-        mode_value = self.training_cfg.get('mode', 'logits')
-        mode = coerce_to_str(mode_value, 'logits', key='training.mode')
-        epochs_value = self.training_cfg.get('epochs', 150)
-        num_epochs = coerce_to_int(epochs_value, 150, key='training.epochs')
-
-        backbone_value = get_config_value(self.model_cfg, 'backbone', 'ViT-B/32')
-        backbone = coerce_to_str(backbone_value, 'ViT-B/32', key='model.backbone')
-        dataset_name_value = get_config_value(self.model_cfg, 'dataset_name', 'CUBirds')
-        dataset_name = coerce_to_str(dataset_name_value, 'CUBirds', key='model.dataset_name')
-        num_heads_value = get_config_value(self.model_cfg, 'num_heads', 8)
-        num_heads = coerce_to_int(num_heads_value, 8, key='model.num_heads')
-        num_layers_value = get_config_value(self.model_cfg, 'num_layers', 1)
-        num_layers = coerce_to_int(num_layers_value, 1, key='model.num_layers')
-        dropout_value = get_config_value(self.model_cfg, 'dropout', 0.2)
-        dropout = coerce_to_float(dropout_value, 0.2, key='model.dropout')
-
-        trainer_cfg = {
-            'backbone': backbone,
-            'dataset_name': dataset_name,
-            'num_heads': num_heads,
-            'num_layers': num_layers,
-            'dropout': dropout,
-            'precision': precision,
-            'learning_rate': learning_rate,
-            'weight_decay': weight_decay,
-            'num_epochs': num_epochs,
-            'mode': mode,
-            'run_decoder': bool(get_config_value(self.training_cfg, 'run_decoder', False)),
-            'visualize_attention': bool(get_config_value(self.training_cfg, 'visualize_attention', False)),
-            'visualize_gradcam': bool(get_config_value(self.training_cfg, 'visualize_gradcam', False)),
-            'use_cutout': bool(get_config_value(self.training_cfg, 'use_cutout', False)),
-            'generate_confusion_matrix': bool(get_config_value(self.training_cfg, 'confusion_matrix', False)),
-            'optimizer': coerce_to_str(optimizer_name, 'SGD', key='training.optimizer.name'),
+        extra_values = {
             'dataset_root': self.dataset_root,
             'active_learning': self.strategy,
             'nshot': self.nshot,
@@ -433,12 +405,12 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             'train_pool_size': stats['labeled_count'] + stats['unlabeled_count'],
             'al_selection_log': self.selection_log_path,
             'val_percentage_actual': val_percentage,
-            'use_cache': True,
-            'cache_alpha': 1.0,
-            'cache_beta': 1.0,
-            'cache_temperature': 5.5,
-            'reset_optimizer_per_round': True
+            'reset_optimizer_per_round': True,
+            'num_epochs': build_dynamic_config(self.config, AL_CONFIG_SCHEMA)['epochs'],
+            'generate_confusion_matrix': build_dynamic_config(self.config, AL_CONFIG_SCHEMA)['confusion_matrix']
         }
+        
+        trainer_cfg = build_dynamic_config(self.config, AL_CONFIG_SCHEMA, stats, extra_values)
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
 
@@ -615,16 +587,10 @@ class ActiveLearningPipeline(APTTrainingPipeline):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train APT model with active learning")
-    parser.add_argument('--config', type=str, required=True, help='Path to YAML configuration file')
-    parser.add_argument('--output_dir', type=str, default=None, help='Override logging.output_dir from config')
-    parser.add_argument('--device', type=str, default=None, help='Override training.device from config')
+    parser = create_argument_parser("Train APT model with active learning", AL_ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
-    if parsed.output_dir is not None:
-        set_nested_value(overrides, ['logging', 'output_dir'], parsed.output_dir)
-    if parsed.device is not None:
-        set_nested_value(overrides, ['training', 'device'], parsed.device)
+    overrides = process_parsed_args(parsed, AL_ARG_SCHEMA, overrides)
     return parsed, overrides
 
 

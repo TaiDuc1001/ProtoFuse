@@ -18,3 +18,5 @@ to_delete
 *.pt
 *.json
 uv.lock
+
+_*
