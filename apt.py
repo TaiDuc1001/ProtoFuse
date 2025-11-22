@@ -27,46 +27,54 @@ from thop import profile
 from typing import Any, Dict, List, Optional
 from sklearn.metrics import confusion_matrix
 
-# ==========================================
-# 1. LoRA Implementation & Utilities
-# ==========================================
-
-class LoRALinear(nn.Linear):
-    def __init__(self, in_features, out_features, r=4, alpha=1, bias=True):
-        super().__init__(in_features, out_features, bias=bias)
-        self.r = r
+class CacheAdapter(nn.Module):
+    def __init__(self, feature_dim, num_classes, alpha=1.0, beta=1.0, temperature=10.0):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_classes = num_classes
         self.alpha = alpha
-        self.scaling = alpha / r
-        self.lora_A = nn.Parameter(torch.zeros((r, in_features)))
-        self.lora_B = nn.Parameter(torch.zeros((out_features, r)))
-        self.disable_lora = False
-        self.reset_lora_parameters()
+        self.beta = beta
+        self.temperature = temperature
+        
+        self.register_buffer('cache_keys', torch.zeros(0, feature_dim))
+        self.register_buffer('cache_values', torch.zeros(0, num_classes))
+        self.register_buffer('class_counts', torch.zeros(num_classes))
+        self.enabled = True
 
-    def reset_lora_parameters(self):
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
+    def update_cache(self, keys, labels):
+        keys = F.normalize(keys, dim=-1)
+        one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
+        
+        self.cache_keys = keys.detach().clone()
+        self.cache_values = one_hot.detach().clone()
+        
+        counts = torch.zeros(self.num_classes, device=keys.device)
+        unique_labels, counts_per_label = labels.unique(return_counts=True)
+        counts[unique_labels] = counts_per_label.float()
+        self.class_counts = counts
 
-    def forward(self, x):
-        result = super().forward(x)
-        if not self.disable_lora and self.r > 0:
-            lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
-            result += lora_out
-        return result
+    def get_cache_logits(self, image_features):
+        if not self.enabled or self.cache_keys.shape[0] == 0:
+            return torch.zeros(image_features.shape[0], self.num_classes, device=image_features.device)
 
-def apply_lora_to_transformer(transformer, rank=4, alpha=1):
-    for block in transformer.resblocks:
-        if hasattr(block, 'mlp'):
-            c_fc = block.mlp[0]
-            new_c_fc = LoRALinear(c_fc.in_features, c_fc.out_features, r=rank, alpha=alpha, bias=True)
-            new_c_fc.weight = c_fc.weight
-            new_c_fc.bias = c_fc.bias
-            block.mlp[0] = new_c_fc
+        image_features = F.normalize(image_features, dim=-1)
+        affinity = image_features @ self.cache_keys.t()
+        
+        cache_logits = ((-1) * (self.temperature - self.temperature * affinity)).exp() @ self.cache_values
+        
+        safe_counts = self.class_counts.clone()
+        safe_counts[safe_counts == 0] = 1.0
+        cache_logits = cache_logits / safe_counts.unsqueeze(0)
+        
+        return cache_logits
 
-            c_proj = block.mlp[2]
-            new_c_proj = LoRALinear(c_proj.in_features, c_proj.out_features, r=rank, alpha=alpha, bias=True)
-            new_c_proj.weight = c_proj.weight
-            new_c_proj.bias = c_proj.bias
-            block.mlp[2] = new_c_proj
+    def forward(self, image_features, apt_logits):
+        if not self.enabled or self.cache_keys.shape[0] == 0:
+            return apt_logits
+        
+        cache_logits = self.get_cache_logits(image_features)
+        final_logits = self.beta * apt_logits + self.alpha * cache_logits
+        return final_logits
 
 def generate_confusion_matrix_plot(args):
     cm, row_idx, col_idx, start_row, start_col, end_row, end_col, epoch, cm_dir = args
@@ -83,11 +91,7 @@ def generate_confusion_matrix_plot(args):
     plt.savefig(os.path.join(cm_dir, f'confusion_matrix_r{row_idx:02d}_c{col_idx:02d}.pdf'), dpi=100, bbox_inches='tight')
     plt.close()
 
-# ==========================================
-# 2. Active Learning Scores
-# ==========================================
-
-def compute_conflict_scores(trainer, dataset, indices, batch_size, num_workers):
+def compute_conflict_scores_cache(trainer, dataset, indices, batch_size, num_workers):
     if not indices:
         return defaultdict(list)
 
@@ -105,34 +109,57 @@ def compute_conflict_scores(trainer, dataset, indices, batch_size, num_workers):
             position += batch_size_local
             images = images.to(trainer.device)
 
-            # Conservative Prediction (Frozen features)
-            trainer.model.set_lora_enabled(False)
-            logits_conservative = trainer.model(images)
-            if isinstance(logits_conservative, (list, tuple)): logits_conservative = logits_conservative[0]
-            probs_conservative = torch.softmax(logits_conservative, dim=1)
+            # 1. APT Logits (Text Knowledge)
+            # Note: Using original mode='logits'
+            apt_logits = trainer.model(images)
+            if isinstance(apt_logits, (list, tuple)): apt_logits = apt_logits[0]
+            prob_apt = torch.softmax(apt_logits, dim=1)
 
-            # Aggressive Prediction (Tuned LoRA features)
-            trainer.model.set_lora_enabled(True)
-            logits_aggressive = trainer.model(images)
-            if isinstance(logits_aggressive, (list, tuple)): logits_aggressive = logits_aggressive[0]
-            probs_aggressive = torch.softmax(logits_aggressive, dim=1)
+            # 2. Cache Logits (Image Experience)
+            # Extract frozen image features
+            visual_out = trainer.model.vis_encoder(images)
+            img_feats = visual_out[1]
+            img_feats = F.normalize(img_feats, dim=-1)
+            
+            cache_logits_only = trainer.cache_adapter.get_cache_logits(img_feats)
+            prob_cache = torch.softmax(cache_logits_only, dim=1)
 
-            kl_div = F.kl_div(probs_conservative.log(), probs_aggressive, reduction='none', log_target=False).sum(dim=1)
+            # KL Divergence: APT || Cache
+            # High KL means APT disagrees with Cache -> Hard/Interesting Sample
+            kl_div = F.kl_div(prob_apt.log(), prob_cache, reduction='none', log_target=False).sum(dim=1)
 
             for score, lbl, idx in zip(kl_div.cpu().tolist(), labels.cpu().tolist(), batch_indices):
                 conflict_per_class[int(lbl)].append((float(score), int(idx)))
     
-    trainer.model.set_lora_enabled(True)
     return conflict_per_class
 
-def select_conflict_indices(conflict_per_class, nshot):
+def select_global_topk_indices(conflict_per_class, nshot):
     if nshot <= 0: return []
-    selected = []
-    for class_id in sorted(conflict_per_class.keys()):
-        scores = conflict_per_class[class_id]
-        if not scores: continue
-        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
-        selected.extend(idx for _, idx in sorted_scores[:nshot])
+    
+    # Flatten all candidates into a single list (score, idx)
+    all_candidates = []
+    for class_id, scores in conflict_per_class.items():
+        all_candidates.extend(scores)
+    
+    if not all_candidates:
+        return []
+        
+    # Sort globally by score (descending) - Winner takes all strategy
+    # We select total_k = nshot * num_classes to match the budget
+    # If nshot is interpreted as 'per class budget', the total is nshot * num_classes
+    # If nshot is 'total budget', then k = nshot.
+    # Based on previous code, 'nshot' seemed to be per-class in random/entropy (iterating classes).
+    # But for Global Top-K, we just pick the top N regardless of class.
+    # Let's assume nshot is passed as the TOTAL budget for the round if strategy is global.
+    # However, standard AL usually defines 'nshot' as 'samples to add'.
+    # Let's calculate K based on the dictionary length to be safe, assuming nshot is per class average budget.
+    # K = nshot * len(conflict_per_class.keys())
+    
+    k = nshot * len(conflict_per_class) # Total budget
+    
+    sorted_candidates = sorted(all_candidates, key=lambda item: item[0], reverse=True)
+    selected = [idx for _, idx in sorted_candidates[:k]]
+    
     return selected
 
 def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
@@ -325,10 +352,6 @@ def select_coreset_indices(trainer, dataset, labeled_indices, unlabeled_indices,
 
     return selected
 
-# ==========================================
-# 3. Config Parsing
-# ==========================================
-
 def infer_override_value(raw):
     lowered = raw.lower()
     if lowered == "true":
@@ -444,10 +467,6 @@ def coerce_to_float(value, default, key=None):
         except ValueError as exc:
             raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.") from exc
     raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.")
-
-# ==========================================
-# 4. Model Architecture (CLIP + APT)
-# ==========================================
 
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim, num_heads, dropout):
@@ -579,23 +598,10 @@ class CustomCLIP(nn.Module):
             param.requires_grad = False
 
         self.vis_encoder = ImageEncoder(self.clip_model)
-        
-        # Apply LoRA if configured
-        if cfg.get('use_lora', True):
-            lora_rank = cfg.get('lora_rank', 4)
-            lora_alpha = cfg.get('lora_alpha', 1)
-            apply_lora_to_transformer(self.vis_encoder.transformer, rank=lora_rank, alpha=lora_alpha)
-            print(f"Applied LoRA with rank={lora_rank}, alpha={lora_alpha} (Zero-Init) to ImageEncoder.")
-
         self.logit_scale = clip_model.logit_scale
 
         self.text_features, self.prompts, self.text_tokens = self._init_text_feats(cfg, classnames)
         self.base_text_features = self.text_features.clone().detach()
-    
-    def set_lora_enabled(self, enabled: bool):
-        for module in self.vis_encoder.modules():
-            if isinstance(module, LoRALinear):
-                module.disable_lora = not enabled
 
     def _init_text_feats(self, cfg, classnames):
         dataset_name = cfg.get('dataset_name', 'ImageNet')
@@ -611,46 +617,32 @@ class CustomCLIP(nn.Module):
         tokens = None
         return text_features, prompts, tokens
 
-    def update_text_features(self, tuned_embeddings):
-        if tuned_embeddings is None:
-            return
-
-        target = tuned_embeddings.to(self.device)
-        target = target.to(self.base_text_features.dtype)
-
-        if target.shape != self.text_features.shape:
-            raise ValueError(
-                f"Tuned embeddings shape {target.shape} does not match expected {self.text_features.shape}."
-            )
-        self.text_features = target.detach()
-
     def forward(self, image, label=None):
         with torch.no_grad():
             pass
 
         visual_output = self.vis_encoder(image)
-
         unpooled_levels, image_features = visual_output
         if not isinstance(unpooled_levels, list):
             unpooled_levels = [unpooled_levels]
 
         attn_maps = []
-
-        base_text_features = self._prepare_text_features()
+        base_text_features = self.text_features.clone()
 
         unpooled_images = unpooled_levels[0].permute(1, 0, 2)
         text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
 
-        for layer in self._prompt_layers_iter():
+        for layer in self.prompt_learner:
             text_features, attn_weights = layer(unpooled_images, text_features)
             attn_maps.append(attn_weights)
 
         text_features = text_features.permute(1, 0, 2)
         text_features = F.normalize(text_features, dim=-1)
+        
         logit_scale = self.logit_scale.exp()
-
         image_features = F.normalize(image_features, dim=-1)
         image_features = image_features.unsqueeze(1)
+        
         logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
 
         mode = self.cfg.get('mode', 'logits')
@@ -660,69 +652,22 @@ class CustomCLIP(nn.Module):
             return loss, logits
         elif mode == "logits":
             return logits
-        elif mode == "features":
-            return logits, text_features
         elif mode == "map":
             return logits, attn_maps
 
         return logits
-
     def _prompt_layers_iter(self):
         if isinstance(self.prompt_learner, nn.ModuleList):
             return self.prompt_learner
         return [self.prompt_learner]
-
     def _prepare_text_features(self):
         return self.text_features.clone()
-
     def trainable_parameters(self):
-        params = list(self.prompt_learner.parameters())
-        # Add LoRA parameters
-        for name, param in self.vis_encoder.named_parameters():
-            if 'lora_' in name:
-                params.append(param)
-        return params
+        return self.prompt_learner.parameters()
 
     def get_trainable_parameter_names(self):
         names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
-        # Add LoRA parameter names
-        for name, _ in self.vis_encoder.named_parameters():
-            if 'lora_' in name:
-                names.append(f"vis_encoder.{name}")
         return names
-
-    def _reshape_attn_map(self, attn_map, batch_size):
-        if isinstance(attn_map, (list, tuple)):
-            if not attn_map:
-                return None
-            attn_map = attn_map[0]
-        if not isinstance(attn_map, torch.Tensor):
-            return None
-
-        if attn_map.dim() == 4:
-            if attn_map.shape[0] == batch_size:
-                attn_map = attn_map.mean(dim=1)
-            elif attn_map.shape[1] == batch_size:
-                attn_map = attn_map.mean(dim=0)
-            else:
-                return None
-
-        candidate = None
-
-        if attn_map.dim() == 3:
-            if attn_map.shape[0] == batch_size:
-                candidate = attn_map
-            elif attn_map.shape[1] == batch_size:
-                candidate = attn_map.permute(1, 0, 2)
-            elif attn_map.shape[2] == batch_size:
-                candidate = attn_map.permute(2, 0, 1)
-        elif attn_map.dim() == 2:
-            candidate = attn_map.unsqueeze(0).expand(batch_size, -1, -1)
-
-        if candidate is None:
-            return None
-
-        return candidate.contiguous()
 
 def load_clip_to_cpu(backbone_name):
     url = clip._MODELS[backbone_name]
@@ -736,10 +681,6 @@ def load_clip_to_cpu(backbone_name):
 
     model = clip.build_model(state_dict or model.state_dict())
     return model
-
-# ==========================================
-# 5. Trainer Class (APT)
-# ==========================================
 
 class APT:
     def __init__(self, cfg, classnames, device="cuda", log_file=None):
@@ -760,6 +701,17 @@ class APT:
                 device=str(self.device),
                 clip_model_name=cfg.get('backbone', 'ViT-B/32')
             )
+        
+        if cfg.get('use_cache', False):
+            self.cache_adapter = CacheAdapter(
+                feature_dim=self.model.vis_encoder.ln_post.normalized_shape[0],
+                num_classes=len(classnames),
+                alpha=cfg.get('cache_alpha', 1.0),
+                beta=cfg.get('cache_beta', 1.0),
+                temperature=cfg.get('cache_temperature', 5.0)
+            ).to(self.device)
+        else:
+            self.cache_adapter = None
     
     def build_model(self):
         backbone_name = self.cfg.get('backbone', 'ViT-B/32')
@@ -792,6 +744,7 @@ class APT:
         flops_results = {}
         self.model.to(self.device)
         self.model.eval()
+        
         for param in self.model.parameters():
             if param.device != self.device:
                 param.data = param.data.to(self.device)
@@ -841,46 +794,60 @@ class APT:
         self.model.to(self.device)
     
     def setup_optimizer(self):
-        base_lr = self.cfg.get('learning_rate', 0.002)
+        lr = self.cfg.get('learning_rate', 0.002)
         weight_decay = self.cfg.get('weight_decay', 0.0005)
         optimizer_type = self.cfg.get('optimizer', 'SGD')
-        
-        # --- DIFFERENTIAL LEARNING RATES IMPLEMENTATION ---
-        lora_params = []
-        other_params = []
-        
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'lora_' in name:
-                lora_params.append(param)
-            else:
-                other_params.append(param)
-        
-        # LoRA LR ratio (e.g., 0.1 means LoRA learns 10x slower)
-        lora_lr_ratio = self.cfg.get('lora_lr_ratio', 0.1)
-        
-        param_groups = [
-            {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
-            {'params': lora_params, 'lr': base_lr * lora_lr_ratio, 'weight_decay': weight_decay}
-        ]
+        trainable_params = list(self.model.trainable_parameters())
         
         if optimizer_type == 'AdamW':
-            self.optimizer = torch.optim.AdamW(param_groups)
+            self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
         elif optimizer_type == 'Adam':
-            self.optimizer = torch.optim.Adam(param_groups)
+            self.optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
         else:
-            self.optimizer = torch.optim.SGD(param_groups, momentum=0.9)
+            self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         
         num_epochs = self.cfg.get('num_epochs', 100)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=num_epochs
-        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
     
     def reset_optimizer_scheduler(self):
-        # Re-implementation to support differential LR on reset as well
         self.setup_optimizer()
+
+    def update_cache_memory(self, dataset, labeled_indices):
+        if self.cache_adapter is None:
+            return
+
+        print("Building Cache Memory from Labeled Set...")
+        if self.log_file:
+            with open(self.log_file, 'a') as f:
+                f.write("Building Cache Memory from Labeled Set...\n")
+
+        self.model.eval()
+        
+        subset = Subset(dataset, labeled_indices)
+        loader = DataLoader(subset, batch_size=32, shuffle=False, num_workers=self.cfg.get('num_workers', 4))
+        
+        all_keys = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(self.device)
+                visual_out = self.model.vis_encoder(images)
+                img_feats = visual_out[1]
+                img_feats = F.normalize(img_feats, dim=-1)
+                
+                all_keys.append(img_feats)
+                all_labels.append(labels.to(self.device))
+        
+        if all_keys:
+            keys = torch.cat(all_keys, dim=0)
+            lbls = torch.cat(all_labels, dim=0)
+            self.cache_adapter.update_cache(keys, lbls)
+            msg = f"Cache Updated: {keys.shape[0]} samples stored."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
     
     def train_step(self, batch):
         images, labels = batch
@@ -890,58 +857,19 @@ class APT:
         self.model.train()
         self.model.prompt_learner.train()
         
-        # --- TETHERED TUNING: GET TEACHER (FROZEN) FEATURES ---
-        # We need the features from the original CLIP image encoder (before LoRA effect)
-        # or effectively "frozen" features to calculate consistency loss.
-        # Since LoRA is additive, we can just disable it to get the original features.
-        with torch.no_grad():
-            self.model.set_lora_enabled(False)
-            visual_output_old = self.model.vis_encoder(images)
-            z_old = visual_output_old[1] # global feature
-            z_old = F.normalize(z_old, dim=-1).detach()
-            self.model.set_lora_enabled(True)
-        # ------------------------------------------------------
-
         precision = self.cfg.get('precision', 'fp32')
         
         if precision == 'amp':
             with autocast():
-                # Standard Cross-Entropy
-                loss_ce, logits = self.model(images, labels)
-                
-                # --- CONSISTENCY LOSS ---
-                # Re-compute student features (with LoRA enabled)
-                # We call vis_encoder explicitly to get the embedding before text interaction
-                visual_output_new = self.model.vis_encoder(images)
-                z_new = visual_output_new[1]
-                z_new = F.normalize(z_new, dim=-1)
-                
-                # Consistency Loss (MSE)
-                lambda_distill = self.cfg.get('distill_weight', 10.0)
-                loss_distill = F.mse_loss(z_new, z_old)
-                
-                total_loss = loss_ce + (lambda_distill * loss_distill)
-
+                loss, logits = self.model(images, labels)
             self.optimizer.zero_grad()
-            self.scaler.scale(total_loss).backward() # type: ignore
+            self.scaler.scale(loss).backward() # type: ignore
             self.scaler.step(self.optimizer) # type: ignore
             self.scaler.update() # type: ignore
         else:
-            # Standard Cross-Entropy
-            loss_ce, logits = self.model(images, labels)
-            
-            # --- CONSISTENCY LOSS ---
-            visual_output_new = self.model.vis_encoder(images)
-            z_new = visual_output_new[1]
-            z_new = F.normalize(z_new, dim=-1)
-            
-            lambda_distill = self.cfg.get('distill_weight', 10.0)
-            loss_distill = F.mse_loss(z_new, z_old)
-            
-            total_loss = loss_ce + (lambda_distill * loss_distill)
-
+            loss, logits = self.model(images, labels)
             self.optimizer.zero_grad()
-            total_loss.backward()
+            loss.backward()
             self.optimizer.step()
         
         _, predicted = torch.max(logits.data, 1)
@@ -949,12 +877,7 @@ class APT:
         total = labels.size(0)
         accuracy = 100 * correct / total
         
-        return {
-            "loss": total_loss.item(), 
-            "loss_ce": loss_ce.item(),
-            "loss_distill": loss_distill.item(),
-            "accuracy": accuracy
-        }
+        return {"loss": loss.item(), "accuracy": accuracy}
     
     def evaluate(self, dataloader):
         self.model.eval()
@@ -964,10 +887,6 @@ class APT:
         steps = 0
         all_preds = []
         all_labels_list = []
-        old_mode = None
-        if isinstance(self.model, nn.Module) and isinstance(self.model.cfg, dict):
-            old_mode = self.model.cfg.get('mode', None)
-            self.model.cfg['mode'] = 'logits'
 
         with torch.no_grad():
             for batch in dataloader:
@@ -975,10 +894,16 @@ class APT:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
+                # 1. APT Logits
                 logits = self.model(images)
-
                 if isinstance(logits, (list, tuple)):
                     logits = logits[0]
+
+                # 2. Cache Logits
+                if self.cache_adapter is not None:
+                    visual_out = self.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits = self.cache_adapter(img_feats, logits)
 
                 loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
                 running_loss += loss.item()
@@ -989,73 +914,10 @@ class APT:
                 correct += (predicted == labels).sum().item()
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels_list.extend(labels.cpu().numpy())
-
-        if old_mode is not None:
-            self.model.cfg['mode'] = old_mode
         
         accuracy = 100 * correct / total
         avg_loss = running_loss / max(1, steps)
         return {"accuracy": accuracy, "loss": avg_loss, "predictions": all_preds, "true_labels": all_labels_list}
-    
-    def predict(self, images, return_features=False):
-        self.model.eval()
-        images = images.to(self.device)
-        
-        with torch.no_grad():
-            if return_features:
-                result = self.model(images)
-                return result
-            else:
-                logits = self.model(images)
-                return logits
-
-    def compute_average_text_embeddings(self, dataloader):
-        if dataloader is None:
-            raise ValueError("Dataloader must not be None when computing average text embeddings.")
-
-        self.model.eval()
-
-        old_mode = self.model.cfg.get('mode', None)
-        self.model.cfg['mode'] = 'features'
-
-        num_classes = len(self.classnames)
-        embed_dim = self.model.text_features.shape[-1]
-        dtype = self.model.text_features.dtype
-
-        sums = torch.zeros((num_classes, embed_dim), device=self.device, dtype=dtype)
-        counts = torch.zeros(num_classes, device=self.device, dtype=torch.float32)
-
-        with torch.no_grad():
-            for images, labels in dataloader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-
-                _, text_features = self.model(images)
-                text_features = text_features.to(dtype)
-
-                batch_size = labels.size(0)
-                batch_indices = torch.arange(batch_size, device=self.device)
-                selected = text_features[batch_indices, labels]
-
-                sums.index_add_(0, labels, selected)
-                counts.index_add_(0, labels, torch.ones_like(labels, dtype=torch.float32))
-
-        if old_mode is not None:
-            self.model.cfg['mode'] = old_mode
-        else:
-            self.model.cfg.pop('mode', None)
-
-        mean_embeddings = torch.zeros_like(sums)
-        valid_mask = counts > 0
-        if valid_mask.any():
-            divisor = counts[valid_mask].unsqueeze(1).to(sums.dtype)
-            mean_embeddings[valid_mask] = sums[valid_mask] / divisor
-
-        if (~valid_mask).any():
-            base_fallback = self.model.base_text_features.to(self.device).to(sums.dtype)
-            mean_embeddings[~valid_mask] = base_fallback[~valid_mask]
-
-        return mean_embeddings.detach()
     
     def save_model(self, path):
         checkpoint = {
@@ -1085,120 +947,6 @@ class APT:
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
-    
-    @classmethod
-    def load_from_run_dir(cls, run_dir, device='cuda', checkpoint='best.pth'):
-        config_path = os.path.join(run_dir, 'config.json')
-        with open(config_path, 'r') as f:
-            cfg = json.load(f)
-        classnames = cfg['classnames']
-        trainer = cls(cfg, classnames, device=device)
-        model_path = os.path.join(run_dir, checkpoint)
-        trainer.load_model(model_path)
-        return trainer
-    
-    def forward_uq(self, images, num_samples=10):
-        self.model.train()
-        images = images.to(self.device)
-        
-        all_logits = []
-        
-        with torch.no_grad():
-            for _ in range(num_samples):
-                logits = self.model(images)
-                all_logits.append(logits.unsqueeze(0))
-        
-        all_logits = torch.cat(all_logits, dim=0)
-        mean_logits = all_logits.mean(dim=0)
-        std_logits = all_logits.std(dim=0)
-        
-        return mean_logits, std_logits
-
-    def save_activation(self, module, input, output):
-        self.activations = output.detach()
-
-    def save_gradient(self, module, grad_input, grad_output):
-        if grad_output[0] is not None:
-            self.gradients = grad_output[0].detach()
-
-    def generate_gradcam(self, images, target_classes):
-        original_mode = self.model.training
-        self.model.train()
-        
-        for param in self.model.vis_encoder.parameters():
-            param.requires_grad_(True)
-            
-        images = images.to(self.device)
-        images.requires_grad_(True)
-        
-        encoder_output = self.model.vis_encoder(images)
-        target_unpooled, _ = encoder_output
-        unpooled_levels = [target_unpooled]
-
-        target_unpooled.retain_grad()
-        
-        batch_size = images.shape[0]
-        gradcams = []
-        
-        for i in range(batch_size):
-            target_class = target_classes[i]
-            
-            base_text = self.model._prepare_text_features()
-
-            unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
-            text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
-            for layer in self.model._prompt_layers_iter():
-                text_features, _ = layer(unpooled_single, text_features)
-
-            text_features = text_features.permute(1, 0, 2)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            
-            image_features = target_unpooled[i:i+1, 0, :]
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            image_features = image_features.unsqueeze(1)
-            
-            logit_scale = self.model.logit_scale.exp()
-            logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
-            
-            score = logits[0, target_class]
-            
-            self.model.zero_grad()
-            score.backward(retain_graph=True)
-            
-            if target_unpooled.grad is None:
-                print(f"Image {i}: No gradients captured!")
-                gradcams.append(np.zeros((8, 8)))
-                continue
-            gradients = target_unpooled.grad[i]
-            activations = target_unpooled[i]
-            
-            weights = torch.mean(gradients[1:], dim=0)
-            cam = torch.sum(activations[1:] * weights, dim=-1)
-            cam = F.relu(cam)
-            
-            cam_before = cam.detach().cpu().numpy()
-            
-            if cam_before.size > 0:
-                cam = (cam_before - cam_before.min()) / (cam_before.max() - cam_before.min() + 1e-8)
-                
-                num_patches = cam.size
-                grid_size = int(np.sqrt(num_patches))
-                
-                if grid_size * grid_size == num_patches:
-                    cam = cam.reshape(grid_size, grid_size)
-                else:
-                    cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
-            else:
-                cam = np.zeros((8, 8))
-            
-            gradcams.append(cam)
-            if target_unpooled.grad is not None:
-                target_unpooled.grad.zero_()
-        
-        for param in self.model.vis_encoder.parameters():
-            param.requires_grad_(False)
-        self.model.train(original_mode)
-        return gradcams
 
     def decode_adapted_prompts(self, images, entry_length=30, temperature=1.0, batch_decode_size=32):
         self.model.eval()
@@ -1214,18 +962,14 @@ class APT:
                 text_features, _ = layer(unpooled_images, text_features)
 
             adapted = text_features.permute(1, 0, 2)
-            
             batch_size, num_classes, embedding_dim = adapted.shape
-            
             all_embeddings = adapted.reshape(-1, embedding_dim)
             all_captions = []
             
             for i in range(0, all_embeddings.shape[0], batch_decode_size):
                 batch_embeddings = all_embeddings[i:i+batch_decode_size]
                 batch_captions = self.decoder.decode_from_apt_embedding_batch(
-                    batch_embeddings, 
-                    entry_length=entry_length, 
-                    temperature=temperature
+                    batch_embeddings, entry_length=entry_length, temperature=temperature
                 )
                 all_captions.extend(batch_captions)
             
@@ -1236,18 +980,79 @@ class APT:
                 for c in range(num_classes):
                     class_name = self.classnames[c] if c < len(self.classnames) else f"Class_{c}"
                     classes_out.append({
-                        'class_id': c,
-                        'class_name': class_name,
-                        'generated_caption': all_captions[caption_idx]
+                        'class_id': c, 'class_name': class_name, 'generated_caption': all_captions[caption_idx]
                     })
                     caption_idx += 1
                 batch_out.append(classes_out)
-        
         return batch_out
 
-# ==========================================
-# 6. Pipeline
-# ==========================================
+    def generate_gradcam(self, images, target_classes):
+        original_mode = self.model.training
+        self.model.train()
+        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(True)
+            
+        images = images.to(self.device)
+        images.requires_grad_(True)
+        
+        encoder_output = self.model.vis_encoder(images)
+        target_unpooled, _ = encoder_output
+
+        target_unpooled.retain_grad()
+        batch_size = images.shape[0]
+        gradcams = []
+        
+        for i in range(batch_size):
+            target_class = target_classes[i]
+            base_text = self.model._prepare_text_features()
+            unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
+            text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
+            for layer in self.model._prompt_layers_iter():
+                text_features, _ = layer(unpooled_single, text_features)
+
+            text_features = text_features.permute(1, 0, 2)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            image_features = target_unpooled[i:i+1, 0, :]
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = image_features.unsqueeze(1)
+            
+            logit_scale = self.model.logit_scale.exp()
+            logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
+            score = logits[0, target_class]
+            
+            self.model.zero_grad()
+            score.backward(retain_graph=True)
+            
+            if target_unpooled.grad is None:
+                gradcams.append(np.zeros((8, 8)))
+                continue
+            gradients = target_unpooled.grad[i]
+            activations = target_unpooled[i]
+            weights = torch.mean(gradients[1:], dim=0)
+            cam = torch.sum(activations[1:] * weights, dim=-1)
+            cam = F.relu(cam)
+            cam_before = cam.detach().cpu().numpy()
+            
+            if cam_before.size > 0:
+                cam = (cam_before - cam_before.min()) / (cam_before.max() - cam_before.min() + 1e-8)
+                num_patches = cam.size
+                grid_size = int(np.sqrt(num_patches))
+                if grid_size * grid_size == num_patches:
+                    cam = cam.reshape(grid_size, grid_size)
+                else:
+                    cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
+            else:
+                cam = np.zeros((8, 8))
+            
+            gradcams.append(cam)
+            if target_unpooled.grad is not None:
+                target_unpooled.grad.zero_()
+        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(False)
+        self.model.train(original_mode)
+        return gradcams
 
 class ActiveLearningPipeline:
     def __init__(self, config):
@@ -1324,10 +1129,7 @@ class ActiveLearningPipeline:
         self.best_val_acc = -float('inf')
         self.global_epoch = 0
         self.sample_cache = {
-            'images': None,
-            'labels': None,
-            'paths': [],
-            'decoded_prompts': None
+            'images': None, 'labels': None, 'paths': [], 'decoded_prompts': None
         }
 
         self.trainer: Optional[APT] = None
@@ -1353,11 +1155,9 @@ class ActiveLearningPipeline:
             transforms.ToTensor(),
             transforms.Normalize(mean=self.clip_mean, std=self.clip_std),
         ]
-
         if bool(get_config_value(self.training_cfg, "use_cutout", False)):
             base_transforms.append(transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0))
             print("Using Cutout (RandomErasing) augmentation.")
-
         return transforms.Compose(base_transforms)
 
     def _load_dataset(self):
@@ -1403,9 +1203,6 @@ class ActiveLearningPipeline:
         self.labeled_indices = labeled_indices
         self.unlabeled_indices = unlabeled_indices
 
-        if len(self.labeled_indices) == 0:
-            raise RuntimeError("No labeled samples available after split. Adjust data.kshot or data.val_size.")
-
         if len(self.val_indices) > 0:
             val_ds = Subset(self.dataset, self.val_indices)
             self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
@@ -1420,7 +1217,6 @@ class ActiveLearningPipeline:
             'labeled_count': len(self.labeled_indices),
             'unlabeled_count': len(self.unlabeled_indices)
         }
-
         print(f"Dataset loaded: {stats['total_images']} total images.")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
@@ -1435,16 +1231,6 @@ class ActiveLearningPipeline:
 
         with open(self.log_file, 'w') as f:
             f.write(f"Config: {trainer_cfg}\n\n")
-            f.write('=' * 50 + '\n')
-            f.write(f"Dataset loaded: {stats['total_images']} total images.\n")
-            f.write(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).\n")
-            f.write(
-                f"Train pool size: {stats['labeled_count'] + stats['unlabeled_count']} images "
-                f"({stats['labeled_count']} labeled, {stats['unlabeled_count']} unlabeled).\n"
-            )
-            if bool(get_config_value(self.training_cfg, "use_cutout", False)):
-                f.write("Using Cutout (RandomErasing) augmentation.\n")
-            f.write('\n')
             f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
@@ -1509,11 +1295,11 @@ class ActiveLearningPipeline:
             'train_pool_size': stats['labeled_count'] + stats['unlabeled_count'],
             'al_selection_log': self.selection_log_path,
             'val_percentage_actual': val_percentage,
-            'use_lora': True,
-            'lora_rank': 8,
-            'lora_alpha': 1,
-            'distill_weight': 10.0,
-            'lora_lr_ratio': 0.1
+            'use_cache': True,
+            'cache_alpha': 1.0,
+            'cache_beta': 1.0,
+            'cache_temperature': 5.5,
+            'reset_optimizer_per_round': True
         }
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
@@ -1527,6 +1313,8 @@ class ActiveLearningPipeline:
         print('\n')
         print('=' * 50)
 
+        self.trainer.update_cache_memory(self.dataset, self.labeled_indices) # type: ignore
+        
         for round_idx in range(1, self.rounds + 1):
             self._run_round(round_idx)
 
@@ -1558,16 +1346,17 @@ class ActiveLearningPipeline:
         base_epochs_value = self.training_cfg.get('epochs', None)
         base_epochs = coerce_to_int(base_epochs_value, 150, key='training.epochs')
         epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
+        
         with open(self.log_file, 'a') as f:
-            f.write(
-                f"  Epochs this round: {epochs_this_round} (base: {base_epochs} + {(round_idx - 1)} * {self.incr_epochs})\n"
-            )
+            f.write(f"  Epochs this round: {epochs_this_round} (base: {base_epochs})\n")
 
         for epoch_in_round in range(1, epochs_this_round + 1):
             self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
 
         if self.strategy in ('entropy', 'random', 'coreset', 'conflict') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)
+            self.trainer.reset_optimizer_scheduler()
+            self.trainer.update_cache_memory(self.dataset, self.labeled_indices)
 
         self.trainer_cfg['completed_rounds'] = round_idx
 
@@ -1624,10 +1413,10 @@ class ActiveLearningPipeline:
                 self.num_workers
             )
         elif strategy == 'conflict':
-            conflict_scores = compute_conflict_scores(
+            conflict_scores = compute_conflict_scores_cache(
                 self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers
             )
-            raw_selected = select_conflict_indices(conflict_scores, self.nshot)
+            raw_selected = select_global_topk_indices(conflict_scores, self.nshot)
 
         if not raw_selected:
             empty_msg = (
@@ -1676,53 +1465,20 @@ class ActiveLearningPipeline:
             return
 
         prev_labeled = len(self.labeled_indices)
-        prev_unlabeled = len(self.unlabeled_indices)
-
         new_set = set(new_indices)
         self.labeled_indices.extend(new_indices)
         self.unlabeled_indices = [idx for idx in self.unlabeled_indices if idx not in new_set]
-
         after_labeled = len(self.labeled_indices)
-        after_unlabeled = len(self.unlabeled_indices)
 
-        selection_details = []
-        detail_limit = 20
-        for idx in new_indices[:detail_limit]:
-            class_id = self.dataset.samples[idx][1]
-            class_name = self.classnames[class_id] if class_id < len(self.classnames) else f"Class_{class_id}"
-            selection_details.append(
-                f"  idx={idx} class={class_id} ({class_name}) path={os.path.abspath(self.dataset.samples[idx][0])}"
-            )
-        if len(new_indices) > detail_limit:
-            selection_details.append(f"  ... and {len(new_indices) - detail_limit} more")
-
-        header = f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}):"
-        print(header)
+        summary = f"Selected {len(new_indices)} new samples. Labeled: {after_labeled} (was {prev_labeled})."
+        print(summary)
         with open(self.log_file, 'a') as f:
-            f.write(header + '\n')
-            for line in selection_details:
-                f.write(line + '\n')
-            summary = (
-                f"Selected {len(new_indices)} new samples. "
-                f"Labeled: {after_labeled} (was {prev_labeled}), "
-                f"Unlabeled: {after_unlabeled} (was {prev_unlabeled})."
-            )
             f.write(summary + '\n')
-            f.write(
-                f"Strategy: {strategy} | round {round_idx}->{round_idx + 1} | nshot={self.nshot}\n"
-            )
-
+        
         round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
         with open(self.selection_log_path, 'a') as f:
             line = ';'.join(round_selected_paths) if round_selected_paths else f"round {round_idx}: none"
             f.write(line + '\n')
-
-        if bool(get_config_value(self.training_cfg, 'reset_optimizer_per_round', False)):
-            reset_msg = "Resetting optimizer and scheduler for new active samples."
-            print(reset_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(reset_msg + '\n')
-            self.trainer.reset_optimizer_scheduler()
 
     def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
         if self.trainer is None:
@@ -1731,19 +1487,16 @@ class ActiveLearningPipeline:
         start_time = time.time()
         self.trainer.model.train()
         running_loss = 0.0
-        running_distill = 0.0
         running_accuracy = 0.0
         steps = 0
 
         for batch in train_loader:
             loss_dict = self.trainer.train_step(batch)
             running_loss += loss_dict['loss']
-            running_distill += loss_dict['loss_distill']
             running_accuracy += loss_dict['accuracy']
             steps += 1
 
         avg_loss = running_loss / max(1, steps)
-        avg_distill = running_distill / max(1, steps)
         avg_acc = running_accuracy / max(1, steps)
 
         if self.val_loader is not None:
@@ -1781,33 +1534,26 @@ class ActiveLearningPipeline:
             self._maybe_visualize_gradcam(maps_dir)
 
         epoch_time = time.time() - start_time
-        val_loss_for_metrics = val_loss if self.val_loader is not None else None
-        val_acc_for_metrics = val_acc if self.val_loader is not None else None
         self.metrics.append({
             'round': round_idx,
             'epoch_in_round': epoch_in_round,
             'epoch_global': self.global_epoch,
             'train_loss': avg_loss,
-            'train_distill_loss': avg_distill,
             'train_acc': avg_acc,
-            'val_loss': val_loss_for_metrics,
-            'val_acc': val_acc_for_metrics,
-            'time': epoch_time,
-            'labeled_size': len(self.labeled_indices),
-            'unlabeled_size': len(self.unlabeled_indices)
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'time': epoch_time
         })
 
         if self.val_loader is not None and val_acc > self.best_val_acc:
-            if self.trainer is None:
-                raise RuntimeError("Trainer unavailable during checkpoint save.")
             self.best_val_acc = val_acc
             self.trainer.save_model(self.best_model_path)
 
         val_loss_display = f"{val_loss:.4f}" if self.val_loader is not None else "N/A"
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
         epoch_str = (
-            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}, step {epoch_in_round}/{epochs_this_round}) - "
-            f"loss={avg_loss:.4f} (distill={avg_distill:.4f}) - train_acc={avg_acc:.2f}% - "
+            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}) - "
+            f"loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
             f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
         )
         print(epoch_str)
@@ -2183,14 +1929,7 @@ class ActiveLearningPipeline:
     def _finalize(self):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before finalization.")
-        self.trainer_cfg['final_labeled_size'] = len(self.labeled_indices)
-        self.trainer_cfg['final_unlabeled_size'] = len(self.unlabeled_indices)
-        self.trainer_cfg['samples_per_round'] = {
-            'initial': self.trainer_cfg['initial_labeled_size'],
-            'final': len(self.labeled_indices),
-            'added_total': len(self.labeled_indices) - self.trainer_cfg['initial_labeled_size']
-        }
-
+        
         with open(self.config_path, 'w') as f:
             json.dump(self.trainer_cfg, f, indent=4)
 
@@ -2199,48 +1938,10 @@ class ActiveLearningPipeline:
 
         self.trainer.save_model(self.last_model_path)
 
-        if bool(get_config_value(self.training_cfg, 'run_decoder', False)) and self.sample_cache['images'] is not None:
-            decoded_prompts = self.sample_cache['decoded_prompts']
-            if decoded_prompts is not None:
-                final_prompts = []
-                labels = self.sample_cache['labels']
-                for i in range(len(decoded_prompts)):
-                    image_prompts = decoded_prompts[i]
-                    image_path = self.sample_cache['paths'][i] if i < len(self.sample_cache['paths']) else "Unknown path"
-                    image_label = None
-                    if labels is not None:
-                        try:
-                            image_label = int(labels[i])
-                        except Exception:
-                            image_label = None
-
-                    selected_prompt = None
-                    if image_label is not None:
-                        for prompt in image_prompts:
-                            if prompt.get('class_id') == image_label:
-                                selected_prompt = prompt
-                                break
-
-                    if selected_prompt is None and len(image_prompts) > 0:
-                        selected_prompt = image_prompts[0]
-
-                    if selected_prompt:
-                        final_prompts.append({
-                            'image_path': image_path,
-                            'image_idx': i,
-                            'class_id': selected_prompt.get('class_id', 'unknown'),
-                            'class_name': selected_prompt.get('class_name', 'unknown'),
-                            'generated_caption': selected_prompt.get('generated_caption', '')
-                        })
-
-                with open(self.final_prompts_path, 'w') as f:
-                    json.dump(final_prompts, f, indent=4)
-
         completion_msg = f"Training completed. Results written to {self.run_dir}"
         print(completion_msg)
         with open(self.log_file, 'a') as f:
             f.write(completion_msg + '\n')
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train APT model")
@@ -2255,14 +1956,12 @@ def parse_args():
         set_nested_value(overrides, ['training', 'device'], parsed.device)
     return parsed, overrides
 
-
 def main():
     args, overrides = parse_args()
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = ActiveLearningPipeline(merged)
     pipeline.run()
-
 
 if __name__ == "__main__":
     main()
