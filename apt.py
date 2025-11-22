@@ -28,83 +28,68 @@ from utils import (
     visualize_gradcam_maps,
 )
 
-CONFIG_SCHEMA = {
-    'model': {
-        'backbone': {'type': str, 'default': 'ViT-B/32'},
-        'dataset_name': {'type': str, 'default': 'CUBirds'},
-        'num_heads': {'type': int, 'default': 8},
-        'num_layers': {'type': int, 'default': 1},
-        'dropout': {'type': float, 'default': 0.2},
-        'cache_alpha': {'type': float, 'default': 1.0},
-        'cache_beta': {'type': float, 'default': 1.0},
-        'cache_temperature': {'type': float, 'default': 5.5},
-    },
-    'training': {
-        'precision': {'type': str, 'default': 'fp32'},
-        'learning_rate': {'type': float, 'default': 0.001},
-        'weight_decay': {'type': float, 'default': 0.0005},
-        'epochs': {'type': int, 'default': 150},
-        'mode': {'type': str, 'default': 'logits'},
-        'optimizer': {'type': str, 'default': 'SGD', 'nested': {'name': str, 'learning_rate': float, 'weight_decay': float}},
-        'run_decoder': {'type': bool, 'default': False},
-        'visualize_attention': {'type': bool, 'default': False},
-        'visualize_gradcam': {'type': bool, 'default': False},
-        'use_cutout': {'type': bool, 'default': False},
-        'confusion_matrix': {'type': bool, 'default': False},
-        'use_cache': {'type': bool, 'default': True},
-    }
-}
-
 ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
     'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
     'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
 }
 
-def build_dynamic_config(base_config, schema, stats=None, extra_values=None):
-    config = {}
-    extra_values = extra_values or {}
-    
-    def coerce_bool(value, default, key=None):
-        return bool(value) if value is not None else bool(default)
-    
-    coerce_funcs = {
-        str: coerce_to_str,
-        int: coerce_to_int,
-        float: coerce_to_float,
-        bool: coerce_bool
-    }
-    
-    for section, fields in schema.items():
-        section_config = base_config.get(section, {})
-        
-        for field, spec in fields.items():
-            key_path = f"{section}.{field}"
-            
-            if field == 'optimizer' and isinstance(section_config.get('optimizer'), dict):
-                optimizer_section = section_config['optimizer']
-                config['optimizer'] = coerce_to_str(
-                    optimizer_section.get('name', spec['default']), 
-                    spec['default'], 
-                    key=f"{key_path}.name"
-                )
-                config['learning_rate'] = coerce_to_float(
-                    optimizer_section.get('learning_rate', section_config.get('learning_rate', 0.001)),
-                    0.001, 
-                    key=f"{key_path}.learning_rate"
-                )
-                config['weight_decay'] = coerce_to_float(
-                    optimizer_section.get('weight_decay', section_config.get('weight_decay', 0.0005)),
-                    0.0005, 
-                    key=f"{key_path}.weight_decay"
-                )
+class ConfigNode(dict):
+    def __init__(self, initial: Optional[Dict[str, Any]] = None):
+        super().__init__()
+        if initial:
+            self.update(initial)
+
+    def _convert(self, value: Any) -> Any:
+        if isinstance(value, dict) and not isinstance(value, ConfigNode):
+            return ConfigNode(value)
+        if isinstance(value, list):
+            return [self._convert(item) for item in value]
+        return value
+
+    def __getattr__(self, item: str) -> Any:
+        try:
+            return self[item]
+        except KeyError as exc:
+            raise AttributeError(f"Config key '{item}' not found") from exc
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        self[key] = self._convert(value)
+
+    def update(self, *args, **kwargs) -> None:
+        for key, value in dict(*args, **kwargs).items():
+            super().__setitem__(key, self._convert(value))
+
+    def copy(self) -> "ConfigNode":
+        return ConfigNode(self.to_dict())
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in self.items():
+            if isinstance(value, ConfigNode):
+                result[key] = value.to_dict()
+            elif isinstance(value, list):
+                result[key] = [item.to_dict() if isinstance(item, ConfigNode) else item for item in value]
             else:
-                raw_value = get_config_value(base_config, key_path, spec['default'])
-                coerce_func = coerce_funcs[spec['type']]
-                config[field] = coerce_func(raw_value, spec['default'], key=key_path)
-    
-    config.update(extra_values)
-    return config
+                result[key] = value
+        return result
+
+
+def deep_merge_dicts(target: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            deep_merge_dicts(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+    return target
+
+
+def build_config_namespace(base_config: Dict[str, Any], extra_values: Optional[Dict[str, Any]] = None) -> ConfigNode:
+    config_copy = copy.deepcopy(base_config)
+    if extra_values:
+        meta = config_copy.setdefault('meta', {})
+        deep_merge_dicts(meta, extra_values)
+    return ConfigNode(config_copy)
 
 def create_argument_parser(description, arg_schema):
     parser = argparse.ArgumentParser(description=description)
@@ -130,28 +115,6 @@ def process_parsed_args(parsed_args, arg_schema, overrides):
             keys = spec['config_path'].split('.')
             set_nested_value(overrides, keys, value)
     return overrides
-
-def extend_config_schema(base_schema, extensions):
-    extended = dict(base_schema)
-    for section, fields in extensions.items():
-        if section in extended:
-            extended[section] = {**extended[section], **fields}
-        else:
-            extended[section] = fields
-    return extended
-
-def add_argument_to_schema(base_schema, arg_name, arg_type, help_text, config_path=None, required=False):
-    extended = dict(base_schema)
-    spec = {
-        'type': arg_type,
-        'help': help_text
-    }
-    if config_path:
-        spec['config_path'] = config_path
-    if required:
-        spec['required'] = True
-    extended[arg_name] = spec
-    return extended
 
 class CacheAdapter(nn.Module):
     def __init__(self, feature_dim, num_classes, alpha=1.0, beta=1.0, temperature=10.0):
@@ -423,15 +386,19 @@ class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model, device):
         super().__init__()
         self.clip_model = clip_model.to(device)
+        if not isinstance(cfg, ConfigNode):
+            cfg = ConfigNode(cfg)
         self.cfg = cfg
+        self.model_cfg = getattr(self.cfg, 'model', ConfigNode())
+        self.training_cfg = getattr(self.cfg, 'training', ConfigNode())
         self.device = device
 
         prompt_dim = self.clip_model.text_projection.shape[1]
-        num_heads = cfg.get('num_heads', 8)
-        dropout = cfg.get('dropout', 0.1)
+        num_heads = self.model_cfg.get('num_heads', 8)
+        dropout = self.model_cfg.get('dropout', 0.1)
 
         prompt_layers = []
-        for _ in range(cfg.get('num_layers', 1)):
+        for _ in range(self.model_cfg.get('num_layers', 1)):
             prompt_layers.append(
                 CrossAttention(
                     feature_dim=prompt_dim,
@@ -441,7 +408,7 @@ class CustomCLIP(nn.Module):
             )
         self.prompt_learner = nn.ModuleList(prompt_layers)
 
-        if cfg.get('precision', 'fp32') == 'fp16':
+        if self.training_cfg.get('precision', 'fp32') == 'fp16':
             self.prompt_learner = self.prompt_learner.half()
 
         for param in self.clip_model.parameters():
@@ -450,7 +417,7 @@ class CustomCLIP(nn.Module):
         self.vis_encoder = ImageEncoder(self.clip_model)
         self.logit_scale = clip_model.logit_scale
 
-        self.text_features, self.prompts, self.text_tokens = self._init_text_feats(cfg, classnames)
+        self.text_features, self.prompts, self.text_tokens = self._init_text_feats(self.model_cfg, classnames)
         self.base_text_features = self.text_features.clone().detach()
 
     def _init_text_feats(self, cfg, classnames):
@@ -495,7 +462,7 @@ class CustomCLIP(nn.Module):
         
         logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
 
-        mode = self.cfg.get('mode', 'logits')
+        mode = self.training_cfg.get('mode', 'logits')
 
         if self.training and label is not None:
             loss = F.cross_entropy(logits, label)
@@ -534,7 +501,13 @@ def load_clip_to_cpu(backbone_name):
 
 class APT:
     def __init__(self, cfg, classnames, device="cuda", log_file=None):
+        if not isinstance(cfg, ConfigNode):
+            cfg = ConfigNode(cfg)
         self.cfg = cfg
+        self.training_cfg = self.cfg.get('training', ConfigNode())
+        self.model_cfg = self.cfg.get('model', ConfigNode())
+        self.data_cfg = self.cfg.get('data', ConfigNode())
+        self.cache_cfg = self.cfg.get('cache', ConfigNode())
         self.classnames = classnames
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.log_file = log_file
@@ -544,27 +517,48 @@ class APT:
         
         self.build_model()
         self.setup_optimizer()
-        self.scaler = GradScaler() if cfg.get('precision', 'fp32') == 'amp' else None
+        precision_mode = self._cfg_str('fp32', 'training.precision', 'precision')
+        self.scaler = GradScaler() if precision_mode == 'amp' else None
         
-        if cfg.get('run_decoder', False):
+        if bool(self._cfg_value('training.run_decoder', 'run_decoder', default=False)):
             self.decoder = APTDecoder(
                 device=str(self.device),
-                clip_model_name=cfg.get('backbone', 'ViT-B/32')
+                clip_model_name=self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
             )
         
-        if cfg.get('use_cache', False):
+        if bool(self._cfg_value('model.use_cache', 'cache.use_cache', 'training.use_cache', 'use_cache', default=False)):
             self.cache_adapter = CacheAdapter(
                 feature_dim=self.model.vis_encoder.ln_post.normalized_shape[0],
                 num_classes=len(classnames),
-                alpha=cfg.get('cache_alpha', 1.0),
-                beta=cfg.get('cache_beta', 1.0),
-                temperature=cfg.get('cache_temperature', 5.0)
+                alpha=self._cfg_float(1.0, 'cache.alpha', 'model.cache_alpha', 'cache_alpha'),
+                beta=self._cfg_float(1.0, 'cache.beta', 'model.cache_beta', 'cache_beta'),
+                temperature=self._cfg_float(5.0, 'cache.temperature', 'model.cache_temperature', 'cache_temperature')
             ).to(self.device)
         else:
             self.cache_adapter = None
     
+    def _cfg_value(self, *paths, default=None):
+        sentinel = object()
+        for path in paths:
+            value = get_config_value(self.cfg, path, sentinel)
+            if value is not sentinel:
+                return value
+        return default
+    
+    def _cfg_float(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_float(value, default)
+
+    def _cfg_int(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_int(value, default)
+
+    def _cfg_str(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_str(value, default)
+    
     def build_model(self):
-        backbone_name = self.cfg.get('backbone', 'ViT-B/32')
+        backbone_name = self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
         msg = f"Loading CLIP (backbone: {backbone_name})"
         print(msg)
         if self.log_file:
@@ -573,7 +567,7 @@ class APT:
         
         clip_model = load_clip_to_cpu(backbone_name)
         
-        if self.cfg.get('precision', 'fp32') in ['fp32', 'amp']:
+        if self._cfg_str('fp32', 'training.precision', 'precision') in ['fp32', 'amp']:
             clip_model.float()
 
         self.model = CustomCLIP(self.cfg, self.classnames, clip_model, self.device)
@@ -644,9 +638,9 @@ class APT:
         self.model.to(self.device)
     
     def setup_optimizer(self):
-        lr = self.cfg.get('learning_rate', 0.002)
-        weight_decay = self.cfg.get('weight_decay', 0.0005)
-        optimizer_type = self.cfg.get('optimizer', 'SGD')
+        lr = self._cfg_float(0.002, 'training.optimizer.learning_rate', 'training.learning_rate', 'learning_rate')
+        weight_decay = self._cfg_float(0.0005, 'training.optimizer.weight_decay', 'training.weight_decay', 'weight_decay')
+        optimizer_type = self._cfg_str('SGD', 'training.optimizer.name', 'optimizer')
         trainable_params = list(self.model.trainable_parameters())
         
         if optimizer_type == 'AdamW':
@@ -656,7 +650,7 @@ class APT:
         else:
             self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         
-        num_epochs = self.cfg.get('num_epochs', 100)
+        num_epochs = self._cfg_int(100, 'training.epochs', 'num_epochs')
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
     
     def reset_optimizer_scheduler(self):
@@ -674,7 +668,12 @@ class APT:
         self.model.eval()
         
         subset = Subset(dataset, labeled_indices)
-        loader = DataLoader(subset, batch_size=32, shuffle=False, num_workers=self.cfg.get('num_workers', 4))
+        loader = DataLoader(
+            subset,
+            batch_size=32,
+            shuffle=False,
+            num_workers=self._cfg_int(4, 'data.num_workers', 'num_workers')
+        )
         
         all_keys = []
         all_labels = []
@@ -707,7 +706,7 @@ class APT:
         self.model.train()
         self.model.prompt_learner.train()
         
-        precision = self.cfg.get('precision', 'fp32')
+        precision = self._cfg_str('fp32', 'training.precision', 'precision')
         
         if precision == 'amp':
             with autocast():
@@ -906,11 +905,13 @@ class APT:
 
 class APTTrainingPipeline:
     def __init__(self, config):
+        if not isinstance(config, ConfigNode):
+            config = ConfigNode(config)
         self.config = config
-        self.model_cfg = get_config_value(config, "model", {}) or {}
-        self.training_cfg = get_config_value(config, "training", {}) or {}
-        self.data_cfg = get_config_value(config, "data", {}) or {}
-        self.logging_cfg = get_config_value(config, "logging", {}) or {}
+        self.model_cfg = self.config.get('model', ConfigNode())
+        self.training_cfg = self.config.get('training', ConfigNode())
+        self.data_cfg = self.config.get('data', ConfigNode())
+        self.logging_cfg = self.config.get('logging', ConfigNode())
 
         device_value = self.training_cfg.get("device", None)
         device_name = coerce_to_str(device_value, "cuda:0", key="training.device")
@@ -966,7 +967,7 @@ class APTTrainingPipeline:
         }
 
         self.trainer: Optional[APT] = None
-        self.trainer_cfg: Dict[str, Any] = {}
+        self.trainer_cfg: ConfigNode = ConfigNode({})
         self.rounds = 1
 
     def run(self):
@@ -1054,10 +1055,10 @@ class APTTrainingPipeline:
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
-            json.dump(trainer_cfg, f, indent=4)
+            json.dump(trainer_cfg.to_dict(), f, indent=4)
 
         with open(self.log_file, 'a') as f:
-            f.write(f"Config: {trainer_cfg}\n\n")
+            f.write(f"Config: {trainer_cfg.to_dict()}\n\n")
             f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
@@ -1072,11 +1073,10 @@ class APTTrainingPipeline:
             'train_pool_size': stats['train_count'],
             'val_percentage_actual': val_percentage,
             'reset_optimizer_per_round': False,
-            'num_epochs': build_dynamic_config(self.config, CONFIG_SCHEMA)['epochs'],
-            'generate_confusion_matrix': build_dynamic_config(self.config, CONFIG_SCHEMA)['confusion_matrix']
+            'completed_rounds': 0,
         }
-        
-        trainer_cfg = build_dynamic_config(self.config, CONFIG_SCHEMA, stats, extra_values)
+
+        trainer_cfg = build_config_namespace(self.config, extra_values)
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
 
@@ -1105,7 +1105,7 @@ class APTTrainingPipeline:
         for epoch_idx in range(1, epochs_total + 1):
             self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
 
-        self.trainer_cfg['completed_rounds'] = 1
+        self.trainer_cfg.meta.completed_rounds = 1
 
     def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
         if self.trainer is None:
@@ -1286,7 +1286,7 @@ class APTTrainingPipeline:
             raise RuntimeError("Trainer not initialized before finalization.")
         
         with open(self.config_path, 'w') as f:
-            json.dump(self.trainer_cfg, f, indent=4)
+            json.dump(self.trainer_cfg.to_dict(), f, indent=4)
 
         with open(self.metrics_path, 'w') as f:
             json.dump(self.metrics, f, indent=4)

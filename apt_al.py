@@ -10,30 +10,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from apt import (
+    ConfigNode,
     APTTrainingPipeline,
     ARG_SCHEMA,
-    CONFIG_SCHEMA,
-    build_dynamic_config,
-    coerce_to_float,
     coerce_to_int,
-    coerce_to_str,
     create_argument_parser,
-    get_config_value,
     load_config_file,
     merge_configs,
     parse_override_arguments,
     process_parsed_args,
     set_nested_value,
 )
-
-AL_CONFIG_SCHEMA = {
-    **CONFIG_SCHEMA,
-    'active_learning': {
-        'rounds': {'type': int, 'default': 1},
-        'strategy': {'type': str, 'default': None},
-        'nshot': {'type': int, 'default': 0},
-    }
-}
 
 AL_ARG_SCHEMA = {
     **ARG_SCHEMA,
@@ -289,7 +276,7 @@ def select_coreset_indices(trainer, dataset, labeled_indices, unlabeled_indices,
 class ActiveLearningPipeline(APTTrainingPipeline):
     def __init__(self, config):
         super().__init__(config)
-        self.active_cfg = get_config_value(config, "active_learning", {}) or {}
+        self.active_cfg = self.config.get('active_learning', ConfigNode())
 
         rounds_value = self.active_cfg.get("rounds", None)
         self.rounds = max(1, coerce_to_int(rounds_value, 1, key="active_learning.rounds"))
@@ -371,7 +358,8 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             'total_images': len(self.dataset),
             'val_count': len(self.val_indices),
             'labeled_count': len(self.labeled_indices),
-            'unlabeled_count': len(self.unlabeled_indices)
+            'unlabeled_count': len(self.unlabeled_indices),
+            'train_count': len(self.labeled_indices) + len(self.unlabeled_indices),
         }
         print(f"Dataset loaded: {stats['total_images']} total images.")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
@@ -383,34 +371,23 @@ class ActiveLearningPipeline(APTTrainingPipeline):
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
-            json.dump(trainer_cfg, f, indent=4)
+            json.dump(trainer_cfg.to_dict(), f, indent=4)
 
         with open(self.log_file, 'w') as f:
-            f.write(f"Config: {trainer_cfg}\n\n")
+            f.write(f"Config: {json.dumps(trainer_cfg.to_dict(), indent=2)}\n\n")
             f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
-        extra_values = {
-            'dataset_root': self.dataset_root,
-            'active_learning': self.strategy,
-            'nshot': self.nshot,
-            'val_size': self.val_fraction,
-            'rounds': self.rounds,
-            'initial_kshot': self.initial_kshot,
-            'classnames': self.classnames,
-            'num_classes': len(self.classnames),
-            'initial_labeled_size': stats['labeled_count'],
-            'initial_unlabeled_size': stats['unlabeled_count'],
-            'val_size_count': stats['val_count'],
-            'train_pool_size': stats['labeled_count'] + stats['unlabeled_count'],
-            'al_selection_log': self.selection_log_path,
-            'val_percentage_actual': val_percentage,
-            'reset_optimizer_per_round': True,
-            'num_epochs': build_dynamic_config(self.config, AL_CONFIG_SCHEMA)['epochs'],
-            'generate_confusion_matrix': build_dynamic_config(self.config, AL_CONFIG_SCHEMA)['confusion_matrix']
-        }
-        
-        trainer_cfg = build_dynamic_config(self.config, AL_CONFIG_SCHEMA, stats, extra_values)
+        trainer_cfg = super()._build_trainer_config(stats, val_percentage)
+        meta = trainer_cfg.meta
+        meta.active_learning = self.strategy
+        meta.nshot = self.nshot
+        meta.initial_kshot = self.initial_kshot
+        meta.initial_labeled_size = stats.get('labeled_count', 0)
+        meta.initial_unlabeled_size = stats.get('unlabeled_count', 0)
+        meta.train_pool_size = stats.get('train_count', meta.get('train_pool_size', 0))
+        meta.al_selection_log = self.selection_log_path
+        meta.reset_optimizer_per_round = True
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
 
@@ -434,7 +411,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             print(msg)
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
-            self.trainer_cfg['completed_rounds'] = round_idx - 1
+                self.trainer_cfg.meta.completed_rounds = round_idx - 1
             return
 
         train_subset = Subset(self.dataset, list(self.labeled_indices))
@@ -463,7 +440,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             self.trainer.reset_optimizer_scheduler()
             self.trainer.update_cache_memory(self.dataset, self.labeled_indices)
 
-        self.trainer_cfg['completed_rounds'] = round_idx
+        self.trainer_cfg.meta.completed_rounds = round_idx
 
     def _perform_active_selection(self, round_idx):
         if self.dataset is None or self.trainer is None:
