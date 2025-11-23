@@ -258,16 +258,19 @@ def _prepare_coreset_embedding_matrix(
     embeddings: Dict[int, torch.Tensor],
     labeled_indices: Sequence[int],
     unlabeled_indices: Sequence[int],
+    val_indices: Sequence[int],
     selected_indices: Sequence[int],
 ):
     if not embeddings:
         return None, None
 
     status_map: Dict[int, str] = {}
+    for idx in val_indices:
+        status_map[int(idx)] = 'val'
+    for idx in unlabeled_indices:
+        status_map[int(idx)] = 'unlabeled'
     for idx in labeled_indices:
         status_map[int(idx)] = 'labeled'
-    for idx in unlabeled_indices:
-        status_map.setdefault(int(idx), 'unlabeled')
     for idx in selected_indices:
         status_map[int(idx)] = 'selected'
 
@@ -308,11 +311,19 @@ def _plot_embedding_projection(
     os.makedirs(directory, exist_ok=True)
 
     plt.figure(figsize=(10, 8))
-    order = ['labeled', 'unlabeled', 'selected']
+    order = ['val', 'unlabeled', 'labeled', 'selected']
     style_map = {
-        'labeled': {'color': '#1f77b4', 'marker': 'o', 'size': 30, 'alpha': 0.6},
-        'unlabeled': {'color': '#7f7f7f', 'marker': 'o', 'size': 20, 'alpha': 0.4},
-        'selected': {'color': '#d62728', 'marker': 'X', 'size': 80, 'alpha': 0.9},
+        'val': {'color': "#d1d14c", 'marker': 'o', 'size': 25, 'alpha': 0.3, 'edgecolors': 'black', 'linewidths': 0.5},
+        'unlabeled': {'color': '#7f7f7f', 'marker': 'o', 'size': 25, 'alpha': 0.3, 'edgecolors': 'black', 'linewidths': 0.5},
+        'labeled': {'color': "#464fb4", 'marker': 'o', 'size': 25, 'alpha': 0.3, 'edgecolors': 'black', 'linewidths': 0.5},
+        'selected': {'color': "#ee7272", 'marker': 'o', 'size': 25, 'alpha': 0.3, 'edgecolors': 'black', 'linewidths': 0.5},
+    }
+
+    label_map = {
+        'val': 'Validation',
+        'unlabeled': 'Unlabeled',
+        'labeled': 'Labeled',
+        'selected': 'Selected',
     }
 
     for status in order:
@@ -327,8 +338,9 @@ def _plot_embedding_projection(
             c=style['color'],
             alpha=style['alpha'],
             marker=style['marker'],
-            label=status.capitalize(),
-            edgecolors='none',
+            label=label_map.get(status, status.capitalize()),
+            edgecolors=style.get('edgecolors', 'none'),
+            linewidths=style.get('linewidths', 0.5),
         )
 
     plt.title(f"Coreset Embeddings ({method_name}) - Round {round_idx}")
@@ -351,6 +363,7 @@ def plot_coreset_embedding_umap(
     embeddings: Dict[int, torch.Tensor],
     labeled_indices: Sequence[int],
     unlabeled_indices: Sequence[int],
+    val_indices: Sequence[int],
     selected_indices: Sequence[int],
     round_idx: int,
     output_path: str,
@@ -366,13 +379,13 @@ def plot_coreset_embedding_umap(
         return
 
     matrix, statuses = _prepare_coreset_embedding_matrix(
-        embeddings, labeled_indices, unlabeled_indices, selected_indices
+        embeddings, labeled_indices, unlabeled_indices, val_indices, selected_indices
     )
     if matrix is None or statuses is None:
         print("No embeddings available for UMAP plot; skipping.")
         return
 
-    n_neighbors = max(2, min(15, matrix.shape[0] - 1))
+    n_neighbors = max(2, min(7, matrix.shape[0] - 1))
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=None, n_jobs=-1)
     coords = reducer.fit_transform(matrix)
     _plot_embedding_projection(coords, statuses, 'UMAP', round_idx, output_path, log_file) # type: ignore
@@ -382,6 +395,7 @@ def plot_coreset_embedding_tsne(
     embeddings: Dict[int, torch.Tensor],
     labeled_indices: Sequence[int],
     unlabeled_indices: Sequence[int],
+    val_indices: Sequence[int],
     selected_indices: Sequence[int],
     round_idx: int,
     output_path: str,
@@ -389,7 +403,7 @@ def plot_coreset_embedding_tsne(
     random_state: int = 42,
 ) -> None:
     matrix, statuses = _prepare_coreset_embedding_matrix(
-        embeddings, labeled_indices, unlabeled_indices, selected_indices
+        embeddings, labeled_indices, unlabeled_indices, val_indices, selected_indices
     )
     if matrix is None or statuses is None:
         print("No embeddings available for t-SNE plot; skipping.")
@@ -402,9 +416,11 @@ def plot_coreset_embedding_tsne(
             with open(log_file, 'a') as f:
                 f.write(msg + '\n')
         return
-
-    perplexity = max(5, min(30, matrix.shape[0] - 1))
-    reducer = TSNE(n_components=2, perplexity=perplexity, init='pca', random_state=random_state)
+    
+    n_samples = matrix.shape[0]
+    perplexity = max(5, min(50, n_samples // 100))
+    # perplexity = max(5, min(30, matrix.shape[0] - 1))
+    reducer = TSNE(n_components=2, perplexity=perplexity, init='pca', random_state=random_state, metric='cosine', n_jobs=-1, early_exaggeration=4.0)
     coords = reducer.fit_transform(matrix)
     _plot_embedding_projection(coords, statuses, 't-SNE', round_idx, output_path, log_file)
 

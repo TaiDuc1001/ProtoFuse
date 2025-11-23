@@ -34,6 +34,8 @@ ARG_SCHEMA = {
     'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
 }
 
+DEFAULT_TRAINING_EPOCHS = 100
+
 class ConfigNode(dict):
     def __init__(self, initial: Optional[Dict[str, Any]] = None):
         super().__init__()
@@ -654,7 +656,7 @@ class APT:
         else:
             self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         
-        num_epochs = self._cfg_int(100, 'training.epochs', 'num_epochs')
+        num_epochs = self._cfg_int(DEFAULT_TRAINING_EPOCHS, 'training.epochs')
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
     
     def reset_optimizer_scheduler(self):
@@ -986,6 +988,12 @@ class APTTrainingPipeline:
         self.trainer_cfg: ConfigNode = ConfigNode({})
         self.rounds = 1
 
+    def _get_training_epochs(self):
+        epochs_value = None
+        if isinstance(self.training_cfg, dict):
+            epochs_value = self.training_cfg.get('epochs', None)
+        return coerce_to_int(epochs_value, DEFAULT_TRAINING_EPOCHS, key='training.epochs')
+
     def run(self):
         self._prepare_directories()
         self._load_dataset()
@@ -1126,8 +1134,7 @@ class APTTrainingPipeline:
         train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
-        epochs_value = self.training_cfg.get('epochs', None)
-        epochs_total = coerce_to_int(epochs_value, 150, key='training.epochs')
+        epochs_total = self._get_training_epochs()
 
         if self.trainer.cache_adapter is not None:
             self.trainer.update_cache_memory(self.dataset, self.train_indices)
@@ -1216,7 +1223,7 @@ class APTTrainingPipeline:
         val_loss_display = f"{val_loss:.4f}" if self.val_loader is not None else "N/A"
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
         epoch_str = (
-            f"Epoch {self.global_epoch}/{self.total_epochs} (round {round_idx}/{self.rounds}) - " # type: ignore
+            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}) - " # type: ignore
             f"loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
             f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
         )

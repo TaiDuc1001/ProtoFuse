@@ -8,11 +8,13 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
+import numpy as np
 
 from apt import (
     ConfigNode,
     APTTrainingPipeline,
     ARG_SCHEMA,
+    coerce_to_float,
     coerce_to_int,
     create_argument_parser,
     load_config_file,
@@ -20,6 +22,11 @@ from apt import (
     parse_override_arguments,
     process_parsed_args,
     set_nested_value,
+)
+from dn4 import (
+    aggregate_test_distributions,
+    build_similarity_matrix,
+    label_propagation,
 )
 from utils import (
     plot_conflict_distribution,
@@ -30,6 +37,7 @@ from utils import (
 
 AL_ARG_SCHEMA = {
     **ARG_SCHEMA,
+    'use_dn4': {'type': bool, 'help': 'Enable DN4 graph propagation and blending (bool)', 'config_path': 'use_dn4'},
 }
 
 
@@ -181,10 +189,6 @@ def compute_coreset_embeddings(trainer, dataset, indices, batch_size, num_worker
     original_training_state = trainer.model.training
     trainer.model.eval()
 
-    old_mode = trainer.model.cfg.get('mode', None) if isinstance(trainer.model.cfg, dict) else None
-    if isinstance(trainer.model.cfg, dict):
-        trainer.model.cfg['mode'] = 'features'
-
     with torch.no_grad():
         for images, _ in loader:
             batch_size_local = images.size(0)
@@ -193,37 +197,46 @@ def compute_coreset_embeddings(trainer, dataset, indices, batch_size, num_worker
 
             images = images.to(trainer.device)
 
-            outputs = trainer.model(images)
-            if isinstance(outputs, (list, tuple)) and len(outputs) == 2:
-                logits, text_features = outputs
+            visual_out = trainer.model.vis_encoder(images)
+            if isinstance(visual_out, (list, tuple)) and len(visual_out) == 2:
+                unpooled_levels, image_features = visual_out
             else:
-                raise RuntimeError("Model in 'features' mode is expected to return (logits, text_features).")
+                unpooled_levels = visual_out
+                image_features = None
 
-            if isinstance(logits, (list, tuple)):
-                logits = logits[0]
+            if isinstance(unpooled_levels, list):
+                unpooled = unpooled_levels[0]
+            else:
+                unpooled = unpooled_levels
 
-            predicted = torch.argmax(logits, dim=1)
+            if isinstance(unpooled, (list, tuple)):
+                unpooled = unpooled[0]
 
-            visual_output = trainer.model.vis_encoder(images)
-            _, image_features = visual_output
+            unpooled_images = unpooled.permute(1, 0, 2)
 
-            image_features = image_features.to(torch.float32)
+            base_text_features = trainer.model._prepare_text_features().to(images.device).to(unpooled_images.dtype)
+            text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+
+            for layer in trainer.model._prompt_layers_iter():
+                text_features, _ = layer(unpooled_images, text_features)
+
+            text_features = text_features.permute(1, 0, 2)
+            text_features = F.normalize(text_features, dim=-1).to(torch.float32)
+
+            if image_features is not None:
+                image_features = F.normalize(image_features.to(torch.float32), dim=-1)
+                logit_scale = trainer.model.logit_scale.exp()
+                logits = logit_scale * F.cosine_similarity(image_features.unsqueeze(1), text_features, dim=-1)
+                predicted = torch.argmax(logits, dim=1)
+            else:
+                norms = torch.norm(text_features, dim=-1)
+                predicted = torch.argmax(norms, dim=1)
+
             tuned_features = text_features[torch.arange(text_features.size(0)), predicted].to(torch.float32)
+            tuned_features_cpu = tuned_features.detach().cpu()
 
-            image_features = F.normalize(image_features, dim=-1)
-            tuned_features = F.normalize(tuned_features, dim=-1)
-
-            combined = torch.cat([image_features, tuned_features], dim=-1)
-            combined_cpu = combined.detach().cpu().to(torch.float32)
-
-            for idx, vec in zip(batch_indices, combined_cpu):
+            for idx, vec in zip(batch_indices, tuned_features_cpu):
                 embeddings[int(idx)] = vec
-
-    if isinstance(trainer.model.cfg, dict):
-        if old_mode is None:
-            trainer.model.cfg.pop('mode', None)
-        else:
-            trainer.model.cfg['mode'] = old_mode
 
     trainer.model.train(original_training_state)
     return embeddings
@@ -313,6 +326,11 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         self.plot_coreset_embedding_umap = bool(self.config.get("plot_coreset_embedding_umap", self.active_cfg.get("plot_coreset_embedding_umap", False)))
         self.plot_coreset_embedding_tsne = bool(self.config.get("plot_coreset_embedding_tsne", self.active_cfg.get("plot_coreset_embedding_tsne", False)))
         print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_conflict_distribution={self.plot_conflict_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
+        self.use_dn4 = bool(self.config.get("use_dn4", False))
+        raw_dn4_cfg = self.config.get("dn4", ConfigNode())
+        if not isinstance(raw_dn4_cfg, ConfigNode):
+            raw_dn4_cfg = ConfigNode(raw_dn4_cfg)
+        self.dn4_cfg = raw_dn4_cfg
 
     def run(self):
         self._prepare_directories()
@@ -320,6 +338,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         self._split_dataset()
         self._initialize_trainer()
         self._active_learning_loop()
+        self._run_dn4_mode()
         self._finalize()
 
     def _prepare_directories(self):
@@ -419,7 +438,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         print('\n')
         print('=' * 50)
 
-        base_epochs = coerce_to_int(self.training_cfg.get('epochs', None), 150, key='training.epochs')
+        base_epochs = self._get_training_epochs()
         incr_epochs = self.incr_epochs
         self.total_epochs = sum(base_epochs + (r - 1) * incr_epochs for r in range(1, self.rounds + 1))
 
@@ -453,8 +472,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         with open(self.log_file, 'a') as f:
             f.write(msg + '\n')
 
-        base_epochs_value = self.training_cfg.get('epochs', None)
-        base_epochs = coerce_to_int(base_epochs_value, 150, key='training.epochs')
+        base_epochs = self._get_training_epochs()
         epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
 
         with open(self.log_file, 'a') as f:
@@ -540,7 +558,9 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 self.num_workers
             )
             if need_coreset_plot and selection_plot_dir is not None:
-                combined_indices = list(dict.fromkeys(self.labeled_indices + self.unlabeled_indices))
+                combined_indices = list(
+                    dict.fromkeys(self.labeled_indices + self.unlabeled_indices + self.val_indices)
+                )
                 coreset_embeddings = compute_coreset_embeddings(
                     self.trainer,
                     self.dataset,
@@ -555,6 +575,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                             coreset_embeddings,
                             self.labeled_indices,
                             self.unlabeled_indices,
+                            self.val_indices,
                             raw_selected,
                             round_idx,
                             f"{plot_base}_umap.pdf",
@@ -565,6 +586,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                             coreset_embeddings,
                             self.labeled_indices,
                             self.unlabeled_indices,
+                            self.val_indices,
                             raw_selected,
                             round_idx,
                             f"{plot_base}_tsne.pdf",
@@ -642,6 +664,202 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         with open(self.selection_log_path, 'a') as f:
             line = ';'.join(round_selected_paths) if round_selected_paths else f"round {round_idx}: none"
             f.write(line + '\n')
+
+    def _run_dn4_mode(self):
+        if not self.use_dn4:
+            return
+        if self.dataset is None or self.trainer is None:
+            return
+        if len(self.val_indices) == 0:
+            msg = "DN4 mode skipped (validation split empty)."
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
+            return
+        support_indices = list(dict.fromkeys(self.labeled_indices + self.unlabeled_indices))
+        if not support_indices:
+            msg = "DN4 mode skipped (support set empty)."
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
+            return
+        k_value = self.dn4_cfg.get('k', 7)
+        k_prime_value = self.dn4_cfg.get('k_prime', k_value)
+        alpha_value = self.dn4_cfg.get('alpha', 0.8)
+        max_iter_value = self.dn4_cfg.get('max_iter', 30)
+        tol_value = self.dn4_cfg.get('tol', 1e-4)
+        epsilon_value = self.dn4_cfg.get('epsilon', 1e-8)
+        lambda_values = self.dn4_cfg.get('lambdas', [0.0, 0.25, 0.5, 0.75, 1.0])
+        k = coerce_to_int(k_value, 7, key='dn4.k')
+        k_prime = coerce_to_int(k_prime_value, k, key='dn4.k_prime')
+        alpha = coerce_to_float(alpha_value, 0.8, key='dn4.alpha')
+        max_iter = coerce_to_int(max_iter_value, 30, key='dn4.max_iter')
+        tol = coerce_to_float(tol_value, 1e-4, key='dn4.tol')
+        epsilon = coerce_to_float(epsilon_value, 1e-8, key='dn4.epsilon')
+        if isinstance(lambda_values, (int, float)):
+            lambda_values = [lambda_values]
+        elif not isinstance(lambda_values, (list, tuple)):
+            lambda_values = [0.0, 0.25, 0.5, 0.75, 1.0]
+        lambda_candidates = []
+        for value in lambda_values:
+            lambda_candidates.append(coerce_to_float(value, 0.0, key='dn4.lambdas'))
+        if not lambda_candidates:
+            lambda_candidates = [1.0]
+        lambda_candidates = sorted(set(float(val) for val in lambda_candidates))
+        if self.trainer.cache_adapter is not None:
+            self.trainer.update_cache_memory(self.dataset, self.labeled_indices)
+        combined_indices = list(dict.fromkeys(support_indices + self.val_indices))
+        embedding_map = compute_coreset_embeddings(
+            self.trainer,
+            self.dataset,
+            combined_indices,
+            self.batch_size,
+            self.num_workers,
+        )
+        support_features = []
+        ordered_support = []
+        for idx in support_indices:
+            tensor = embedding_map.get(idx)
+            if tensor is None:
+                continue
+            support_features.append(tensor.detach().cpu().numpy().astype(np.float32))
+            ordered_support.append(idx)
+        if not ordered_support:
+            msg = "DN4 mode skipped (no embeddings for support set)."
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
+            return
+        support_features = np.stack(support_features, axis=0)
+        num_classes = len(self.classnames)
+        seed_labels = np.zeros((support_features.shape[0], num_classes), dtype=np.float32)
+        labeled_lookup = set(self.labeled_indices)
+        for pos, idx in enumerate(ordered_support):
+            if idx in labeled_lookup:
+                label = self.dataset.samples[idx][1]
+                seed_labels[pos, label] = 1.0
+        val_features = []
+        val_indices_filtered = []
+        for idx in self.val_indices:
+            tensor = embedding_map.get(idx)
+            if tensor is None:
+                continue
+            val_features.append(tensor.detach().cpu().numpy().astype(np.float32))
+            val_indices_filtered.append(idx)
+        if not val_indices_filtered:
+            msg = "DN4 mode skipped (no embeddings for validation set)."
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
+            return
+        val_features = np.stack(val_features, axis=0)
+        logits_np, labels_np, val_paths = self._collect_logits_for_indices(val_indices_filtered)
+        if logits_np.shape[0] == 0:
+            msg = "DN4 mode skipped (no logits for validation set)."
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
+            return
+        similarity_matrix, sigma = build_similarity_matrix(support_features, k)
+        propagated = label_propagation(similarity_matrix, seed_labels, alpha, max_iter, tol)
+        val_distributions = aggregate_test_distributions(val_features, support_features, propagated, sigma, k_prime)
+        graph_logits = np.log(np.clip(val_distributions, epsilon, None))
+        apt_logits = logits_np.astype(np.float32)
+        best_lambda = lambda_candidates[0]
+        best_accuracy = -float('inf')
+        metrics = []
+        for candidate in lambda_candidates:
+            blended = candidate * apt_logits + (1 - candidate) * graph_logits
+            preds = np.argmax(blended, axis=1)
+            acc = float((preds == labels_np).mean() * 100.0)
+            metrics.append({'lambda': float(candidate), 'accuracy': acc})
+            if acc > best_accuracy:
+                best_accuracy = acc
+                best_lambda = candidate
+        best_blended = best_lambda * apt_logits + (1 - best_lambda) * graph_logits
+        best_preds = np.argmax(best_blended, axis=1)
+        apt_preds = np.argmax(apt_logits, axis=1)
+        graph_preds = np.argmax(val_distributions, axis=1)
+        idx_array = np.arange(len(val_indices_filtered))
+        apt_scores = apt_logits[idx_array, apt_preds]
+        graph_scores = val_distributions[idx_array, graph_preds]
+        final_scores = best_blended[idx_array, best_preds]
+        predictions = []
+        for i, idx in enumerate(val_indices_filtered):
+            predictions.append({
+                'index': int(idx),
+                'path': val_paths[i] if i < len(val_paths) else 'unknown',
+                'label': int(labels_np[i]),
+                'apt_pred': int(apt_preds[i]),
+                'graph_pred': int(graph_preds[i]),
+                'final_pred': int(best_preds[i]),
+                'apt_score': float(apt_scores[i]),
+                'graph_prob': float(graph_scores[i]),
+                'final_score': float(final_scores[i]),
+            })
+        results = {
+            'support_size': int(len(ordered_support)),
+            'labeled_support': int(len(self.labeled_indices)),
+            'unlabeled_support': int(len(self.unlabeled_indices)),
+            'validation_size': int(len(val_indices_filtered)),
+            'k': int(k),
+            'k_prime': int(k_prime),
+            'alpha': float(alpha),
+            'max_iter': int(max_iter),
+            'tol': float(tol),
+            'sigma': float(sigma),
+            'epsilon': float(epsilon),
+            'lambda_metrics': metrics,
+            'best_lambda': float(best_lambda),
+            'best_accuracy': float(best_accuracy),
+        }
+        results_path = os.path.join(self.run_dir, 'dn4_results.json')
+        predictions_path = os.path.join(self.run_dir, 'dn4_val_predictions.json')
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        with open(predictions_path, 'w') as f:
+            json.dump(predictions, f, indent=2)
+        summary = f"DN4 mode completed: lambda={best_lambda:.2f}, accuracy={best_accuracy:.2f}% on {len(val_indices_filtered)} samples."
+        print(summary)
+        with open(self.log_file, 'a') as f:
+            f.write(summary + '\n')
+
+    def _collect_logits_for_indices(self, indices):
+        if self.dataset is None or self.trainer is None or not indices:
+            return np.zeros((0, len(self.classnames)), dtype=np.float32), np.zeros((0,), dtype=np.int64), []
+        subset = Subset(self.dataset, indices)
+        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        logits_chunks = []
+        labels_list = []
+        paths = []
+        position = 0
+        self.trainer.model.eval()
+        with torch.no_grad():
+            for images, labels in loader:
+                batch_size_local = images.size(0)
+                batch_indices = indices[position:position + batch_size_local]
+                position += batch_size_local
+                images = images.to(self.trainer.device)
+                logits = self.trainer.model(images)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+                if self.trainer.cache_adapter is not None:
+                    visual_out = self.trainer.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits = self.trainer.cache_adapter(img_feats, logits)
+                logits_chunks.append(logits.detach().cpu())
+                labels_list.extend(labels.cpu().numpy().astype(np.int64).tolist())
+                for idx in batch_indices:
+                    if 0 <= idx < len(self.dataset.samples):
+                        paths.append(os.path.abspath(self.dataset.samples[idx][0]))
+                    else:
+                        paths.append('unknown')
+        if logits_chunks:
+            logits_tensor = torch.cat(logits_chunks, dim=0)
+            logits_array = logits_tensor.numpy()
+        else:
+            logits_array = np.zeros((0, len(self.classnames)), dtype=np.float32)
+        return logits_array, np.asarray(labels_list, dtype=np.int64), paths
 
 
 def parse_args():
