@@ -27,6 +27,11 @@ from utils import (
     visualize_attention_maps,
     visualize_gradcam_maps,
 )
+from dn4 import (
+    aggregate_test_distributions,
+    build_similarity_matrix,
+    label_propagation,
+)
 
 ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
@@ -987,6 +992,11 @@ class APTTrainingPipeline:
         self.trainer: Optional[APT] = None
         self.trainer_cfg: ConfigNode = ConfigNode({})
         self.rounds = 1
+        self.use_dn4 = bool(self.config.get('use_dn4', False))
+        raw_dn4_cfg = self.config.get('dn4', ConfigNode())
+        if not isinstance(raw_dn4_cfg, ConfigNode):
+            raw_dn4_cfg = ConfigNode(raw_dn4_cfg)
+        self.dn4_cfg = raw_dn4_cfg
 
     def _get_training_epochs(self):
         epochs_value = None
@@ -1000,6 +1010,7 @@ class APTTrainingPipeline:
         self._split_dataset()
         self._initialize_trainer()
         self._train_epochs()
+        self._run_dn4_mode()
         self._finalize()
 
     def _prepare_directories(self):
@@ -1317,6 +1328,298 @@ class APTTrainingPipeline:
             maps_dir,
             self.log_file,
         )
+
+    def _compute_dn4_embeddings(self, indices):
+        if not indices or self.dataset is None or self.trainer is None:
+            return {}
+
+        subset = Subset(self.dataset, indices)
+        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+        embeddings = {}
+        position = 0
+        original_training_state = self.trainer.model.training
+        self.trainer.model.eval()
+
+        with torch.no_grad():
+            for images, _ in loader:
+                batch_size_local = images.size(0)
+                batch_indices = indices[position:position + batch_size_local]
+                position += batch_size_local
+
+                images = images.to(self.trainer.device)
+
+                visual_out = self.trainer.model.vis_encoder(images)
+                if isinstance(visual_out, (list, tuple)) and len(visual_out) == 2:
+                    unpooled_levels, image_features = visual_out
+                else:
+                    unpooled_levels = visual_out
+                    image_features = None
+
+                if isinstance(unpooled_levels, list):
+                    unpooled = unpooled_levels[0]
+                else:
+                    unpooled = unpooled_levels
+
+                if isinstance(unpooled, (list, tuple)):
+                    unpooled = unpooled[0]
+
+                unpooled_images = unpooled.permute(1, 0, 2)
+
+                base_text_features = self.trainer.model._prepare_text_features().to(images.device).to(unpooled_images.dtype)
+                text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+
+                for layer in self.trainer.model._prompt_layers_iter():
+                    text_features, _ = layer(unpooled_images, text_features)
+
+                text_features = text_features.permute(1, 0, 2)
+                text_features = F.normalize(text_features, dim=-1).to(torch.float32)
+
+                if image_features is not None:
+                    image_features = F.normalize(image_features.to(torch.float32), dim=-1)
+                    logit_scale = self.trainer.model.logit_scale.exp()
+                    logits = logit_scale * F.cosine_similarity(image_features.unsqueeze(1), text_features, dim=-1)
+                    predicted = torch.argmax(logits, dim=1)
+                else:
+                    norms = torch.norm(text_features, dim=-1)
+                    predicted = torch.argmax(norms, dim=1)
+
+                tuned_features = text_features[torch.arange(text_features.size(0)), predicted].to(torch.float32)
+                tuned_features_cpu = tuned_features.detach().cpu()
+
+                for idx, vec in zip(batch_indices, tuned_features_cpu):
+                    embeddings[int(idx)] = vec
+
+        self.trainer.model.train(original_training_state)
+        return embeddings
+
+    def _collect_logits_for_indices(self, indices):
+        if not indices or self.dataset is None or self.trainer is None:
+            return np.zeros((0, len(self.classnames)), dtype=np.float32), np.zeros((0,), dtype=np.int64), []
+
+        subset = Subset(self.dataset, indices)
+        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        logits_chunks = []
+        labels_list = []
+        paths = []
+        position = 0
+        self.trainer.model.eval()
+
+        with torch.no_grad():
+            for images, labels in loader:
+                batch_size_local = images.size(0)
+                batch_indices = indices[position:position + batch_size_local]
+                position += batch_size_local
+                images = images.to(self.trainer.device)
+                logits = self.trainer.model(images)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+                if self.trainer.cache_adapter is not None:
+                    visual_out = self.trainer.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits = self.trainer.cache_adapter(img_feats, logits)
+                logits_chunks.append(logits.detach().cpu())
+                labels_list.extend(labels.cpu().numpy().astype(np.int64).tolist())
+                for idx in batch_indices:
+                    if 0 <= idx < len(self.dataset.samples):
+                        paths.append(os.path.abspath(self.dataset.samples[idx][0]))
+                    else:
+                        paths.append('unknown')
+
+        if logits_chunks:
+            logits_tensor = torch.cat(logits_chunks, dim=0)
+            logits_array = logits_tensor.numpy()
+        else:
+            logits_array = np.zeros((0, len(self.classnames)), dtype=np.float32)
+
+        return logits_array, np.asarray(labels_list, dtype=np.int64), paths
+
+    def _run_dn4_mode(self):
+        if not self.use_dn4:
+            return
+        if self.dataset is None or self.trainer is None:
+            return
+        if len(self.val_indices) == 0:
+            msg = "DN4 mode skipped (validation split empty)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        support_indices = list(dict.fromkeys(self.labeled_indices + self.unlabeled_indices))
+        if not support_indices:
+            msg = "DN4 mode skipped (support set empty)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        k_value = self.dn4_cfg.get('k', 7)
+        k_prime_value = self.dn4_cfg.get('k_prime', k_value)
+        alpha_value = self.dn4_cfg.get('alpha', 0.8)
+        max_iter_value = self.dn4_cfg.get('max_iter', 30)
+        tol_value = self.dn4_cfg.get('tol', 1e-4)
+        epsilon_value = self.dn4_cfg.get('epsilon', 1e-8)
+        lambda_values = self.dn4_cfg.get('lambdas', [0.0, 0.25, 0.5, 0.75, 1.0])
+
+        k = coerce_to_int(k_value, 7, key='dn4.k')
+        k_prime = coerce_to_int(k_prime_value, k, key='dn4.k_prime')
+        alpha = coerce_to_float(alpha_value, 0.8, key='dn4.alpha')
+        max_iter = coerce_to_int(max_iter_value, 30, key='dn4.max_iter')
+        tol = coerce_to_float(tol_value, 1e-4, key='dn4.tol')
+        epsilon = coerce_to_float(epsilon_value, 1e-8, key='dn4.epsilon')
+
+        if isinstance(lambda_values, (int, float)):
+            lambda_candidates = [coerce_to_float(lambda_values, 0.0, key='dn4.lambdas')]
+        elif isinstance(lambda_values, (list, tuple)):
+            lambda_candidates = [coerce_to_float(val, 0.0, key='dn4.lambdas') for val in lambda_values]
+        else:
+            lambda_candidates = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+        lambda_candidates = sorted(set(lambda_candidates)) or [1.0]
+
+        combined_indices = list(dict.fromkeys(support_indices + self.val_indices))
+        embedding_map = self._compute_dn4_embeddings(combined_indices)
+        if not embedding_map:
+            msg = "DN4 mode skipped (no embeddings available)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        support_features = []
+        ordered_support = []
+        for idx in support_indices:
+            tensor = embedding_map.get(idx)
+            if tensor is None:
+                continue
+            support_features.append(tensor.detach().cpu().numpy().astype(np.float32))
+            ordered_support.append(idx)
+
+        if not ordered_support:
+            msg = "DN4 mode skipped (no embeddings for support set)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        support_features = np.stack(support_features, axis=0)
+        num_classes = len(self.classnames)
+        seed_labels = np.zeros((support_features.shape[0], num_classes), dtype=np.float32)
+        labeled_lookup = set(self.labeled_indices)
+
+        for pos, idx in enumerate(ordered_support):
+            if idx in labeled_lookup:
+                label = self.dataset.samples[idx][1]
+                seed_labels[pos, label] = 1.0
+
+        val_features = []
+        val_indices_filtered = []
+        for idx in self.val_indices:
+            tensor = embedding_map.get(idx)
+            if tensor is None:
+                continue
+            val_features.append(tensor.detach().cpu().numpy().astype(np.float32))
+            val_indices_filtered.append(idx)
+
+        if not val_indices_filtered:
+            msg = "DN4 mode skipped (no embeddings for validation set)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        val_features = np.stack(val_features, axis=0)
+        logits_np, labels_np, val_paths = self._collect_logits_for_indices(val_indices_filtered)
+        if logits_np.shape[0] == 0:
+            msg = "DN4 mode skipped (no logits for validation set)."
+            print(msg)
+            if self.log_file:
+                with open(self.log_file, 'a') as f:
+                    f.write(msg + '\n')
+            return
+
+        similarity_matrix, sigma = build_similarity_matrix(support_features, k)
+        propagated = label_propagation(similarity_matrix, seed_labels, alpha, max_iter, tol)
+        val_distributions = aggregate_test_distributions(val_features, support_features, propagated, sigma, k_prime)
+
+        graph_logits = np.log(np.clip(val_distributions, epsilon, None))
+        apt_logits = logits_np.astype(np.float32)
+
+        best_lambda = lambda_candidates[0]
+        best_accuracy = -float('inf')
+        lambda_metrics = []
+
+        for candidate in lambda_candidates:
+            blended = candidate * apt_logits + (1 - candidate) * graph_logits
+            preds = np.argmax(blended, axis=1)
+            acc = float((preds == labels_np).mean() * 100.0)
+            lambda_metrics.append({'lambda': float(candidate), 'accuracy': acc})
+            if acc > best_accuracy:
+                best_accuracy = acc
+                best_lambda = candidate
+
+        best_blended = best_lambda * apt_logits + (1 - best_lambda) * graph_logits
+        best_preds = np.argmax(best_blended, axis=1)
+        apt_preds = np.argmax(apt_logits, axis=1)
+        graph_preds = np.argmax(val_distributions, axis=1)
+        idx_array = np.arange(len(val_indices_filtered))
+        apt_scores = apt_logits[idx_array, apt_preds]
+        graph_scores = val_distributions[idx_array, graph_preds]
+        final_scores = best_blended[idx_array, best_preds]
+
+        predictions = []
+        for i, idx in enumerate(val_indices_filtered):
+            predictions.append({
+                'index': int(idx),
+                'path': val_paths[i] if i < len(val_paths) else 'unknown',
+                'label': int(labels_np[i]),
+                'apt_pred': int(apt_preds[i]),
+                'graph_pred': int(graph_preds[i]),
+                'final_pred': int(best_preds[i]),
+                'apt_score': float(apt_scores[i]),
+                'graph_prob': float(graph_scores[i]),
+                'final_score': float(final_scores[i]),
+            })
+
+        results = {
+            'support_size': int(len(ordered_support)),
+            'labeled_support': int(len(self.labeled_indices)),
+            'unlabeled_support': int(len(self.unlabeled_indices)),
+            'validation_size': int(len(val_indices_filtered)),
+            'k': int(k),
+            'k_prime': int(k_prime),
+            'alpha': float(alpha),
+            'max_iter': int(max_iter),
+            'tol': float(tol),
+            'sigma': float(sigma),
+            'epsilon': float(epsilon),
+            'lambda_metrics': lambda_metrics,
+            'best_lambda': float(best_lambda),
+            'best_accuracy': float(best_accuracy),
+        }
+
+        results_path = os.path.join(self.run_dir, 'dn4_results.json')
+        predictions_path = os.path.join(self.run_dir, 'dn4_val_predictions.json')
+
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        with open(predictions_path, 'w') as f:
+            json.dump(predictions, f, indent=2)
+
+        summary = (
+            f"DN4 mode completed: lambda={best_lambda:.2f}, accuracy={best_accuracy:.2f}% "
+            f"on {len(val_indices_filtered)} validation samples."
+        )
+        print(summary)
+        if self.log_file:
+            with open(self.log_file, 'a') as f:
+                f.write(summary + '\n')
 
     def _finalize(self):
         if self.trainer is None:
