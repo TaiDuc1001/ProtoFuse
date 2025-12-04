@@ -187,6 +187,15 @@ class ImageEncoder(nn.Module):
         return patch_features, cls_feature
 
 
+class LinearClassifier(nn.Module):
+    def __init__(self, feature_dim, num_classes):
+        super().__init__()
+        self.fc = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 class MIMModule(nn.Module):
     def __init__(self, feature_dim, hidden_dim, num_encoder_layers, num_decoder_layers, num_heads, dropout):
         super().__init__()
@@ -290,6 +299,12 @@ class CLIPZeroShotMIM(nn.Module):
             logits = logit_scale * cls_feature @ self.text_features.t()
         return logits
 
+    def extract_features(self, images):
+        with torch.no_grad():
+            patch_tokens, _ = self.image_encoder(images)
+            avg_patch_tokens = patch_tokens.mean(dim=1)
+        return avg_patch_tokens
+
     def trainable_parameters(self):
         return self.mim_module.parameters()
 
@@ -337,17 +352,38 @@ class MIMTrainer:
         self.optimizer.step()
         return {"loss": loss.item()}
 
-    def evaluate(self, dataloader):
+    def linear_eval(self, train_loader, val_loader, num_classes, epochs=100, lr=0.01):
         self.model.eval()
+        feature_dim = self.model.clip_model.text_projection.shape[1]
+        classifier = LinearClassifier(feature_dim, num_classes).to(self.device)
+        optimizer = torch.optim.SGD(classifier.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.CrossEntropyLoss()
+        
+        for epoch in range(epochs):
+            classifier.train()
+            for images, labels in train_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                features = self.model.extract_features(images)
+                logits = classifier(features)
+                loss = criterion(logits, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+        
+        classifier.eval()
         correct = 0
         total = 0
         all_preds = []
         all_labels = []
         with torch.no_grad():
-            for images, labels in dataloader:
+            for images, labels in val_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
-                logits = self.model.forward_zeroshot(images)
+                features = self.model.extract_features(images)
+                logits = classifier(features)
                 _, predicted = torch.max(logits, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
@@ -407,6 +443,7 @@ class MIMTrainingPipeline:
         self.dataset: Optional[ImageFolder] = None
         self.val_loader: Optional[DataLoader] = None
         self.unlabeled_loader: Optional[DataLoader] = None
+        self.labeled_loader: Optional[DataLoader] = None
         self.classnames: List[str] = []
         self.val_indices: List[int] = []
         self.labeled_indices: List[int] = []
@@ -482,6 +519,9 @@ class MIMTrainingPipeline:
         if len(self.unlabeled_indices) > 0:
             unlabeled_ds = Subset(self.dataset, self.unlabeled_indices)
             self.unlabeled_loader = DataLoader(unlabeled_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        if len(self.labeled_indices) > 0:
+            labeled_ds = Subset(self.dataset, self.labeled_indices)
+            self.labeled_loader = DataLoader(labeled_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self.classnames = list(self.dataset.classes)
         print(f"Dataset loaded: {len(self.dataset)} total images.")
         print(f"Validation split: {len(self.val_indices)} images ({len(self.val_indices)/len(self.dataset)*100:.2f}%).")
@@ -519,8 +559,14 @@ class MIMTrainingPipeline:
             steps += 1
         avg_loss = running_loss / max(1, steps)
         val_acc = 0.0
-        if self.val_loader is not None:
-            results = self.trainer.evaluate(self.val_loader)
+        if self.val_loader is not None and self.labeled_loader is not None:
+            linear_eval_epochs = coerce_to_int(self.training_cfg.get('linear_eval_epochs', 100), 100)
+            linear_eval_lr = coerce_to_float(self.training_cfg.get('linear_eval_lr', 0.01), 0.01)
+            num_classes = len(self.classnames)
+            results = self.trainer.linear_eval(
+                self.labeled_loader, self.val_loader, num_classes,
+                epochs=linear_eval_epochs, lr=linear_eval_lr
+            )
             val_acc = results['accuracy']
         epoch_time = time.time() - start_time
         self.metrics.append({
