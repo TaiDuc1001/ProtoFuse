@@ -647,6 +647,7 @@ class APT:
                 f.write(msg + '\n')
 
         self.model.to(self.device)
+        self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
     
     def setup_optimizer(self):
         lr = self._cfg_float(0.002, 'training.learning_rate')
@@ -666,6 +667,11 @@ class APT:
     
     def reset_optimizer_scheduler(self):
         self.setup_optimizer()
+
+    def reset_model(self):
+        if hasattr(self, 'initial_model_state'):
+            self.model.load_state_dict(self.initial_model_state)
+            self.model.to(self.device)
 
     def update_cache_memory(self, dataset, labeled_indices):
         if self.cache_adapter is None:
