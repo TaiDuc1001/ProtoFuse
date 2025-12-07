@@ -20,6 +20,7 @@ from apt import (
     process_parsed_args,
 )
 from utils import (
+    plot_bald_distribution,
     plot_entropy_distribution,
     plot_coreset_embedding_tsne,
     plot_coreset_embedding_umap,
@@ -36,7 +37,9 @@ def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
     subset = Subset(dataset, indices)
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    entropy_per_class = defaultdict(list)
+    all_probs = []
+    all_labels = []
+    all_indices = []
     position = 0
     eps = 1e-12
 
@@ -54,12 +57,113 @@ def compute_entropy_scores(trainer, dataset, indices, batch_size, num_workers):
                 logits = logits[0]
 
             probs = torch.softmax(logits, dim=1)
-            entropy = -(probs * torch.log(probs + eps)).sum(dim=1)
+            all_probs.append(probs.cpu())
+            all_labels.extend(labels.cpu().tolist())
+            all_indices.extend(batch_indices)
 
-            for ent, lbl, idx in zip(entropy.cpu().tolist(), labels.cpu().tolist(), batch_indices):
-                entropy_per_class[int(lbl)].append((float(ent), int(idx)))
+    all_probs = torch.cat(all_probs, dim=0)
+    num_classes = all_probs.shape[1]
+
+    class_probs = defaultdict(list)
+    for i, lbl in enumerate(all_labels):
+        class_probs[int(lbl)].append(all_probs[i])
+
+    contextual_prior = torch.zeros(num_classes)
+    top_k_fraction = 0.1
+
+    for c in range(num_classes):
+        if c in class_probs and len(class_probs[c]) > 0:
+            class_prob_tensor = torch.stack(class_probs[c])
+            class_scores = class_prob_tensor[:, c]
+            k = max(1, int(len(class_scores) * top_k_fraction))
+            top_k_scores, _ = torch.topk(class_scores, k)
+            contextual_prior[c] = top_k_scores.mean()
+        else:
+            contextual_prior[c] = 1.0
+
+    contextual_prior = torch.clamp(contextual_prior, min=eps)
+
+    calibrated_probs = all_probs / contextual_prior.unsqueeze(0)
+    calibrated_probs = calibrated_probs / calibrated_probs.sum(dim=1, keepdim=True)
+
+    calibrated_entropy = -(calibrated_probs * torch.log(calibrated_probs + eps)).sum(dim=1)
+
+    entropy_per_class = defaultdict(list)
+    for i, (ent, lbl, idx) in enumerate(zip(calibrated_entropy.tolist(), all_labels, all_indices)):
+        entropy_per_class[int(lbl)].append((float(ent), int(idx)))
 
     return entropy_per_class
+
+
+def compute_bald_scores(trainer, dataset, indices, batch_size, num_workers, mc_samples=10):
+    if not indices:
+        return defaultdict(list)
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    eps = 1e-12
+    all_mc_probs = []
+    all_labels = []
+    all_indices = []
+
+    original_training_state = trainer.model.training
+    trainer.model.train()
+
+    for m in range(mc_samples):
+        mc_probs = []
+        position = 0
+
+        with torch.no_grad():
+            for images, labels in loader:
+                batch_size_local = images.size(0)
+                if m == 0:
+                    batch_indices = indices[position:position + batch_size_local]
+                    all_labels.extend(labels.cpu().tolist())
+                    all_indices.extend(batch_indices)
+                position += batch_size_local
+
+                images = images.to(trainer.device)
+                logits = trainer.model(images)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+
+                probs = torch.softmax(logits, dim=1)
+                mc_probs.append(probs.cpu())
+
+        all_mc_probs.append(torch.cat(mc_probs, dim=0))
+
+    trainer.model.train(original_training_state)
+
+    stacked_probs = torch.stack(all_mc_probs, dim=0)
+    mean_probs = stacked_probs.mean(dim=0)
+
+    mean_entropy = -(mean_probs * torch.log(mean_probs + eps)).sum(dim=1)
+
+    individual_entropies = -(stacked_probs * torch.log(stacked_probs + eps)).sum(dim=2)
+    avg_entropy = individual_entropies.mean(dim=0)
+
+    bald_scores = mean_entropy - avg_entropy
+
+    bald_per_class = defaultdict(list)
+    for i, (score, lbl, idx) in enumerate(zip(bald_scores.tolist(), all_labels, all_indices)):
+        bald_per_class[int(lbl)].append((float(score), int(idx)))
+
+    return bald_per_class
+
+
+def select_high_bald_indices(bald_per_class, nshot):
+    if nshot <= 0:
+        return []
+
+    selected = []
+    for class_id in sorted(bald_per_class.keys()):
+        scores = bald_per_class[class_id]
+        if not scores:
+            continue
+        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
+        selected.extend(idx for _, idx in sorted_scores[:nshot])
+    return selected
 
 
 def select_high_entropy_indices(entropy_per_class, nshot):
@@ -245,17 +349,21 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         if strategy_value is not None and not isinstance(strategy_value, str):
             raise ValueError("active_learning.strategy must be a string or null.")
         self.strategy = strategy_value
-        if self.strategy not in (None, "entropy", "random", "coreset"):
-            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset'.")
+        if self.strategy not in (None, "entropy", "random", "coreset", "bald"):
+            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'bald'.")
+
+        mc_samples_value = self.active_cfg.get("mc_samples", None)
+        self.mc_samples = coerce_to_int(mc_samples_value, 10, key="active_learning.mc_samples")
 
         nshot_value = self.active_cfg.get("nshot", None)
         self.nshot = coerce_to_int(nshot_value, 0, key="active_learning.nshot")
 
         self.reset_model_per_round = bool(self.active_cfg.get("reset_model_per_round", False))
         self.plot_entropy_distribution = bool(self.config.get("plot_entropy_distribution", self.active_cfg.get("plot_entropy_distribution", False)))
+        self.plot_bald_distribution = bool(self.config.get("plot_bald_distribution", self.active_cfg.get("plot_bald_distribution", False)))
         self.plot_coreset_embedding_umap = bool(self.config.get("plot_coreset_embedding_umap", self.active_cfg.get("plot_coreset_embedding_umap", False)))
         self.plot_coreset_embedding_tsne = bool(self.config.get("plot_coreset_embedding_tsne", self.active_cfg.get("plot_coreset_embedding_tsne", False)))
-        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
+        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, mc_samples={self.mc_samples}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_bald_distribution={self.plot_bald_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
 
     def run(self):
         self._prepare_directories()
@@ -399,7 +507,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         for epoch_in_round in range(1, epochs_this_round + 1):
             self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
 
-        if self.strategy in ('entropy', 'random', 'coreset') and round_idx < self.rounds:
+        if self.strategy in ('entropy', 'random', 'coreset', 'bald') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)
             self.trainer.reset_optimizer_scheduler()
             if self.reset_model_per_round:
@@ -412,7 +520,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             raise RuntimeError("Pipeline not initialized before active selection.")
 
         strategy = self.strategy
-        if strategy not in ('entropy', 'random', 'coreset'):
+        if strategy not in ('entropy', 'random', 'coreset', 'bald'):
             return
 
         if not self.unlabeled_indices:
@@ -438,12 +546,13 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             return
 
         need_entropy_plot = self.plot_entropy_distribution and strategy == 'entropy'
+        need_bald_plot = self.plot_bald_distribution and strategy == 'bald'
         need_coreset_plot = (
             (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy == 'coreset'
         )
 
         selection_plot_dir = None
-        if need_entropy_plot or need_coreset_plot:
+        if need_entropy_plot or need_bald_plot or need_coreset_plot:
             selection_plot_dir = os.path.join(self.run_dir, f'round_{round_idx:02d}', 'selection_plots')
             os.makedirs(selection_plot_dir, exist_ok=True)
 
@@ -460,6 +569,16 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 )
                 plot_entropy_distribution(entropy_scores, round_idx, entropy_plot_path, self.log_file)
             raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
+        elif strategy == 'bald':
+            bald_scores = compute_bald_scores(
+                self.trainer, self.dataset, self.unlabeled_indices, self.batch_size, self.num_workers, self.mc_samples
+            )
+            if need_bald_plot and selection_plot_dir is not None:
+                bald_plot_path = os.path.join(
+                    selection_plot_dir, f'bald_distribution_round_{round_idx:02d}.pdf'
+                )
+                plot_bald_distribution(bald_scores, round_idx, bald_plot_path, self.log_file)
+            raw_selected = select_high_bald_indices(bald_scores, self.nshot)
         elif strategy == 'random':
             seed = self.seed + round_idx
             raw_selected = select_random_indices(

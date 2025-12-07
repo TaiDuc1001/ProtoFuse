@@ -254,6 +254,17 @@ def plot_conflict_distribution(
     _plot_score_distribution(values, title, 'KL-Divergence', output_path, '#d83b73', log_file)
 
 
+def plot_bald_distribution(
+    bald_scores: Dict[int, List[Any]],
+    round_idx: int,
+    output_path: str,
+    log_file: Optional[str],
+) -> None:
+    values = _flatten_score_values(bald_scores)
+    title = f"BALD Score Distribution - Round {round_idx}"
+    _plot_score_distribution(values, title, 'BALD', output_path, '#8b5cf6', log_file)
+
+
 def _prepare_coreset_embedding_matrix(
     embeddings: Dict[int, torch.Tensor],
     labeled_indices: Sequence[int],
