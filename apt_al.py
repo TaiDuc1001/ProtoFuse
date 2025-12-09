@@ -13,6 +13,7 @@ from apt import (
     APTTrainingPipeline,
     ARG_SCHEMA,
     coerce_to_int,
+    coerce_to_float,
     create_argument_parser,
     load_config_file,
     merge_configs,
@@ -25,6 +26,7 @@ from utils import (
     plot_coreset_embedding_tsne,
     plot_coreset_embedding_umap,
 )
+from alfamix import compute_alfamix_scores, select_alfamix_indices
 
 AL_ARG_SCHEMA = {
     **ARG_SCHEMA,
@@ -166,7 +168,7 @@ def select_high_bald_indices(bald_per_class, nshot):
     return selected
 
 
-def select_high_entropy_indices(entropy_per_class, nshot):
+def select_high_entropy_indices(entropy_per_class, nshot, fraction=0.5):
     if nshot <= 0:
         return []
 
@@ -175,8 +177,10 @@ def select_high_entropy_indices(entropy_per_class, nshot):
         scores = entropy_per_class[class_id]
         if not scores:
             continue
-        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
-        selected.extend(idx for _, idx in sorted_scores[:nshot])
+        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=False)
+        start_idx = int(len(sorted_scores) * fraction)
+        chosen = sorted_scores[start_idx:start_idx + nshot]
+        selected.extend(idx for _, idx in chosen)
     return selected
 
 
@@ -349,8 +353,11 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         if strategy_value is not None and not isinstance(strategy_value, str):
             raise ValueError("active_learning.strategy must be a string or null.")
         self.strategy = strategy_value
-        if self.strategy not in (None, "entropy", "random", "coreset", "bald"):
-            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'bald'.")
+        if self.strategy not in (None, "entropy", "random", "coreset", "bald", "alfamix"):
+            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'bald', 'alfamix'.")
+
+        alpha_cap_value = self.active_cfg.get("alpha_cap", None)
+        self.alpha_cap = coerce_to_float(alpha_cap_value, 0.5, key="active_learning.alpha_cap")
 
         mc_samples_value = self.active_cfg.get("mc_samples", None)
         self.mc_samples = coerce_to_int(mc_samples_value, 10, key="active_learning.mc_samples")
@@ -363,7 +370,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         self.plot_bald_distribution = bool(self.config.get("plot_bald_distribution", self.active_cfg.get("plot_bald_distribution", False)))
         self.plot_coreset_embedding_umap = bool(self.config.get("plot_coreset_embedding_umap", self.active_cfg.get("plot_coreset_embedding_umap", False)))
         self.plot_coreset_embedding_tsne = bool(self.config.get("plot_coreset_embedding_tsne", self.active_cfg.get("plot_coreset_embedding_tsne", False)))
-        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, mc_samples={self.mc_samples}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_bald_distribution={self.plot_bald_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
+        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, mc_samples={self.mc_samples}, alpha_cap={self.alpha_cap}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_bald_distribution={self.plot_bald_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
 
     def run(self):
         self._prepare_directories()
@@ -507,7 +514,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         for epoch_in_round in range(1, epochs_this_round + 1):
             self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
 
-        if self.strategy in ('entropy', 'random', 'coreset', 'bald') and round_idx < self.rounds:
+        if self.strategy in ('entropy', 'random', 'coreset', 'bald', 'alfamix') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)
             self.trainer.reset_optimizer_scheduler()
             if self.reset_model_per_round:
@@ -520,7 +527,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             raise RuntimeError("Pipeline not initialized before active selection.")
 
         strategy = self.strategy
-        if strategy not in ('entropy', 'random', 'coreset', 'bald'):
+        if strategy not in ('entropy', 'random', 'coreset', 'bald', 'alfamix'):
             return
 
         if not self.unlabeled_indices:
@@ -548,7 +555,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         need_entropy_plot = self.plot_entropy_distribution and strategy == 'entropy'
         need_bald_plot = self.plot_bald_distribution and strategy == 'bald'
         need_coreset_plot = (
-            (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy == 'coreset'
+            (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy in ('coreset', 'alfamix')
         )
 
         selection_plot_dir = None
@@ -594,6 +601,26 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 self.batch_size,
                 self.num_workers
             )
+        elif strategy == 'alfamix':
+            combined_indices = list(
+                dict.fromkeys(self.labeled_indices + self.unlabeled_indices)
+            )
+            embeddings = compute_coreset_embeddings(
+                self.trainer,
+                self.dataset,
+                combined_indices,
+                self.batch_size,
+                self.num_workers
+            )
+            scores_per_class = compute_alfamix_scores(
+                self.trainer,
+                self.dataset,
+                self.labeled_indices,
+                self.unlabeled_indices,
+                embeddings,
+                alpha_cap=self.alpha_cap
+            )
+            raw_selected = select_alfamix_indices(scores_per_class, self.nshot)
             if need_coreset_plot and selection_plot_dir is not None:
                 combined_indices = list(
                     dict.fromkeys(self.labeled_indices + self.unlabeled_indices + self.val_indices)
@@ -685,6 +712,27 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         print(summary)
         with open(self.log_file, 'a') as f:
             f.write(summary + '\n')
+
+        if new_indices:
+            new_subset = Subset(self.dataset, new_indices)
+            new_loader = DataLoader(new_subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+            correct = 0
+            total = 0
+            self.trainer.model.eval()
+            with torch.no_grad():
+                for images, labels in new_loader:
+                    images = images.to(self.trainer.device)
+                    labels = labels.to(self.trainer.device)
+                    logits = self.trainer.model(images)
+                    if isinstance(logits, (list, tuple)):
+                        logits = logits[0]
+                    preds = torch.argmax(logits, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            accuracy = correct / total * 100 if total > 0 else 0
+            print(f"Newly selected images: {correct}/{total} correctly predicted ({accuracy:.2f}%)")
+            with open(self.log_file, 'a') as f:
+                f.write(f"Newly selected images: {correct}/{total} correctly predicted ({accuracy:.2f}%)\n")
 
         round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
         with open(self.selection_log_path, 'a') as f:
