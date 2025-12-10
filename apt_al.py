@@ -19,6 +19,7 @@ from apt import (
     merge_configs,
     parse_override_arguments,
     process_parsed_args,
+    set_global_seed,
 )
 from utils import (
     plot_bald_distribution,
@@ -373,6 +374,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, mc_samples={self.mc_samples}, alpha_cap={self.alpha_cap}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_bald_distribution={self.plot_bald_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
 
     def run(self):
+        set_global_seed(self.seed)
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()
@@ -494,25 +496,31 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 self.trainer_cfg.meta.completed_rounds = round_idx - 1
             return
 
-        train_subset = Subset(self.dataset, list(self.labeled_indices))
-        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        if round_idx == 1 and self._try_load_checkpoint():
+            print("Skipping round 1 training (loaded from checkpoint)")
+        else:
+            train_subset = Subset(self.dataset, list(self.labeled_indices))
+            train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
-        msg = (
-            f"Starting round {round_idx}/{self.rounds}: {len(self.labeled_indices)} labeled | "
-            f"{len(self.unlabeled_indices)} unlabeled"
-        )
-        print(msg)
-        with open(self.log_file, 'a') as f:
-            f.write(msg + '\n')
+            msg = (
+                f"Starting round {round_idx}/{self.rounds}: {len(self.labeled_indices)} labeled | "
+                f"{len(self.unlabeled_indices)} unlabeled"
+            )
+            print(msg)
+            with open(self.log_file, 'a') as f:
+                f.write(msg + '\n')
 
-        base_epochs = self._get_training_epochs()
-        epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
+            base_epochs = self._get_training_epochs()
+            epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
 
-        with open(self.log_file, 'a') as f:
-            f.write(f"  Epochs this round: {epochs_this_round} (base: {base_epochs})\n")
+            with open(self.log_file, 'a') as f:
+                f.write(f"  Epochs this round: {epochs_this_round} (base: {base_epochs})\n")
 
-        for epoch_in_round in range(1, epochs_this_round + 1):
-            self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
+            for epoch_in_round in range(1, epochs_this_round + 1):
+                self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
+
+            if round_idx == 1:
+                self._save_checkpoint()
 
         if self.strategy in ('entropy', 'random', 'coreset', 'bald', 'alfamix') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)

@@ -33,6 +33,7 @@ from apt import (
     load_clip_to_cpu,
     CustomCLIP,
     DEFAULT_TRAINING_EPOCHS,
+    set_global_seed,
 )
 
 ARG_SCHEMA = {
@@ -426,6 +427,7 @@ class APTDirichletPipeline:
         return coerce_to_int(epochs_value, DEFAULT_TRAINING_EPOCHS, key='training.epochs')
 
     def run(self):
+        set_global_seed(self.seed)
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()

@@ -5,6 +5,7 @@ import copy
 import json
 import torch
 import random
+import hashlib
 import argparse
 import datetime
 import numpy as np
@@ -32,6 +33,20 @@ from dn4 import (
     build_similarity_matrix,
     label_propagation,
 )
+from apt_ssl import (
+    SSLHead,
+    LinearClassifier,
+    ImageSSLModel,
+    SSLTransform,
+    DINOMultiCropTransform,
+    create_teacher_from_student,
+    update_teacher_ema,
+    get_cosine_ema_momentum,
+    update_center,
+    ssl_loss_symmetric,
+    dino_loss,
+    visualize_dino_attention,
+)
 
 ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
@@ -39,7 +54,98 @@ ARG_SCHEMA = {
     'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
 }
 
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 DEFAULT_TRAINING_EPOCHS = 100
+DEFAULT_CHECKPOINT_DIR = 'checkpoints'
+CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
+
+
+class CheckpointCache:
+    def __init__(self, cache_dir: str = DEFAULT_CHECKPOINT_DIR):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.index_path = os.path.join(cache_dir, CHECKPOINT_INDEX_FILE)
+
+    def _get_key_settings(self, config) -> dict:
+        if hasattr(config, 'to_dict'):
+            config = config.to_dict()
+        return {
+            'dataset_root': config.get('data', {}).get('root'),
+            'kshot': config.get('data', {}).get('kshot'),
+            'seed': config.get('data', {}).get('seed'),
+            'epochs': config.get('training', {}).get('epochs'),
+            'backbone': config.get('model', {}).get('backbone'),
+        }
+
+    def compute_checkpoint_id(self, config) -> str:
+        key_settings = self._get_key_settings(config)
+        key_str = json.dumps(key_settings, sort_keys=True)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+    def get_checkpoint_path(self, checkpoint_id: str) -> str:
+        return os.path.join(self.cache_dir, f"init_ckpt_{checkpoint_id}.pt")
+
+    def exists(self, checkpoint_id: str) -> bool:
+        return os.path.exists(self.get_checkpoint_path(checkpoint_id))
+
+    def _update_index(self, checkpoint_id: str, key_settings: dict, path: str):
+        import csv
+        rows = []
+        fieldnames = ['checkpoint_id', 'file', 'dataset_root', 'kshot', 'seed', 
+                      'epochs', 'backbone', 'created_at']
+        if os.path.exists(self.index_path):
+            with open(self.index_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = [row for row in reader if row.get('checkpoint_id') != checkpoint_id]
+        row = {
+            'checkpoint_id': checkpoint_id,
+            'file': os.path.basename(path),
+            'dataset_root': key_settings.get('dataset_root'),
+            'kshot': key_settings.get('kshot'),
+            'seed': key_settings.get('seed'),
+            'epochs': key_settings.get('epochs'),
+            'backbone': key_settings.get('backbone'),
+            'created_at': datetime.datetime.now().isoformat(),
+        }
+        rows.append(row)
+        with open(self.index_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def save(self, checkpoint_id, model_state, optimizer_state, scheduler_state,
+             labeled_indices, unlabeled_indices, metrics, config):
+        key_settings = self._get_key_settings(config)
+        checkpoint = {
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer_state,
+            'scheduler_state_dict': scheduler_state,
+            'labeled_indices': labeled_indices,
+            'unlabeled_indices': unlabeled_indices,
+            'metrics': metrics,
+            'config_snapshot': config.to_dict() if hasattr(config, 'to_dict') else dict(config),
+            'timestamp': datetime.datetime.now().isoformat(),
+        }
+        path = self.get_checkpoint_path(checkpoint_id)
+        torch.save(checkpoint, path)
+        self._update_index(checkpoint_id, key_settings, path)
+        return path
+
+    def load(self, checkpoint_id):
+        path = self.get_checkpoint_path(checkpoint_id)
+        if not os.path.exists(path):
+            return None
+        return torch.load(path, map_location='cpu')
 
 class ConfigNode(dict):
     def __init__(self, initial: Optional[Dict[str, Any]] = None):
@@ -1004,18 +1110,81 @@ class APTTrainingPipeline:
             raw_dn4_cfg = ConfigNode(raw_dn4_cfg)
         self.dn4_cfg = raw_dn4_cfg
 
+        raw_ssl_cfg = self.config.get('ssl', ConfigNode())
+        if not isinstance(raw_ssl_cfg, ConfigNode):
+            raw_ssl_cfg = ConfigNode(raw_ssl_cfg)
+        self.ssl_cfg = raw_ssl_cfg
+        self.use_ssl = bool(self.ssl_cfg.get('enabled', False))
+        self.ssl_student = None
+        self.ssl_teacher = None
+        self.ssl_classifier = None
+        self.ssl_center = None
+
+        self.checkpoint_cache: Optional[CheckpointCache] = None
+        self.checkpoint_id: Optional[str] = None
+        self._init_checkpoint_cache()
+
     def _get_training_epochs(self):
         epochs_value = None
         if isinstance(self.training_cfg, dict):
             epochs_value = self.training_cfg.get('epochs', None)
         return coerce_to_int(epochs_value, DEFAULT_TRAINING_EPOCHS, key='training.epochs')
 
+    def _init_checkpoint_cache(self):
+        checkpoint_cfg = self.config.get('checkpoint', ConfigNode())
+        if bool(checkpoint_cfg.get('enabled', False)):
+            cache_dir = checkpoint_cfg.get('cache_dir', DEFAULT_CHECKPOINT_DIR)
+            self.checkpoint_cache = CheckpointCache(cache_dir)
+            self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
+            print(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+
+    def _try_load_checkpoint(self) -> bool:
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return False
+        if not self.checkpoint_cache.exists(self.checkpoint_id):
+            return False
+        ckpt = self.checkpoint_cache.load(self.checkpoint_id)
+        if ckpt is None:
+            return False
+        if self.trainer is None:
+            return False
+        self.trainer.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.trainer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        self.labeled_indices = ckpt['labeled_indices']
+        self.unlabeled_indices = ckpt['unlabeled_indices']
+        self.metrics = ckpt['metrics']
+        self.global_epoch = len(self.metrics)
+        print(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        return True
+
+    def _save_checkpoint(self):
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return
+        if self.trainer is None:
+            return
+        path = self.checkpoint_cache.save(
+            self.checkpoint_id,
+            self.trainer.model.state_dict(),
+            self.trainer.optimizer.state_dict(),
+            self.trainer.scheduler.state_dict(),
+            self.labeled_indices,
+            self.unlabeled_indices,
+            self.metrics,
+            self.config
+        )
+        print(f"Saved checkpoint to: {path}")
+
     def run(self):
+        set_global_seed(self.seed)
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
         self._train_epochs()
+        if self.use_ssl:
+            self._train_ssl_stage1()
+            self._train_ssl_stage2()
         self._run_dn4_mode()
         self._finalize()
 
@@ -1140,11 +1309,376 @@ class APTTrainingPipeline:
             raise RuntimeError("Class names unavailable before trainer initialization.")
         self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device), log_file=self.log_file)
 
+    def _train_ssl_stage1(self):
+        if self.dataset is None or self.trainer is None:
+            raise RuntimeError("Pipeline not initialized before SSL training.")
+        if not self.unlabeled_indices:
+            print("SSL Stage 1 skipped: no unlabeled data available.")
+            return
+
+        feature_dim = self.trainer.model.vis_encoder.proj.shape[1]
+        proj_dim = coerce_to_int(self.ssl_cfg.get('proj_dim', 256), 256)
+        num_prototypes = coerce_to_int(self.ssl_cfg.get('num_prototypes', 4096), 4096)
+        ssl_epochs = coerce_to_int(self.ssl_cfg.get('ssl_epochs', 20), 20)
+        ssl_lr = coerce_to_float(self.ssl_cfg.get('ssl_lr', 0.0001), 0.0001)
+        teacher_temp = coerce_to_float(self.ssl_cfg.get('teacher_temp', 0.04), 0.04)
+        student_temp = coerce_to_float(self.ssl_cfg.get('student_temp', 0.1), 0.1)
+        base_ema_momentum = coerce_to_float(self.ssl_cfg.get('ema_momentum', 0.996), 0.996)
+        final_ema_momentum = coerce_to_float(self.ssl_cfg.get('final_ema_momentum', 1.0), 1.0)
+        center_momentum = coerce_to_float(self.ssl_cfg.get('center_momentum', 0.9), 0.9)
+        eval_freq = coerce_to_int(self.ssl_cfg.get('eval_freq', 5), 5)
+        eval_linear_epochs = coerce_to_int(self.ssl_cfg.get('eval_linear_epochs', 5), 5)
+        
+        global_crop_size = coerce_to_int(self.ssl_cfg.get('global_crop_size', 224), 224)
+        local_crop_size = coerce_to_int(self.ssl_cfg.get('local_crop_size', 96), 96)
+        num_local_crops = coerce_to_int(self.ssl_cfg.get('num_local_crops', 6), 6)
+        global_crop_scale_min = coerce_to_float(self.ssl_cfg.get('global_crop_scale_min', 0.4), 0.4)
+        global_crop_scale_max = coerce_to_float(self.ssl_cfg.get('global_crop_scale_max', 1.0), 1.0)
+        local_crop_scale_min = coerce_to_float(self.ssl_cfg.get('local_crop_scale_min', 0.05), 0.05)
+        local_crop_scale_max = coerce_to_float(self.ssl_cfg.get('local_crop_scale_max', 0.4), 0.4)
+        num_trans_layers = coerce_to_int(self.ssl_cfg.get('num_trans_layers', 1), 1)
+        num_heads = coerce_to_int(self.ssl_cfg.get('num_heads', 8), 8)
+        num_unlabeled = self.ssl_cfg.get('num_unlabeled', None)
+        if num_unlabeled is not None:
+            num_unlabeled = coerce_to_int(num_unlabeled, len(self.unlabeled_indices))
+        num_plot = coerce_to_int(self.ssl_cfg.get('num_plot', 0), 0)
+
+        print(f"[DEBUG] SSL Stage 1 config: feature_dim={feature_dim}, proj_dim={proj_dim}, num_prototypes={num_prototypes}")
+        print(f"[DEBUG] SSL Stage 1 config: ssl_lr={ssl_lr}, teacher_temp={teacher_temp}, student_temp={student_temp}")
+        print(f"[DEBUG] SSL Stage 1 config: base_ema_momentum={base_ema_momentum}, final_ema_momentum={final_ema_momentum}")
+        print(f"[DEBUG] SSL Stage 1 config: center_momentum={center_momentum}, num_trans_layers={num_trans_layers}, num_heads={num_heads}")
+        print(f"[DEBUG] SSL Stage 1 config: eval_freq={eval_freq}, eval_linear_epochs={eval_linear_epochs}")
+        print(f"[DEBUG] Multi-crop config: global={global_crop_size}, local={local_crop_size}, num_local={num_local_crops}")
+
+        self.ssl_student = ImageSSLModel(
+            copy.deepcopy(self.trainer.model.vis_encoder),
+            feature_dim,
+            proj_dim,
+            num_prototypes,
+            num_trans_layers=num_trans_layers,
+            num_heads=num_heads
+        ).to(self.device)
+
+        self.ssl_teacher = create_teacher_from_student(self.ssl_student)
+        self.ssl_center = torch.zeros(num_prototypes, device=self.device)
+
+        trainable_params = sum(p.numel() for p in self.ssl_student.parameters() if p.requires_grad)
+        print(f"[DEBUG] SSL student trainable params: {trainable_params:,}")
+        print(f"[DEBUG] SSL center shape: {self.ssl_center.shape}")
+
+        ssl_optimizer = torch.optim.AdamW(
+            [p for p in self.ssl_student.parameters() if p.requires_grad],
+            lr=ssl_lr
+        )
+
+        dino_transform = DINOMultiCropTransform(
+            self.clip_mean,
+            self.clip_std,
+            global_crop_size=global_crop_size,
+            local_crop_size=local_crop_size,
+            global_crop_scale=(global_crop_scale_min, global_crop_scale_max),
+            local_crop_scale=(local_crop_scale_min, local_crop_scale_max),
+            num_local_crops=num_local_crops
+        )
+
+        class DINODataset(torch.utils.data.Dataset):
+            def __init__(inner_self, base_dataset, indices, transform):
+                inner_self.base_dataset = base_dataset
+                inner_self.indices = indices
+                inner_self.transform = transform
+                from PIL import Image
+                inner_self.Image = Image
+
+            def __len__(inner_self):
+                return len(inner_self.indices)
+
+            def __getitem__(inner_self, idx):
+                real_idx = inner_self.indices[idx]
+                path, label = inner_self.base_dataset.samples[real_idx]
+                img = inner_self.Image.open(path).convert('RGB')
+                global_views, local_views = inner_self.transform(img)
+                return global_views, local_views, label
+
+        def dino_collate_fn(batch):
+            global_views_list = [[], []]
+            local_views_list = [[] for _ in range(num_local_crops)]
+            labels = []
+            for global_views, local_views, label in batch:
+                for i, gv in enumerate(global_views):
+                    global_views_list[i].append(gv)
+                for i, lv in enumerate(local_views):
+                    local_views_list[i].append(lv)
+                labels.append(label)
+            global_views_batch = [torch.stack(gv_list) for gv_list in global_views_list]
+            local_views_batch = [torch.stack(lv_list) for lv_list in local_views_list]
+            return global_views_batch, local_views_batch, torch.tensor(labels)
+
+        ssl_unlabeled_indices = self.unlabeled_indices
+        if num_unlabeled is not None and num_unlabeled < len(ssl_unlabeled_indices):
+            ssl_unlabeled_indices = ssl_unlabeled_indices[:num_unlabeled]
+            print(f"[DEBUG] Limited unlabeled samples to {num_unlabeled}")
+
+        ssl_dataset = DINODataset(self.dataset, ssl_unlabeled_indices, dino_transform)
+        ssl_loader = DataLoader(
+            ssl_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            drop_last=True,
+            collate_fn=dino_collate_fn
+        )
+
+        self.ssl_vis_images = None
+        self.ssl_vis_paths = None
+        if num_plot > 0:
+            num_vis_samples = min(num_plot, len(ssl_unlabeled_indices))
+            vis_indices = ssl_unlabeled_indices[:num_vis_samples]
+            self.ssl_vis_images = []
+            self.ssl_vis_paths = []
+            from PIL import Image as PILImage
+            vis_transform = transforms.Compose([
+                transforms.Resize((global_crop_size, global_crop_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=self.clip_mean, std=self.clip_std),
+            ])
+            for idx in vis_indices:
+                path, _ = self.dataset.samples[idx]
+                img = PILImage.open(path).convert('RGB')
+                self.ssl_vis_images.append(vis_transform(img))
+                self.ssl_vis_paths.append(path)
+            self.ssl_vis_images = torch.stack(self.ssl_vis_images)
+
+        print(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_unlabeled_indices)} unlabeled samples")
+        for epoch in range(1, ssl_epochs + 1):
+            self.ssl_student.train()
+            running_loss = 0.0
+            steps = 0
+            start_time = time.time()
+            
+            ema_momentum = get_cosine_ema_momentum(epoch, ssl_epochs, base_ema_momentum, final_ema_momentum)
+            
+            for global_views_batch, local_views_batch, _ in ssl_loader:
+                global_views_batch = [g.to(self.device) for g in global_views_batch]
+                local_views_batch = [l.to(self.device) for l in local_views_batch]
+                all_views = global_views_batch + local_views_batch
+
+                with torch.no_grad():
+                    teacher_outputs = []
+                    for gv in global_views_batch:
+                        u_t, _ = self.ssl_teacher(gv)
+                        teacher_outputs.append(u_t)
+
+                student_outputs = []
+                for view in all_views:
+                    u_s, _ = self.ssl_student(view)
+                    student_outputs.append(u_s)
+
+                loss = dino_loss(teacher_outputs, student_outputs, teacher_temp, student_temp, self.ssl_center)
+
+                ssl_optimizer.zero_grad()
+                loss.backward()
+                ssl_optimizer.step()
+
+                with torch.no_grad():
+                    batch_logits = torch.cat(teacher_outputs, dim=0)
+                    self.ssl_center = update_center(self.ssl_center, batch_logits, center_momentum)
+
+                update_teacher_ema(self.ssl_teacher, self.ssl_student, ema_momentum)
+
+                running_loss += loss.item()
+                steps += 1
+
+            avg_loss = running_loss / max(1, steps)
+            print(f"  SSL Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - ema={ema_momentum:.4f} - time={time.time() - start_time:.2f}s")
+
+            if epoch % eval_freq == 0 or epoch == ssl_epochs:
+                start_time = time.time()
+                linear_acc = self._run_linear_eval(feature_dim, eval_linear_epochs)
+                print(f"  [EVAL] Linear evaluation acc: {linear_acc:.2f}% - time={time.time() - start_time:.2f}s")
+                
+                if self.ssl_vis_images is not None:
+                    vis_dir = os.path.join(self.run_dir, 'ssl_attention')
+                    visualize_dino_attention(
+                        self.ssl_student,
+                        self.ssl_vis_images,
+                        self.ssl_vis_paths,
+                        epoch,
+                        vis_dir,
+                        self.clip_mean,
+                        self.clip_std
+                    )
+
+    def _run_linear_eval(self, feature_dim, num_epochs):
+        if not self.train_indices or self.val_loader is None:
+            return 0.0
+
+        eval_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
+        eval_optimizer = torch.optim.AdamW(eval_classifier.parameters(), lr=0.001)
+
+        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+        self.ssl_student.encoder.eval()
+        for _ in range(num_epochs):
+            eval_classifier.train()
+            for images, labels in train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                with torch.no_grad():
+                    visual_out = self.ssl_student.encoder(images)
+                    cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                logits = eval_classifier(cls_feat)
+                loss = F.cross_entropy(logits, labels)
+                eval_optimizer.zero_grad()
+                loss.backward()
+                eval_optimizer.step()
+
+        eval_classifier.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                visual_out = self.ssl_student.encoder(images)
+                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                logits = eval_classifier(cls_feat)
+                _, predicted = torch.max(logits, 1)
+                correct += (predicted == labels).sum().item()
+                total += labels.size(0)
+
+        return 100 * correct / total if total > 0 else 0.0
+
+
+    def _train_ssl_stage2(self):
+        if self.dataset is None or self.trainer is None or self.ssl_student is None:
+            print("SSL Stage 2 skipped: Stage 1 not completed.")
+            return
+        if not self.train_indices:
+            print("SSL Stage 2 skipped: no labeled data available.")
+            return
+
+        feature_dim = self.trainer.model.vis_encoder.proj.shape[1]
+        linear_epochs = coerce_to_int(self.ssl_cfg.get('linear_epochs', 10), 10)
+        linear_lr = coerce_to_float(self.ssl_cfg.get('linear_lr', 0.001), 0.001)
+
+        print(f"[DEBUG] SSL Stage 2 config: feature_dim={feature_dim}, linear_epochs={linear_epochs}, linear_lr={linear_lr}")
+
+        for param in self.ssl_student.encoder.parameters():
+            param.requires_grad = False
+        self.ssl_student.ssl_head = None
+
+        self.ssl_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
+        linear_optimizer = torch.optim.AdamW(self.ssl_classifier.parameters(), lr=linear_lr)
+
+        print(f"[DEBUG] SSL classifier params: {sum(p.numel() for p in self.ssl_classifier.parameters()):,}")
+        print(f"[DEBUG] Encoder frozen: {not any(p.requires_grad for p in self.ssl_student.encoder.parameters())}")
+
+        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+        print(f"SSL Stage 2: {linear_epochs} epochs on {len(self.train_indices)} labeled samples")
+        for epoch in range(1, linear_epochs + 1):
+            self.ssl_student.encoder.eval()
+            self.ssl_classifier.train()
+            running_loss = 0.0
+            correct = 0
+            total = 0
+            for images, labels in train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                with torch.no_grad():
+                    visual_out = self.ssl_student.encoder(images)
+                    if isinstance(visual_out, tuple):
+                        _, cls_feat = visual_out
+                    else:
+                        cls_feat = visual_out
+
+                logits = self.ssl_classifier(cls_feat)
+                loss = F.cross_entropy(logits, labels)
+
+                linear_optimizer.zero_grad()
+                loss.backward()
+                linear_optimizer.step()
+
+                running_loss += loss.item()
+                _, predicted = torch.max(logits, 1)
+                correct += (predicted == labels).sum().item()
+                total += labels.size(0)
+
+            avg_loss = running_loss / max(1, len(train_loader))
+            acc = 100 * correct / total
+            print(f"  Linear Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
+
+    def _evaluate_with_ssl_fusion(self, dataloader):
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized.")
+
+        self.trainer.model.eval()
+        correct = 0
+        total = 0
+        running_loss = 0.0
+        steps = 0
+        all_preds = []
+        all_labels_list = []
+
+        fusion_weight = coerce_to_float(self.ssl_cfg.get('fusion_weight', 0.5), 0.5) if self.use_ssl else 0.0
+        use_ssl_fusion = self.use_ssl and self.ssl_student is not None and self.ssl_classifier is not None
+
+        if use_ssl_fusion:
+            self.ssl_student.encoder.eval()
+            self.ssl_classifier.eval()
+
+        with torch.no_grad():
+            for batch in dataloader:
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                logits_apt = self.trainer.model(images)
+                if isinstance(logits_apt, (list, tuple)):
+                    logits_apt = logits_apt[0]
+
+                if self.trainer.cache_adapter is not None:
+                    visual_out = self.trainer.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
+
+                if use_ssl_fusion:
+                    visual_out = self.ssl_student.encoder(images)
+                    if isinstance(visual_out, tuple):
+                        _, cls_feat = visual_out
+                    else:
+                        cls_feat = visual_out
+                    logits_img = self.ssl_classifier(cls_feat)
+
+                    prob_apt = F.softmax(logits_apt, dim=-1)
+                    prob_img = F.softmax(logits_img, dim=-1)
+                    prob_final = (1 - fusion_weight) * prob_apt + fusion_weight * prob_img
+                    logits = torch.log(prob_final + 1e-8)
+                else:
+                    logits = logits_apt
+
+                loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
+                running_loss += loss.item()
+                steps += 1
+
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels_list.extend(labels.cpu().numpy())
+
+        accuracy = 100 * correct / total
+        avg_loss = running_loss / max(1, steps)
+        return {"accuracy": accuracy, "loss": avg_loss, "predictions": all_preds, "true_labels": all_labels_list}
+
     def _train_epochs(self):
         if self.dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before training.")
         if not self.train_indices:
             raise RuntimeError("No training samples available.")
+
+        if self._try_load_checkpoint():
+            print("Skipping training (loaded from checkpoint)")
+            return
 
         round_dir = os.path.join(self.run_dir, 'round_01')
         os.makedirs(round_dir, exist_ok=True)
@@ -1160,6 +1694,7 @@ class APTTrainingPipeline:
             self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
 
         self.trainer_cfg.meta.completed_rounds = 1
+        self._save_checkpoint()
 
     def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
         if self.trainer is None:
@@ -1181,7 +1716,7 @@ class APTTrainingPipeline:
         avg_acc = running_accuracy / max(1, steps)
 
         if self.val_loader is not None:
-            results = self.trainer.evaluate(self.val_loader)
+            results = self._evaluate_with_ssl_fusion(self.val_loader)
             val_acc = results['accuracy']
             val_loss = results['loss']
             all_preds = results['predictions']

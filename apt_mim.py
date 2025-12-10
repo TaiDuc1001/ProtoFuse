@@ -602,6 +602,14 @@ class APTMIMPipeline:
         self.trainer: Optional[APTMIMTrainer] = None
 
     def run(self):
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()
