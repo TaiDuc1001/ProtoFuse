@@ -6,6 +6,10 @@ model:
   dataset_name: "CUBirds"
   use_cache: False
 
+checkpoint:
+  enabled: true
+  cache_dir: "checkpoints"
+
 training:
   epochs: 10
   batch_size: 8
@@ -20,7 +24,7 @@ training:
   weight_decay: 0.0005
   confusion_matrix: false
   visualize_gradcam: false
-  class_distribution: true
+  class_distribution: false
   visualize_attention: false
 
 data:
@@ -29,7 +33,6 @@ data:
   val_size: 0.7
   num_workers: 4
   run_eda: false
-  class_distribution: true
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
   root: "datasets/cub-200-2011-renamed"

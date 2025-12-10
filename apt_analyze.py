@@ -31,6 +31,8 @@ from apt import (
     CustomCLIP,
     DEFAULT_TRAINING_EPOCHS,
     set_global_seed,
+    CheckpointCache,
+    DEFAULT_CHECKPOINT_DIR,
 )
 
 ARG_SCHEMA = {
@@ -321,11 +323,60 @@ class APTDirichletPipeline:
         self.trainer_cfg: ConfigNode = ConfigNode({})
         self.rounds = 1
 
+        self.checkpoint_cache: Optional[CheckpointCache] = None
+        self.checkpoint_id: Optional[str] = None
+        self._init_checkpoint_cache()
+
     def _get_training_epochs(self):
         epochs_value = None
         if isinstance(self.training_cfg, dict):
             epochs_value = self.training_cfg.get('epochs', None)
         return coerce_to_int(epochs_value, DEFAULT_TRAINING_EPOCHS, key='training.epochs')
+
+    def _init_checkpoint_cache(self):
+        checkpoint_cfg = self.config.get('checkpoint', ConfigNode())
+        if bool(checkpoint_cfg.get('enabled', False)):
+            cache_dir = checkpoint_cfg.get('cache_dir', DEFAULT_CHECKPOINT_DIR)
+            self.checkpoint_cache = CheckpointCache(cache_dir)
+            self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
+            print(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+
+    def _try_load_checkpoint(self) -> bool:
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return False
+        if not self.checkpoint_cache.exists(self.checkpoint_id):
+            return False
+        ckpt = self.checkpoint_cache.load(self.checkpoint_id)
+        if ckpt is None:
+            return False
+        if self.trainer is None:
+            return False
+        self.trainer.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.trainer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        self.labeled_indices = ckpt['labeled_indices']
+        self.unlabeled_indices = ckpt['unlabeled_indices']
+        self.metrics = ckpt['metrics']
+        self.global_epoch = len(self.metrics)
+        print(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        return True
+
+    def _save_checkpoint(self):
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return
+        if self.trainer is None:
+            return
+        path = self.checkpoint_cache.save(
+            self.checkpoint_id,
+            self.trainer.model.state_dict(),
+            self.trainer.optimizer.state_dict(),
+            self.trainer.scheduler.state_dict(),
+            self.labeled_indices,
+            self.unlabeled_indices,
+            self.metrics,
+            self.config
+        )
+        print(f"Saved checkpoint to: {path}")
 
     def run(self):
         set_global_seed(self.seed)
@@ -460,6 +511,11 @@ class APTDirichletPipeline:
         if not self.train_indices:
             raise RuntimeError("No training samples available.")
 
+        # Try to load from checkpoint cache
+        if self._try_load_checkpoint():
+            print("Skipping training (loaded from checkpoint cache)")
+            return
+
         round_dir = os.path.join(self.run_dir, 'round_01')
         os.makedirs(round_dir, exist_ok=True)
         train_subset = Subset(self.dataset, list(self.train_indices))
@@ -469,6 +525,9 @@ class APTDirichletPipeline:
 
         for epoch_idx in range(1, epochs_total + 1):
             self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
+
+        # Save checkpoint after training
+        self._save_checkpoint()
 
         self.trainer_cfg.meta.completed_rounds = 1
 

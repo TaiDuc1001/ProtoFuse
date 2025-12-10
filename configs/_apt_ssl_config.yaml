@@ -7,7 +7,7 @@ model:
   use_cache: false
 
 training:
-  epochs: 50
+  epochs: 10
   batch_size: 8
   mode: "logits"
   device: "cuda:0"
@@ -20,7 +20,7 @@ training:
   weight_decay: 0.0005
   confusion_matrix: false
   visualize_gradcam: false
-  class_distribution: true
+  class_distribution: false
   visualize_attention: false
 
 data:
