@@ -121,7 +121,7 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
     import os
     import numpy as np
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
+    from scipy.ndimage import zoom
     
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
@@ -131,64 +131,108 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
         images = torch.stack(images)
     images = images.to(device)
     
-    attn_weights_list = model.get_attention_weights(images)
+    encoder = model.encoder
+    transformer = encoder.transformer
+    last_block = transformer.resblocks[-1]
+    attn_module = last_block.attn
     
-    num_heads = model.num_heads
-    head_colors = list(mcolors.TABLEAU_COLORS.values())[:num_heads]
-    if len(head_colors) < num_heads:
-        head_colors = plt.cm.tab20(np.linspace(0, 1, num_heads))
+    captured_attn = {}
+    
+    def attn_hook(module, args, output):
+        captured_attn['weights'] = output[1]
+    
+    original_need_weights = attn_module.forward.__code__
+    handle = attn_module.register_forward_hook(attn_hook)
+    
+    original_forward = attn_module.forward
+    def forward_with_weights(*args, **kwargs):
+        kwargs['need_weights'] = True
+        kwargs['average_attn_weights'] = False
+        return original_forward(*args, **kwargs)
+    attn_module.forward = forward_with_weights
+    
+    try:
+        with torch.no_grad():
+            _ = encoder(images)
+        attn_weights = captured_attn.get('weights')
+    finally:
+        handle.remove()
+        attn_module.forward = original_forward
+    
+    if attn_weights is None:
+        print("  [VIS] Could not capture attention weights")
+        return
+    
+    B, num_heads, seq_len, _ = attn_weights.shape
+    num_patches = seq_len - 1
+    grid_size = int(num_patches ** 0.5)
+    
+    cls_attn = attn_weights[:, :, 0, 1:]
+    cls_attn = cls_attn.reshape(B, num_heads, grid_size, grid_size)
     
     clip_mean_arr = np.array(clip_mean)
     clip_std_arr = np.array(clip_std)
     
+    img_size = images.shape[-1]
+    
     for img_idx in range(min(len(images), 8)):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
         img_tensor = images[img_idx].cpu()
         img_np = img_tensor.permute(1, 2, 0).numpy()
         img_np = img_np * clip_std_arr + clip_mean_arr
         img_np = np.clip(img_np, 0, 1)
         
+        ncols = min(num_heads + 1, 7)
+        nrows = (num_heads + 1 + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+        axes = np.array(axes).flatten()
+        
         axes[0].imshow(img_np)
-        axes[0].set_title(f"Image {img_idx}")
+        axes[0].set_title("Original", fontsize=10)
         axes[0].axis('off')
         
-        attn = attn_weights_list[-1][img_idx].cpu().numpy()
+        for head_idx in range(num_heads):
+            ax = axes[head_idx + 1]
+            attn_map = cls_attn[img_idx, head_idx].cpu().numpy()
+            
+            attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
+            
+            scale_factor = img_size / grid_size
+            attn_map_resized = zoom(attn_map, scale_factor, order=1)
+            
+            ax.imshow(img_np)
+            ax.imshow(attn_map_resized, cmap='inferno', alpha=0.6)
+            ax.set_title(f"Head {head_idx}", fontsize=10)
+            ax.axis('off')
         
-        head_strengths = attn.squeeze(-1).squeeze(-1)
+        for ax_idx in range(num_heads + 1, len(axes)):
+            axes[ax_idx].axis('off')
         
-        bars = axes[1].bar(range(num_heads), head_strengths, color=head_colors[:num_heads])
-        axes[1].set_xlabel('Attention Head')
-        axes[1].set_ylabel('Attention Weight')
-        axes[1].set_title(f'Per-Head Attention (Epoch {epoch})')
-        axes[1].set_xticks(range(num_heads))
-        axes[1].set_xticklabels([f'H{i}' for i in range(num_heads)])
-        
-        for i, bar in enumerate(bars):
-            bar.set_label(f'Head {i}')
-        
+        plt.suptitle(f"CLS Attention Maps (Epoch {epoch})", fontsize=12)
         plt.tight_layout()
         save_path = os.path.join(output_dir, f'dino_attention_epoch{epoch:03d}_img{img_idx}.png')
-        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
     
-    fig, ax = plt.subplots(figsize=(10, 6))
-    all_attn = attn_weights_list[-1].cpu().numpy()
-    mean_attn = all_attn.squeeze(-1).squeeze(-1).mean(axis=0)
-    std_attn = all_attn.squeeze(-1).squeeze(-1).std(axis=0)
+    mean_cls_attn = cls_attn.mean(dim=0)
+    fig, axes = plt.subplots(1, min(num_heads, 6), figsize=(3 * min(num_heads, 6), 3))
+    if num_heads == 1:
+        axes = [axes]
     
-    bars = ax.bar(range(num_heads), mean_attn, yerr=std_attn, color=head_colors[:num_heads], capsize=3)
-    ax.set_xlabel('Attention Head')
-    ax.set_ylabel('Mean Attention Weight')
-    ax.set_title(f'Average Per-Head Attention (Epoch {epoch})')
-    ax.set_xticks(range(num_heads))
-    ax.set_xticklabels([f'H{i}' for i in range(num_heads)])
+    for head_idx in range(min(num_heads, 6)):
+        ax = axes[head_idx]
+        attn_map = mean_cls_attn[head_idx].cpu().numpy()
+        attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
+        ax.imshow(attn_map, cmap='inferno')
+        ax.set_title(f"Head {head_idx}", fontsize=10)
+        ax.axis('off')
     
+    plt.suptitle(f"Mean CLS Attention Across Batch (Epoch {epoch})", fontsize=12)
+    plt.tight_layout()
     save_path = os.path.join(output_dir, f'dino_attention_epoch{epoch:03d}_summary.png')
-    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
-    print(f"  [VIS] Saved attention visualizations to {output_dir}")
+    print(f"  [VIS] Saved DINO-style attention visualizations to {output_dir}")
 
 
 class DINOMultiCropTransform:

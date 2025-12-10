@@ -423,6 +423,34 @@ class ImageEncoder(nn.Module):
         self.transformer = visual.transformer
         self.ln_post = visual.ln_post
         self.proj = visual.proj
+        
+        self.patch_size = self.conv1.kernel_size[0]
+        self._pos_embed_cache = {}
+
+    def _interpolate_pos_embed(self, pos_embed, num_patches):
+        expected_patches = pos_embed.shape[0] - 1
+        
+        if num_patches == expected_patches:
+            return pos_embed
+        
+        cache_key = (num_patches, pos_embed.device)
+        if cache_key in self._pos_embed_cache:
+            return self._pos_embed_cache[cache_key]
+        
+        cls_embed = pos_embed[:1]
+        patch_embed = pos_embed[1:]
+        
+        src_size = int(expected_patches ** 0.5)
+        tgt_size = int(num_patches ** 0.5)
+        
+        embed_dim = patch_embed.shape[-1]
+        patch_embed = patch_embed.reshape(1, src_size, src_size, embed_dim).permute(0, 3, 1, 2)
+        patch_embed = F.interpolate(patch_embed, size=(tgt_size, tgt_size), mode='bicubic', align_corners=False)
+        patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(num_patches, embed_dim)
+        
+        result = torch.cat([cls_embed, patch_embed], dim=0)
+        self._pos_embed_cache[cache_key] = result
+        return result
 
     def forward(self, x):
         x = x.type(self.conv1.weight.dtype)
@@ -434,7 +462,10 @@ class ImageEncoder(nn.Module):
             x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
         )
         x = torch.cat([cls_tokens, x], dim=1)
-        x = x + self.positional_embedding.to(x.dtype)
+        
+        num_patches = x.shape[1] - 1
+        pos_embed = self._interpolate_pos_embed(self.positional_embedding, num_patches)
+        x = x + pos_embed.to(x.dtype)
 
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)
@@ -990,7 +1021,7 @@ class APT:
             
             logit_scale = self.model.logit_scale.exp()
             logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
-            score = logits[0, target_class]
+            score = logits[0, target_classes[i]]
             
             self.model.zero_grad()
             score.backward(retain_graph=True)
@@ -1115,6 +1146,13 @@ class APTTrainingPipeline:
             raw_ssl_cfg = ConfigNode(raw_ssl_cfg)
         self.ssl_cfg = raw_ssl_cfg
         self.use_ssl = bool(self.ssl_cfg.get('enabled', False))
+        
+        ssl_batch_value = self.ssl_cfg.get("ssl_batch_size", None)
+        self.ssl_batch_size = coerce_to_int(ssl_batch_value, self.batch_size, key="ssl.ssl_batch_size")
+        
+        eval_batch_value = self.ssl_cfg.get("eval_batch_size", None)
+        self.eval_batch_size = coerce_to_int(eval_batch_value, self.batch_size * 4, key="ssl.eval_batch_size")
+        
         self.ssl_student = None
         self.ssl_teacher = None
         self.ssl_classifier = None
@@ -1185,6 +1223,7 @@ class APTTrainingPipeline:
         if self.use_ssl:
             self._train_ssl_stage1()
             self._train_ssl_stage2()
+            self._run_dual_branch_eval()
         self._run_dn4_mode()
         self._finalize()
 
@@ -1421,7 +1460,7 @@ class APTTrainingPipeline:
         ssl_dataset = DINODataset(self.dataset, ssl_unlabeled_indices, dino_transform)
         ssl_loader = DataLoader(
             ssl_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.ssl_batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             drop_last=True,
@@ -1460,18 +1499,21 @@ class APTTrainingPipeline:
             for global_views_batch, local_views_batch, _ in ssl_loader:
                 global_views_batch = [g.to(self.device) for g in global_views_batch]
                 local_views_batch = [l.to(self.device) for l in local_views_batch]
-                all_views = global_views_batch + local_views_batch
 
                 with torch.no_grad():
-                    teacher_outputs = []
-                    for gv in global_views_batch:
-                        u_t, _ = self.ssl_teacher(gv)
-                        teacher_outputs.append(u_t)
+                    teacher_global_cat = torch.cat(global_views_batch, dim=0)
+                    u_t_cat, _ = self.ssl_teacher(teacher_global_cat)
+                    teacher_outputs = list(u_t_cat.chunk(len(global_views_batch), dim=0))
 
-                student_outputs = []
-                for view in all_views:
-                    u_s, _ = self.ssl_student(view)
-                    student_outputs.append(u_s)
+                student_global_cat = torch.cat(global_views_batch, dim=0)
+                u_s_global, _ = self.ssl_student(student_global_cat)
+                student_global_outputs = list(u_s_global.chunk(len(global_views_batch), dim=0))
+                
+                student_local_cat = torch.cat(local_views_batch, dim=0)
+                u_s_local, _ = self.ssl_student(student_local_cat)
+                student_local_outputs = list(u_s_local.chunk(len(local_views_batch), dim=0))
+                
+                student_outputs = student_global_outputs + student_local_outputs
 
                 loss = dino_loss(teacher_outputs, student_outputs, teacher_temp, student_temp, self.ssl_center)
 
@@ -1489,7 +1531,7 @@ class APTTrainingPipeline:
                 steps += 1
 
             avg_loss = running_loss / max(1, steps)
-            print(f"  SSL Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - ema={ema_momentum:.4f} - time={time.time() - start_time:.2f}s")
+            print(f"  SSL Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - time={time.time() - start_time:.2f}s")
 
             if epoch % eval_freq == 0 or epoch == ssl_epochs:
                 start_time = time.time()
@@ -1516,17 +1558,41 @@ class APTTrainingPipeline:
         eval_optimizer = torch.optim.AdamW(eval_classifier.parameters(), lr=0.001)
 
         train_subset = Subset(self.dataset, list(self.train_indices))
-        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        train_loader = DataLoader(train_subset, batch_size=self.eval_batch_size, shuffle=False, num_workers=self.num_workers)
 
         self.ssl_student.encoder.eval()
-        for _ in range(num_epochs):
-            eval_classifier.train()
+        
+        train_features, train_labels = [], []
+        with torch.no_grad():
             for images, labels in train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                with torch.no_grad():
-                    visual_out = self.ssl_student.encoder(images)
-                    cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
-                logits = eval_classifier(cls_feat)
+                images = images.to(self.device)
+                visual_out = self.ssl_student.encoder(images)
+                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                train_features.append(cls_feat.cpu())
+                train_labels.append(labels)
+        train_features = torch.cat(train_features, dim=0)
+        train_labels = torch.cat(train_labels, dim=0)
+        
+        val_features, val_labels = [], []
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images = images.to(self.device)
+                visual_out = self.ssl_student.encoder(images)
+                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                val_features.append(cls_feat.cpu())
+                val_labels.append(labels)
+        val_features = torch.cat(val_features, dim=0)
+        val_labels = torch.cat(val_labels, dim=0)
+        
+        train_dataset = torch.utils.data.TensorDataset(train_features, train_labels)
+        cached_train_loader = DataLoader(train_dataset, batch_size=self.eval_batch_size, shuffle=True)
+        
+        for epoch_idx in range(num_epochs):
+            start_time = time.time()
+            eval_classifier.train()
+            for feats, labels in cached_train_loader:
+                feats, labels = feats.to(self.device), labels.to(self.device)
+                logits = eval_classifier(feats)
                 loss = F.cross_entropy(logits, labels)
                 eval_optimizer.zero_grad()
                 loss.backward()
@@ -1535,15 +1601,13 @@ class APTTrainingPipeline:
         eval_classifier.eval()
         correct, total = 0, 0
         with torch.no_grad():
-            for images, labels in self.val_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                visual_out = self.ssl_student.encoder(images)
-                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
-                logits = eval_classifier(cls_feat)
-                _, predicted = torch.max(logits, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-
+            val_feats = val_features.to(self.device)
+            val_lbls = val_labels.to(self.device)
+            logits = eval_classifier(val_feats)
+            _, predicted = torch.max(logits, 1)
+            correct = (predicted == val_lbls).sum().item()
+            total = val_lbls.size(0)
+            
         return 100 * correct / total if total > 0 else 0.0
 
 
@@ -1606,6 +1670,128 @@ class APTTrainingPipeline:
             avg_loss = running_loss / max(1, len(train_loader))
             acc = 100 * correct / total
             print(f"  Linear Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
+
+    def _run_dual_branch_eval(self):
+        if self.val_loader is None:
+            print("Dual-branch evaluation skipped: no validation data available.")
+            return
+        if self.trainer is None:
+            print("Dual-branch evaluation skipped: trainer not initialized.")
+            return
+
+        print("\n" + "=" * 60)
+        print("DUAL-BRANCH EVALUATION ON VALIDATION SET")
+        print("=" * 60)
+
+        self.trainer.model.eval()
+
+        use_ssl_branch = self.ssl_student is not None and self.ssl_classifier is not None
+
+        if use_ssl_branch:
+            self.ssl_student.encoder.eval()
+            self.ssl_classifier.eval()
+
+        all_apt_probs = []
+        all_img_probs = []
+        all_labels = []
+
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                logits_apt = self.trainer.model(images)
+                if isinstance(logits_apt, (list, tuple)):
+                    logits_apt = logits_apt[0]
+
+                if self.trainer.cache_adapter is not None:
+                    visual_out = self.trainer.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
+
+                prob_apt = F.softmax(logits_apt, dim=-1)
+                all_apt_probs.append(prob_apt.cpu())
+
+                if use_ssl_branch:
+                    visual_out = self.ssl_student.encoder(images)
+                    if isinstance(visual_out, tuple):
+                        _, cls_feat = visual_out
+                    else:
+                        cls_feat = visual_out
+                    logits_img = self.ssl_classifier(cls_feat)
+                    prob_img = F.softmax(logits_img, dim=-1)
+                    all_img_probs.append(prob_img.cpu())
+
+                all_labels.append(labels.cpu())
+
+        all_apt_probs = torch.cat(all_apt_probs, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        _, pred_apt = torch.max(all_apt_probs, 1)
+        apt_acc = 100 * (pred_apt == all_labels).sum().item() / len(all_labels)
+        print(f"\n[APT Branch]   Accuracy: {apt_acc:.2f}%")
+
+        if use_ssl_branch:
+            all_img_probs = torch.cat(all_img_probs, dim=0)
+
+            _, pred_img = torch.max(all_img_probs, 1)
+            img_acc = 100 * (pred_img == all_labels).sum().item() / len(all_labels)
+            print(f"[Image Branch] Accuracy: {img_acc:.2f}%")
+
+            apt_correct = (pred_apt == all_labels)
+            img_correct = (pred_img == all_labels)
+            both_correct = (apt_correct & img_correct).sum().item()
+            apt_only_correct = (apt_correct & ~img_correct).sum().item()
+            img_only_correct = (~apt_correct & img_correct).sum().item()
+            both_wrong = (~apt_correct & ~img_correct).sum().item()
+            
+            print(f"\n[DEBUG] Complementarity Analysis:")
+            print(f"  Both correct:      {both_correct:5d} ({100*both_correct/len(all_labels):.2f}%)")
+            print(f"  APT only correct:  {apt_only_correct:5d} ({100*apt_only_correct/len(all_labels):.2f}%)")
+            print(f"  Img only correct:  {img_only_correct:5d} ({100*img_only_correct/len(all_labels):.2f}%)")
+            print(f"  Both wrong:        {both_wrong:5d} ({100*both_wrong/len(all_labels):.2f}%)")
+            print(f"  Disagreement rate: {100*(apt_correct != img_correct).float().mean():.2f}%")
+
+            print(f"\n{'Fusion Weight':<15} {'Fused Acc':>12}")
+            print("-" * 30)
+
+            best_weight = 0.0
+            best_fused_acc = apt_acc
+            fusion_results = {}
+
+            for w in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+                prob_fused = (1 - w) * all_apt_probs + w * all_img_probs
+                _, pred_fused = torch.max(prob_fused, 1)
+                fused_acc = 100 * (pred_fused == all_labels).sum().item() / len(all_labels)
+                fusion_results[w] = fused_acc
+                apt_weight_pct = 100 * (1 - w)
+                img_weight_pct = 100 * w
+                print(f"w = {w:.1f} (APT:{apt_weight_pct:3.0f}% IMG:{img_weight_pct:3.0f}%)  {fused_acc:>7.2f}%")
+
+                if fused_acc > best_fused_acc:
+                    best_fused_acc = fused_acc
+                    best_weight = w
+
+            print("-" * 30)
+            if best_weight > 0:
+                print(f"Best fusion: w={best_weight:.1f} -> {best_fused_acc:.2f}% (+{best_fused_acc - apt_acc:.2f}%)")
+            else:
+                print(f"Best: APT only -> {apt_acc:.2f}%")
+        else:
+            print("\n[Image Branch] Not available (SSL not trained)")
+            fusion_results = {}
+            best_weight = None
+            best_fused_acc = None
+
+        print("=" * 60 + "\n")
+
+        return {
+            'apt_acc': apt_acc,
+            'img_acc': img_acc if use_ssl_branch else None,
+            'fusion_results': fusion_results,
+            'best_weight': best_weight,
+            'best_fused_acc': best_fused_acc,
+        }
 
     def _evaluate_with_ssl_fusion(self, dataloader):
         if self.trainer is None:

@@ -2,9 +2,13 @@ model:
   dropout: 0.2
   num_heads: 8
   num_layers: 1
-  backbone: "ViT-B/32"
+  backbone: "ViT-B/16"
   dataset_name: "CUBirds"
   use_cache: false
+  
+checkpoint:
+  enabled: true
+  cache_dir: "checkpoints"
 
 training:
   epochs: 10
@@ -27,8 +31,8 @@ data:
   kshot: 16
   seed: 42
   val_size: 0.7
-  num_workers: 4
-  run_eda: true
+  num_workers: 8
+  run_eda: false
   class_distribution: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
@@ -46,30 +50,32 @@ active_learning:
 
 ssl:
   enabled: true
+  ssl_batch_size: 32
+  eval_batch_size: 1024
   proj_dim: 256
   num_prototypes: 4096
-  ssl_epochs: 20
+  ssl_epochs: 5
   ssl_lr: 0.0001
   teacher_temp: 0.04
   student_temp: 0.1
   ema_momentum: 0.996
   final_ema_momentum: 1.0
   center_momentum: 0.9
-  eval_freq: 1
-  eval_linear_epochs: 5
+  eval_freq: 5
+  eval_linear_epochs: 15
   linear_epochs: 5
   linear_lr: 0.001
   fusion_weight: 0.5
   num_trans_layers: 1
   num_heads: 8
-  num_unlabeled: 100
   global_crop_size: 224
   local_crop_size: 96
-  num_local_crops: 6
+  num_local_crops: 4
   global_crop_scale_min: 0.4
   global_crop_scale_max: 1.0
   local_crop_scale_min: 0.05
   local_crop_scale_max: 0.4
+  num_unlabeled: 500
   num_plot: 8
 
 logging:
