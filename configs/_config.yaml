@@ -1,0 +1,59 @@
+model:
+  dropout: 0.2
+  num_heads: 8
+  num_layers: 1
+  backbone: "ViT-B/16"
+  dataset_name: "CUBirds"
+  use_cache: false
+
+training:
+  epochs: 20
+  batch_size: 8
+  mode: "logits"
+  device: "cuda:0"
+  precision: "fp32"
+  optimizer: "SGD"
+  use_cutout: false
+  run_decoder: false
+  increment_epochs: 0
+  learning_rate: 0.002
+  weight_decay: 0.0005
+  confusion_matrix: false
+  visualize_gradcam: false
+  class_distribution: false
+  visualize_attention: false
+
+data:
+  kshot: 1
+  seed: 42
+  val_size: 0.7
+  num_workers: 4
+  run_eda: false
+  class_distribution: false
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+  root: "datasets/cub-200-2011-renamed"
+
+active_learning:
+  nshot: 0
+  rounds: 1
+  strategy: null
+  reset_optimizer_per_round: false
+  plot_coreset_embedding_umap: false
+  plot_coreset_embedding_tsne: false
+  plot_entropy_distribution: false
+  plot_conflict_distribution: false
+
+logging:
+  output_dir: "outputs/baseline/vit16-2shot-standard-apt"
+
+  
+use_dn4: false
+dn4:
+  k: 7
+  k_prime: 7
+  alpha: 0.8
+  max_iter: 30
+  tol: 1e-4
+  epsilon: 1e-8
+  lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]

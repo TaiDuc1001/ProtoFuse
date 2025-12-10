@@ -19,5 +19,4 @@ to_delete
 *.json
 uv.lock
 
-_*
 checkpoints

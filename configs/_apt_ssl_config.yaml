@@ -1,0 +1,76 @@
+model:
+  dropout: 0.2
+  num_heads: 8
+  num_layers: 1
+  backbone: "ViT-B/32"
+  dataset_name: "CUBirds"
+  use_cache: false
+
+training:
+  epochs: 50
+  batch_size: 8
+  mode: "logits"
+  device: "cuda:0"
+  precision: "fp32"
+  optimizer: "SGD"
+  use_cutout: false
+  run_decoder: false
+  increment_epochs: 0
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  confusion_matrix: false
+  visualize_gradcam: false
+  class_distribution: true
+  visualize_attention: false
+
+data:
+  kshot: 16
+  seed: 42
+  val_size: 0.7
+  num_workers: 4
+  run_eda: true
+  class_distribution: false
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+  root: "datasets/cub-200-2011-renamed"
+
+active_learning:
+  nshot: 0
+  rounds: 1
+  strategy: null
+  reset_optimizer_per_round: false
+  plot_coreset_embedding_umap: false
+  plot_coreset_embedding_tsne: false
+  plot_entropy_distribution: false
+  plot_conflict_distribution: false
+
+ssl:
+  enabled: true
+  proj_dim: 256
+  num_prototypes: 4096
+  ssl_epochs: 20
+  ssl_lr: 0.0001
+  teacher_temp: 0.04
+  student_temp: 0.1
+  ema_momentum: 0.996
+  final_ema_momentum: 1.0
+  center_momentum: 0.9
+  eval_freq: 1
+  eval_linear_epochs: 5
+  linear_epochs: 5
+  linear_lr: 0.001
+  fusion_weight: 0.5
+  num_trans_layers: 1
+  num_heads: 8
+  num_unlabeled: 100
+  global_crop_size: 224
+  local_crop_size: 96
+  num_local_crops: 6
+  global_crop_scale_min: 0.4
+  global_crop_scale_max: 1.0
+  local_crop_scale_min: 0.05
+  local_crop_scale_max: 0.4
+  num_plot: 8
+
+logging:
+  output_dir: "outputs/ssl"

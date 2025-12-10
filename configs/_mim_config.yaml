@@ -1,0 +1,30 @@
+model:
+  backbone: "ViT-B/16"
+  dataset_name: "CUBirds"
+  mim_hidden_dim: 512
+  mim_encoder_layers: 3
+  mim_decoder_layers: 3
+  mim_num_heads: 8
+  mim_dropout: 0.1
+  mask_ratio: 0.4
+
+training:
+  epochs: 20
+  batch_size: 16
+  device: "cuda:0"
+  precision: "fp32"
+  optimizer: "AdamW"
+  learning_rate: 0.0001
+  weight_decay: 0.01
+
+data:
+  kshot: 0
+  seed: 42
+  val_size: 0.7
+  num_workers: 4
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+  root: "datasets/cub-200-2011-renamed"
+
+logging:
+  output_dir: "outputs/mim_zeroshot"
