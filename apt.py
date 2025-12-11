@@ -17,6 +17,7 @@ from torchvision.datasets import ImageFolder
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from collections import defaultdict
+from PIL import Image as PILImage
 from decode import APTDecoder
 from thop import profile
 from typing import Any, Dict, List, Optional
@@ -1470,11 +1471,24 @@ class APTTrainingPipeline:
         self.ssl_vis_images = None
         self.ssl_vis_paths = None
         if num_plot > 0:
-            num_vis_samples = min(num_plot, len(ssl_unlabeled_indices))
-            vis_indices = ssl_unlabeled_indices[:num_vis_samples]
+            class_to_indices = defaultdict(list)
+            for idx in ssl_unlabeled_indices:
+                _, label = self.dataset.samples[idx]
+                class_to_indices[label].append(idx)
+            
+            all_classes = list(class_to_indices.keys())
+            num_classes_to_sample = min(num_plot, len(all_classes))
+            
+            rng = random.Random(self.seed)
+            selected_classes = rng.sample(all_classes, num_classes_to_sample)
+            
+            vis_indices = []
+            for cls in selected_classes:
+                class_indices = class_to_indices[cls]
+                vis_indices.append(rng.choice(class_indices))
+            
             self.ssl_vis_images = []
             self.ssl_vis_paths = []
-            from PIL import Image as PILImage
             vis_transform = transforms.Compose([
                 transforms.Resize((global_crop_size, global_crop_size)),
                 transforms.ToTensor(),

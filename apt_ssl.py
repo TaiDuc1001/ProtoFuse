@@ -57,22 +57,26 @@ class TransformerAdapter(nn.Module):
 
     def forward(self, x, return_attention=False):
         B = x.shape[0]
-        x = x.unsqueeze(1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        seq_len = x.shape[1]
         attn_weights_all = []
         for layer in self.layers:
             residual = x
             x = layer['norm1'](x)
-            qkv = layer['qkv'](x).reshape(B, 1, 3, self.num_heads, self.head_dim)
+            qkv = layer['qkv'](x).reshape(B, seq_len, 3, self.num_heads, self.head_dim)
             qkv = qkv.permute(2, 0, 3, 1, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
             attn_weights_all.append(attn)
-            x = (attn @ v).transpose(1, 2).reshape(B, 1, -1)
+            x = (attn @ v).transpose(1, 2).reshape(B, seq_len, -1)
             x = layer['proj'](x)
             x = residual + x
             x = x + layer['mlp'](layer['norm2'](x))
-        x = self.norm(x).squeeze(1)
+        x = self.norm(x)
+        if seq_len == 1:
+            x = x.squeeze(1)
         if attn_weights_all:
             self.last_attn_weights = attn_weights_all[-1].detach()
         if return_attention:
@@ -95,25 +99,27 @@ class ImageSSLModel(nn.Module):
         with torch.no_grad():
             visual_output = self.encoder(x)
             if isinstance(visual_output, tuple):
-                _, cls_feat = visual_output
+                all_tokens, _ = visual_output
             else:
-                cls_feat = visual_output
+                all_tokens = visual_output
         if return_attention:
-            adapted_feat, attn_weights = self.adapter(cls_feat, return_attention=True)
-            u = self.ssl_head(adapted_feat)
-            return u, adapted_feat, attn_weights
-        adapted_feat = self.adapter(cls_feat)
-        u = self.ssl_head(adapted_feat)
-        return u, adapted_feat
+            adapted_tokens, attn_weights = self.adapter(all_tokens, return_attention=True)
+            cls_feat = adapted_tokens[:, 0, :]
+            u = self.ssl_head(cls_feat)
+            return u, cls_feat, attn_weights
+        adapted_tokens = self.adapter(all_tokens)
+        cls_feat = adapted_tokens[:, 0, :]
+        u = self.ssl_head(cls_feat)
+        return u, cls_feat
 
     def get_attention_weights(self, x):
         with torch.no_grad():
             visual_output = self.encoder(x)
             if isinstance(visual_output, tuple):
-                _, cls_feat = visual_output
+                all_tokens, _ = visual_output
             else:
-                cls_feat = visual_output
-            _, attn_weights = self.adapter(cls_feat, return_attention=True)
+                all_tokens = visual_output
+            _, attn_weights = self.adapter(all_tokens, return_attention=True)
         return attn_weights
 
 
@@ -131,33 +137,10 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
         images = torch.stack(images)
     images = images.to(device)
     
-    encoder = model.encoder
-    transformer = encoder.transformer
-    last_block = transformer.resblocks[-1]
-    attn_module = last_block.attn
+    with torch.no_grad():
+        _, _, attn_weights_list = model(images, return_attention=True)
     
-    captured_attn = {}
-    
-    def attn_hook(module, args, output):
-        captured_attn['weights'] = output[1]
-    
-    original_need_weights = attn_module.forward.__code__
-    handle = attn_module.register_forward_hook(attn_hook)
-    
-    original_forward = attn_module.forward
-    def forward_with_weights(*args, **kwargs):
-        kwargs['need_weights'] = True
-        kwargs['average_attn_weights'] = False
-        return original_forward(*args, **kwargs)
-    attn_module.forward = forward_with_weights
-    
-    try:
-        with torch.no_grad():
-            _ = encoder(images)
-        attn_weights = captured_attn.get('weights')
-    finally:
-        handle.remove()
-        attn_module.forward = original_forward
+    attn_weights = attn_weights_list[-1]
     
     if attn_weights is None:
         print("  [VIS] Could not capture attention weights")
