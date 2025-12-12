@@ -35,16 +35,13 @@ from dn4 import (
     label_propagation,
 )
 from apt_ssl import (
-    SSLHead,
     LinearClassifier,
     ImageSSLModel,
-    SSLTransform,
     DINOMultiCropTransform,
     create_teacher_from_student,
     update_teacher_ema,
     get_cosine_ema_momentum,
     update_center,
-    ssl_loss_symmetric,
     dino_loss,
     visualize_dino_attention,
 )
@@ -1705,8 +1702,8 @@ class APTTrainingPipeline:
             self.ssl_student.encoder.eval()
             self.ssl_classifier.eval()
 
-        all_apt_probs = []
-        all_img_probs = []
+        all_apt_logits = []
+        all_img_logits = []
         all_labels = []
 
         with torch.no_grad():
@@ -1723,8 +1720,7 @@ class APTTrainingPipeline:
                     img_feats = visual_out[1]
                     logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
 
-                prob_apt = F.softmax(logits_apt, dim=-1)
-                all_apt_probs.append(prob_apt.cpu())
+                all_apt_logits.append(logits_apt.cpu())
 
                 if use_ssl_branch:
                     visual_out = self.ssl_student.encoder(images)
@@ -1733,21 +1729,22 @@ class APTTrainingPipeline:
                     else:
                         cls_feat = visual_out
                     logits_img = self.ssl_classifier(cls_feat)
-                    prob_img = F.softmax(logits_img, dim=-1)
-                    all_img_probs.append(prob_img.cpu())
+                    all_img_logits.append(logits_img.cpu())
 
                 all_labels.append(labels.cpu())
 
-        all_apt_probs = torch.cat(all_apt_probs, dim=0)
+        all_apt_logits = torch.cat(all_apt_logits, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
 
+        all_apt_probs = F.softmax(all_apt_logits, dim=-1)
         _, pred_apt = torch.max(all_apt_probs, 1)
         apt_acc = 100 * (pred_apt == all_labels).sum().item() / len(all_labels)
         print(f"\n[APT Branch]   Accuracy: {apt_acc:.2f}%")
 
         if use_ssl_branch:
-            all_img_probs = torch.cat(all_img_probs, dim=0)
+            all_img_logits = torch.cat(all_img_logits, dim=0)
 
+            all_img_probs = F.softmax(all_img_logits, dim=-1)
             _, pred_img = torch.max(all_img_probs, 1)
             img_acc = 100 * (pred_img == all_labels).sum().item() / len(all_labels)
             print(f"[Image Branch] Accuracy: {img_acc:.2f}%")
@@ -1774,7 +1771,8 @@ class APTTrainingPipeline:
             fusion_results = {}
 
             for w in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-                prob_fused = (1 - w) * all_apt_probs + w * all_img_probs
+                logits_fused = (1 - w) * all_apt_logits + w * all_img_logits
+                prob_fused = F.softmax(logits_fused, dim=-1)
                 _, pred_fused = torch.max(prob_fused, 1)
                 fused_acc = 100 * (pred_fused == all_labels).sum().item() / len(all_labels)
                 fusion_results[w] = fused_acc
@@ -1849,10 +1847,8 @@ class APTTrainingPipeline:
                         cls_feat = visual_out
                     logits_img = self.ssl_classifier(cls_feat)
 
-                    prob_apt = F.softmax(logits_apt, dim=-1)
-                    prob_img = F.softmax(logits_img, dim=-1)
-                    prob_final = (1 - fusion_weight) * prob_apt + fusion_weight * prob_img
-                    logits = torch.log(prob_final + 1e-8)
+                    logits_fused = (1 - fusion_weight) * logits_apt + fusion_weight * logits_img
+                    logits = logits_fused
                 else:
                     logits = logits_apt
 

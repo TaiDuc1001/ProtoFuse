@@ -30,7 +30,7 @@ class LinearClassifier(nn.Module):
 
 
 class TransformerAdapter(nn.Module):
-    def __init__(self, feature_dim, num_layers=1, num_heads=8, mlp_ratio=4.0, dropout=0.0):
+    def __init__(self, feature_dim, num_layers=1, num_heads=8, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = feature_dim // num_heads
@@ -43,13 +43,7 @@ class TransformerAdapter(nn.Module):
                     'qkv': nn.Linear(feature_dim, feature_dim * 3),
                     'proj': nn.Linear(feature_dim, feature_dim),
                     'norm2': nn.LayerNorm(feature_dim),
-                    'mlp': nn.Sequential(
-                        nn.Linear(feature_dim, int(feature_dim * mlp_ratio)),
-                        nn.GELU(),
-                        nn.Dropout(dropout),
-                        nn.Linear(int(feature_dim * mlp_ratio), feature_dim),
-                        nn.Dropout(dropout)
-                    )
+                    'feed_forward': nn.Linear(feature_dim, feature_dim)
                 })
             )
         self.norm = nn.LayerNorm(feature_dim)
@@ -73,7 +67,7 @@ class TransformerAdapter(nn.Module):
             x = (attn @ v).transpose(1, 2).reshape(B, seq_len, -1)
             x = layer['proj'](x)
             x = residual + x
-            x = x + layer['mlp'](layer['norm2'](x))
+            x = x + layer['feed_forward'](layer['norm2'](x))
         x = self.norm(x)
         if seq_len == 1:
             x = x.squeeze(1)
@@ -216,6 +210,7 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
     plt.close(fig)
     
     print(f"  [VIS] Saved DINO-style attention visualizations to {output_dir}")
+    model.train()
 
 
 class DINOMultiCropTransform:
@@ -247,26 +242,6 @@ class DINOMultiCropTransform:
         global_views = [self.global_transform(img), self.global_transform(img)]
         local_views = [self.local_transform(img) for _ in range(self.num_local_crops)]
         return global_views, local_views
-
-
-class SSLTransform:
-    def __init__(self, base_transform, clip_mean, clip_std):
-        self.base_transform = base_transform
-        self.aug = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.4, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=clip_mean, std=clip_std),
-        ])
-
-    def __call__(self, img):
-        v1 = self.aug(img)
-        v2 = self.aug(img)
-        return v1, v2
-
 
 def create_teacher_from_student(student):
     teacher = copy.deepcopy(student)
@@ -312,9 +287,3 @@ def dino_loss(teacher_global_outputs, student_all_outputs, teacher_temp, student
             total_loss += loss
             n_loss_terms += 1
     return total_loss / max(n_loss_terms, 1)
-
-
-def ssl_loss_symmetric(u_t1, u_t2, u_s1, u_s2, teacher_temp, student_temp, center):
-    loss_12 = ssl_loss(u_t1, u_s2, teacher_temp, student_temp, center)
-    loss_21 = ssl_loss(u_t2, u_s1, teacher_temp, student_temp, center)
-    return (loss_12 + loss_21) / 2

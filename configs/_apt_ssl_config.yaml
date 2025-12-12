@@ -51,7 +51,7 @@ active_learning:
 ssl:
   enabled: true
   ssl_batch_size: 32
-  eval_batch_size: 1024
+  eval_batch_size: 128
   proj_dim: 256
   num_prototypes: 4096
   ssl_epochs: 5
