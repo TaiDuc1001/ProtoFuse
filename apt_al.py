@@ -24,10 +24,7 @@ from apt import (
 from utils import (
     plot_bald_distribution,
     plot_entropy_distribution,
-    plot_coreset_embedding_tsne,
-    plot_coreset_embedding_umap,
 )
-from alfamix import compute_alfamix_scores, select_alfamix_indices
 
 AL_ARG_SCHEMA = {
     **ARG_SCHEMA,
@@ -354,8 +351,8 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         if strategy_value is not None and not isinstance(strategy_value, str):
             raise ValueError("active_learning.strategy must be a string or null.")
         self.strategy = strategy_value
-        if self.strategy not in (None, "entropy", "random", "coreset", "bald", "alfamix"):
-            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'bald', 'alfamix'.")
+        if self.strategy not in (None, "entropy", "random", "coreset", "bald"):
+            raise ValueError("active_learning.strategy must be one of null, 'entropy', 'random', 'coreset', 'bald'.")
 
         alpha_cap_value = self.active_cfg.get("alpha_cap", None)
         self.alpha_cap = coerce_to_float(alpha_cap_value, 0.5, key="active_learning.alpha_cap")
@@ -522,7 +519,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             if round_idx == 1:
                 self._save_checkpoint()
 
-        if self.strategy in ('entropy', 'random', 'coreset', 'bald', 'alfamix') and round_idx < self.rounds:
+        if self.strategy in ('entropy', 'random', 'coreset', 'bald') and round_idx < self.rounds:
             self._perform_active_selection(round_idx)
             self.trainer.reset_optimizer_scheduler()
             if self.reset_model_per_round:
@@ -535,7 +532,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             raise RuntimeError("Pipeline not initialized before active selection.")
 
         strategy = self.strategy
-        if strategy not in ('entropy', 'random', 'coreset', 'bald', 'alfamix'):
+        if strategy not in ('entropy', 'random', 'coreset', 'bald'):
             return
 
         if not self.unlabeled_indices:
@@ -563,7 +560,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         need_entropy_plot = self.plot_entropy_distribution and strategy == 'entropy'
         need_bald_plot = self.plot_bald_distribution and strategy == 'bald'
         need_coreset_plot = (
-            (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy in ('coreset', 'alfamix')
+            (self.plot_coreset_embedding_umap or self.plot_coreset_embedding_tsne) and strategy == 'coreset'
         )
 
         selection_plot_dir = None
@@ -609,61 +606,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 self.batch_size,
                 self.num_workers
             )
-        elif strategy == 'alfamix':
-            combined_indices = list(
-                dict.fromkeys(self.labeled_indices + self.unlabeled_indices)
-            )
-            embeddings = compute_coreset_embeddings(
-                self.trainer,
-                self.dataset,
-                combined_indices,
-                self.batch_size,
-                self.num_workers
-            )
-            scores_per_class = compute_alfamix_scores(
-                self.trainer,
-                self.dataset,
-                self.labeled_indices,
-                self.unlabeled_indices,
-                embeddings,
-                alpha_cap=self.alpha_cap
-            )
-            raw_selected = select_alfamix_indices(scores_per_class, self.nshot)
-            if need_coreset_plot and selection_plot_dir is not None:
-                combined_indices = list(
-                    dict.fromkeys(self.labeled_indices + self.unlabeled_indices + self.val_indices)
-                )
-                coreset_embeddings = compute_coreset_embeddings(
-                    self.trainer,
-                    self.dataset,
-                    combined_indices,
-                    self.batch_size,
-                    self.num_workers
-                )
-                plot_base = os.path.join(selection_plot_dir, f'coreset_round_{round_idx:02d}')
-                if coreset_embeddings:
-                    if self.plot_coreset_embedding_umap:
-                        plot_coreset_embedding_umap(
-                            coreset_embeddings,
-                            self.labeled_indices,
-                            self.unlabeled_indices,
-                            self.val_indices,
-                            raw_selected,
-                            round_idx,
-                            f"{plot_base}_umap.pdf",
-                            self.log_file,
-                        )
-                    if self.plot_coreset_embedding_tsne:
-                        plot_coreset_embedding_tsne(
-                            coreset_embeddings,
-                            self.labeled_indices,
-                            self.unlabeled_indices,
-                            self.val_indices,
-                            raw_selected,
-                            round_idx,
-                            f"{plot_base}_tsne.pdf",
-                            self.log_file,
-                        )
+        
         if not raw_selected:
             empty_msg = (
                 f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) selected no samples."

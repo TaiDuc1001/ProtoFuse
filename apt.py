@@ -11,29 +11,23 @@ import datetime
 import numpy as np
 from clip import clip
 import torch.nn as nn
+from thop import profile
 import torch.nn.functional as F
+from PIL import Image as PILImage
 from torchvision import transforms
+from collections import defaultdict
 from torchvision.datasets import ImageFolder
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
-from collections import defaultdict
-from PIL import Image as PILImage
-from decode import APTDecoder
-from thop import profile
 from typing import Any, Dict, List, Optional
 from utils import (
-    log_decoded_prompts,
     run_dataset_eda,
     save_class_distribution_plot,
     save_confusion_artifacts,
     visualize_attention_maps,
     visualize_gradcam_maps,
 )
-from dn4 import (
-    aggregate_test_distributions,
-    build_similarity_matrix,
-    label_propagation,
-)
+
 from apt_ssl import (
     LinearClassifier,
     ImageSSLModel,
@@ -68,6 +62,23 @@ DEFAULT_TRAINING_EPOCHS = 100
 DEFAULT_CHECKPOINT_DIR = 'checkpoints'
 CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
 
+class DINODataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, indices, transform):
+        self.base_dataset = base_dataset
+        self.indices = indices
+        self.transform = transform
+        from PIL import Image
+        self.Image = Image
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        path, label = self.base_dataset.samples[real_idx]
+        img = self.Image.open(path).convert('RGB')
+        global_views, local_views = self.transform(img)
+        return global_views, local_views, label
 
 class CheckpointCache:
     def __init__(self, cache_dir: str = DEFAULT_CHECKPOINT_DIR):
@@ -227,56 +238,6 @@ def process_parsed_args(parsed_args, arg_schema, overrides):
             keys = spec['config_path'].split('.')
             set_nested_value(overrides, keys, value)
     return overrides
-
-class CacheAdapter(nn.Module):
-    def __init__(self, feature_dim, num_classes, alpha=1.0, beta=1.0, temperature=10.0):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.num_classes = num_classes
-        self.alpha = alpha
-        self.beta = beta
-        self.temperature = temperature
-        
-        self.register_buffer('cache_keys', torch.zeros(0, feature_dim))
-        self.register_buffer('cache_values', torch.zeros(0, num_classes))
-        self.register_buffer('class_counts', torch.zeros(num_classes))
-        self.enabled = True
-
-    def update_cache(self, keys, labels):
-        keys = F.normalize(keys, dim=-1)
-        one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
-        
-        self.cache_keys = keys.detach().clone()
-        self.cache_values = one_hot.detach().clone()
-        
-        counts = torch.zeros(self.num_classes, device=keys.device)
-        unique_labels, counts_per_label = labels.unique(return_counts=True)
-        counts[unique_labels] = counts_per_label.float()
-        self.class_counts = counts
-
-    def get_cache_logits(self, image_features):
-        if not self.enabled or self.cache_keys.shape[0] == 0:
-            print("Cache is empty or disabled. Returning zero logits.")
-            return torch.zeros(image_features.shape[0], self.num_classes, device=image_features.device)
-
-        image_features = F.normalize(image_features, dim=-1)
-        affinity = image_features @ self.cache_keys.t()
-        
-        cache_logits = ((-1) * (self.temperature - self.temperature * affinity)).exp() @ self.cache_values
-        
-        safe_counts = self.class_counts.clone()
-        safe_counts[safe_counts == 0] = 1.0
-        cache_logits = cache_logits / safe_counts.unsqueeze(0)
-        
-        return cache_logits
-
-    def forward(self, image_features, apt_logits):
-        if not self.enabled or self.cache_keys.shape[0] == 0:
-            return apt_logits
-        
-        cache_logits = self.get_cache_logits(image_features)
-        final_logits = self.beta * apt_logits + self.alpha * cache_logits
-        return final_logits
 
 def infer_override_value(raw):
     lowered = raw.lower()
@@ -665,23 +626,6 @@ class APT:
         self.setup_optimizer()
         precision_mode = self._cfg_str('fp32', 'training.precision', 'precision')
         self.scaler = GradScaler() if precision_mode == 'amp' else None
-        
-        if bool(self._cfg_value('training.run_decoder', 'run_decoder', default=False)):
-            self.decoder = APTDecoder(
-                device=str(self.device),
-                clip_model_name=self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
-            )
-        
-        if bool(self._cfg_value('model.use_cache', 'cache.use_cache', 'training.use_cache', 'use_cache', default=False)):
-            self.cache_adapter = CacheAdapter(
-                feature_dim=self.model.vis_encoder.ln_post.normalized_shape[0],
-                num_classes=len(classnames),
-                alpha=self._cfg_float(1.0, 'cache.alpha', 'model.cache_alpha', 'cache_alpha'),
-                beta=self._cfg_float(1.0, 'cache.beta', 'model.cache_beta', 'cache_beta'),
-                temperature=self._cfg_float(5.0, 'cache.temperature', 'model.cache_temperature', 'cache_temperature')
-            ).to(self.device)
-        else:
-            self.cache_adapter = None
     
     def _cfg_value(self, *paths, default=None):
         sentinel = object()
@@ -809,48 +753,6 @@ class APT:
             self.model.load_state_dict(self.initial_model_state)
             self.model.to(self.device)
 
-    def update_cache_memory(self, dataset, labeled_indices):
-        if self.cache_adapter is None:
-            return
-
-        print("Building Cache Memory from Labeled Set...")
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write("Building Cache Memory from Labeled Set...\n")
-
-        self.model.eval()
-        
-        subset = Subset(dataset, labeled_indices)
-        loader = DataLoader(
-            subset,
-            batch_size=32,
-            shuffle=False,
-            num_workers=self._cfg_int(4, 'data.num_workers', 'num_workers')
-        )
-        
-        all_keys = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for images, labels in loader:
-                images = images.to(self.device)
-                visual_out = self.model.vis_encoder(images)
-                img_feats = visual_out[1]
-                img_feats = F.normalize(img_feats, dim=-1)
-                
-                all_keys.append(img_feats)
-                all_labels.append(labels.to(self.device))
-        
-        if all_keys:
-            keys = torch.cat(all_keys, dim=0)
-            lbls = torch.cat(all_labels, dim=0)
-            self.cache_adapter.update_cache(keys, lbls)
-            msg = f"Cache updated: {keys.shape[0]} samples stored."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-    
     def train_step(self, batch):
         images, labels = batch
         images = images.to(self.device)
@@ -901,12 +803,6 @@ class APT:
                 if isinstance(logits, (list, tuple)):
                     logits = logits[0]
 
-                # 2. Cache Logits
-                if self.cache_adapter is not None:
-                    visual_out = self.model.vis_encoder(images)
-                    img_feats = visual_out[1]
-                    logits = self.cache_adapter(img_feats, logits)
-
                 loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
                 running_loss += loss.item()
                 steps += 1
@@ -949,44 +845,6 @@ class APT:
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 f.write(msg + '\n')
-
-    def decode_adapted_prompts(self, images, entry_length=30, temperature=1.0, batch_decode_size=32):
-        self.model.eval()
-        images = images.to(self.device)
-
-        with torch.no_grad():
-            encoder_output = self.model.vis_encoder(images)
-            unpooled_images = encoder_output[0].permute(1, 0, 2)
-            text_features = self.model._prepare_text_features()
-            text_features = text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
-
-            for layer in self.model._prompt_layers_iter():
-                text_features, _ = layer(unpooled_images, text_features)
-
-            adapted = text_features.permute(1, 0, 2)
-            batch_size, num_classes, embedding_dim = adapted.shape
-            all_embeddings = adapted.reshape(-1, embedding_dim)
-            all_captions = []
-            
-            for i in range(0, all_embeddings.shape[0], batch_decode_size):
-                batch_embeddings = all_embeddings[i:i+batch_decode_size]
-                batch_captions = self.decoder.decode_from_apt_embedding_batch(
-                    batch_embeddings, entry_length=entry_length, temperature=temperature
-                )
-                all_captions.extend(batch_captions)
-            
-            batch_out = []
-            caption_idx = 0
-            for b in range(batch_size):
-                classes_out = []
-                for c in range(num_classes):
-                    class_name = self.classnames[c] if c < len(self.classnames) else f"Class_{c}"
-                    classes_out.append({
-                        'class_id': c, 'class_name': class_name, 'generated_caption': all_captions[caption_idx]
-                    })
-                    caption_idx += 1
-                batch_out.append(classes_out)
-        return batch_out
 
     def generate_gradcam(self, images, target_classes):
         original_mode = self.model.training
@@ -1226,7 +1084,6 @@ class APTTrainingPipeline:
             if self.ssl_cfg.get('learn_fusion', False):
                 self._train_ssl_stage3()
             self._run_dual_branch_eval()
-        self._run_dn4_mode()
         self._finalize()
 
     def _prepare_directories(self):
@@ -1422,24 +1279,6 @@ class APTTrainingPipeline:
             num_local_crops=num_local_crops
         )
 
-        class DINODataset(torch.utils.data.Dataset):
-            def __init__(inner_self, base_dataset, indices, transform):
-                inner_self.base_dataset = base_dataset
-                inner_self.indices = indices
-                inner_self.transform = transform
-                from PIL import Image
-                inner_self.Image = Image
-
-            def __len__(inner_self):
-                return len(inner_self.indices)
-
-            def __getitem__(inner_self, idx):
-                real_idx = inner_self.indices[idx]
-                path, label = inner_self.base_dataset.samples[real_idx]
-                img = inner_self.Image.open(path).convert('RGB')
-                global_views, local_views = inner_self.transform(img)
-                return global_views, local_views, label
-
         def dino_collate_fn(batch):
             global_views_list = [[], []]
             local_views_list = [[] for _ in range(num_local_crops)]
@@ -1504,6 +1343,9 @@ class APTTrainingPipeline:
 
         print(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_unlabeled_indices)} unlabeled samples")
         for epoch in range(1, ssl_epochs + 1):
+            if self.ssl_student is None:
+                print("SSL student is None, skipping epoch")
+                return
             self.ssl_student.train()
             running_loss = 0.0
             steps = 0
@@ -1513,7 +1355,7 @@ class APTTrainingPipeline:
             
             for global_views_batch, local_views_batch, _ in ssl_loader:
                 global_views_batch = [g.to(self.device) for g in global_views_batch]
-                local_views_batch = [l.to(self.device) for l in local_views_batch]
+                local_views_batch = [local_view.to(self.device) for local_view in local_views_batch]
 
                 with torch.no_grad():
                     teacher_global_cat = torch.cat(global_views_batch, dim=0)
@@ -1530,10 +1372,14 @@ class APTTrainingPipeline:
                 
                 student_outputs = student_global_outputs + student_local_outputs
 
-                loss = dino_loss(teacher_outputs, student_outputs, teacher_temp, student_temp, self.ssl_center)
+                loss_value = dino_loss(teacher_outputs, student_outputs, teacher_temp, student_temp, self.ssl_center)
+                if not isinstance(loss_value, torch.Tensor):
+                    loss_tensor = torch.tensor(loss_value, device=self.device, dtype=torch.float32, requires_grad=True)
+                else:
+                    loss_tensor = loss_value
 
                 ssl_optimizer.zero_grad()
-                loss.backward()
+                loss_tensor.backward()
                 ssl_optimizer.step()
 
                 with torch.no_grad():
@@ -1542,7 +1388,8 @@ class APTTrainingPipeline:
 
                 update_teacher_ema(self.ssl_teacher, self.ssl_student, ema_momentum)
 
-                running_loss += loss.item()
+                loss_item = loss_tensor.item() if isinstance(loss_tensor, torch.Tensor) else float(loss_tensor)
+                running_loss += loss_item
                 steps += 1
 
             avg_loss = running_loss / max(1, steps)
@@ -1567,6 +1414,9 @@ class APTTrainingPipeline:
 
     def _run_linear_eval(self, feature_dim, num_epochs):
         if not self.train_indices or self.val_loader is None:
+            return 0.0
+        if self.ssl_student is None or self.dataset is None:
+            print("Linear evaluation skipped: SSL student or dataset not available.")
             return 0.0
 
         eval_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
@@ -1603,7 +1453,6 @@ class APTTrainingPipeline:
         cached_train_loader = DataLoader(train_dataset, batch_size=self.eval_batch_size, shuffle=True)
         
         for epoch_idx in range(num_epochs):
-            start_time = time.time()
             eval_classifier.train()
             for feats, labels in cached_train_loader:
                 feats, labels = feats.to(self.device), labels.to(self.device)
@@ -1640,9 +1489,12 @@ class APTTrainingPipeline:
 
         print(f"[DEBUG] SSL Stage 2 config: feature_dim={feature_dim}, linear_epochs={linear_epochs}, linear_lr={linear_lr}")
 
+        if self.ssl_student is None:
+            print("SSL student is None, skipping stage 2")
+            return
+        
         for param in self.ssl_student.encoder.parameters():
             param.requires_grad = False
-        self.ssl_student.ssl_head = None
 
         self.ssl_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
         linear_optimizer = torch.optim.AdamW(self.ssl_classifier.parameters(), lr=linear_lr)
@@ -1700,7 +1552,7 @@ class APTTrainingPipeline:
         fusion_max_iter = coerce_to_int(self.ssl_cfg.get('fusion_max_iter', 20), 20)
         fusion_lr = coerce_to_float(self.ssl_cfg.get('fusion_lr', 1.0), 1.0)
 
-        print(f"\n[SSL Stage 3] Training fusion weights with LBFGS")
+        print("\n[SSL Stage 3] Training fusion weights with LBFGS")
         print(f"[DEBUG] fusion_max_iter={fusion_max_iter}, fusion_lr={fusion_lr}")
 
         self.fusion_weights = FusionWeightLearner().to(self.device)
@@ -1724,11 +1576,6 @@ class APTTrainingPipeline:
                 logits_apt = self.trainer.model(images)
                 if isinstance(logits_apt, (list, tuple)):
                     logits_apt = logits_apt[0]
-
-                if self.trainer.cache_adapter is not None:
-                    visual_out = self.trainer.model.vis_encoder(images)
-                    img_feats = visual_out[1]
-                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
 
                 visual_out = self.ssl_student.encoder(images)
                 if isinstance(visual_out, tuple):
@@ -1755,6 +1602,8 @@ class APTTrainingPipeline:
         iteration = [0]
 
         def closure():
+            if self.fusion_weights is None:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
             fusion_optimizer.zero_grad()
             logits_fused = self.fusion_weights(all_apt_logits, all_img_logits)
             loss = F.cross_entropy(logits_fused, all_labels)
@@ -1790,7 +1639,7 @@ class APTTrainingPipeline:
 
         use_ssl_branch = self.ssl_student is not None and self.ssl_classifier is not None
 
-        if use_ssl_branch:
+        if use_ssl_branch and self.ssl_student is not None and self.ssl_classifier is not None:
             self.ssl_student.encoder.eval()
             self.ssl_classifier.eval()
 
@@ -1807,14 +1656,9 @@ class APTTrainingPipeline:
                 if isinstance(logits_apt, (list, tuple)):
                     logits_apt = logits_apt[0]
 
-                if self.trainer.cache_adapter is not None:
-                    visual_out = self.trainer.model.vis_encoder(images)
-                    img_feats = visual_out[1]
-                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
-
                 all_apt_logits.append(logits_apt.cpu())
 
-                if use_ssl_branch:
+                if use_ssl_branch and self.ssl_student is not None and self.ssl_classifier is not None:
                     visual_out = self.ssl_student.encoder(images)
                     if isinstance(visual_out, tuple):
                         _, cls_feat = visual_out
@@ -1848,7 +1692,7 @@ class APTTrainingPipeline:
             img_only_correct = (~apt_correct & img_correct).sum().item()
             both_wrong = (~apt_correct & ~img_correct).sum().item()
             
-            print(f"\n[DEBUG] Complementarity Analysis:")
+            print("\n[DEBUG] Complementarity Analysis:")
             print(f"  Both correct:      {both_correct:5d} ({100*both_correct/len(all_labels):.2f}%)")
             print(f"  APT only correct:  {apt_only_correct:5d} ({100*apt_only_correct/len(all_labels):.2f}%)")
             print(f"  Img only correct:  {img_only_correct:5d} ({100*img_only_correct/len(all_labels):.2f}%)")
@@ -1928,7 +1772,7 @@ class APTTrainingPipeline:
 
         use_ssl_fusion = self.use_ssl and self.ssl_student is not None and self.ssl_classifier is not None
 
-        if use_ssl_fusion:
+        if use_ssl_fusion and self.ssl_student is not None and self.ssl_classifier is not None:
             self.ssl_student.encoder.eval()
             self.ssl_classifier.eval()
 
@@ -1942,12 +1786,7 @@ class APTTrainingPipeline:
                 if isinstance(logits_apt, (list, tuple)):
                     logits_apt = logits_apt[0]
 
-                if self.trainer.cache_adapter is not None:
-                    visual_out = self.trainer.model.vis_encoder(images)
-                    img_feats = visual_out[1]
-                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
-
-                if use_ssl_fusion and self.fusion_weights is not None:
+                if use_ssl_fusion and self.fusion_weights is not None and self.ssl_student is not None and self.ssl_classifier is not None:
                     visual_out = self.ssl_student.encoder(images)
                     if isinstance(visual_out, tuple):
                         _, cls_feat = visual_out
@@ -1989,9 +1828,6 @@ class APTTrainingPipeline:
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
-
-        if self.trainer.cache_adapter is not None:
-            self.trainer.update_cache_memory(self.dataset, self.train_indices)
 
         for epoch_idx in range(1, epochs_total + 1):
             self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
@@ -2049,9 +1885,6 @@ class APTTrainingPipeline:
             )
 
         self._refresh_sample_cache(all_labels)
-
-        if bool(get_config_value(self.training_cfg, 'run_decoder', False)):
-            self._decode_and_log_prompts()
 
         if bool(get_config_value(self.training_cfg, 'visualize_attention', False)):
             self._export_attention_overlays(maps_dir)
@@ -2136,17 +1969,6 @@ class APTTrainingPipeline:
             self.sample_cache['labels'] = torch.tensor(sample_labels_list)
             self.sample_cache['paths'] = sample_paths
 
-    def _decode_and_log_prompts(self):
-        if self.trainer is None:
-            return
-        images = self.sample_cache['images']
-        if images is None:
-            return
-
-        decoded_prompts = self.trainer.decode_adapted_prompts(images, entry_length=30, temperature=1.0)
-        self.sample_cache['decoded_prompts'] = decoded_prompts
-        log_decoded_prompts(decoded_prompts, self.sample_cache, self.log_file, self.global_epoch)
-
     def _export_attention_overlays(self, maps_dir):
         if self.trainer is None:
             return
@@ -2172,298 +1994,6 @@ class APTTrainingPipeline:
             maps_dir,
             self.log_file,
         )
-
-    def _compute_dn4_embeddings(self, indices):
-        if not indices or self.dataset is None or self.trainer is None:
-            return {}
-
-        subset = Subset(self.dataset, indices)
-        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-
-        embeddings = {}
-        position = 0
-        original_training_state = self.trainer.model.training
-        self.trainer.model.eval()
-
-        with torch.no_grad():
-            for images, _ in loader:
-                batch_size_local = images.size(0)
-                batch_indices = indices[position:position + batch_size_local]
-                position += batch_size_local
-
-                images = images.to(self.trainer.device)
-
-                visual_out = self.trainer.model.vis_encoder(images)
-                if isinstance(visual_out, (list, tuple)) and len(visual_out) == 2:
-                    unpooled_levels, image_features = visual_out
-                else:
-                    unpooled_levels = visual_out
-                    image_features = None
-
-                if isinstance(unpooled_levels, list):
-                    unpooled = unpooled_levels[0]
-                else:
-                    unpooled = unpooled_levels
-
-                if isinstance(unpooled, (list, tuple)):
-                    unpooled = unpooled[0]
-
-                unpooled_images = unpooled.permute(1, 0, 2)
-
-                base_text_features = self.trainer.model._prepare_text_features().to(images.device).to(unpooled_images.dtype)
-                text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
-
-                for layer in self.trainer.model._prompt_layers_iter():
-                    text_features, _ = layer(unpooled_images, text_features)
-
-                text_features = text_features.permute(1, 0, 2)
-                text_features = F.normalize(text_features, dim=-1).to(torch.float32)
-
-                if image_features is not None:
-                    image_features = F.normalize(image_features.to(torch.float32), dim=-1)
-                    logit_scale = self.trainer.model.logit_scale.exp()
-                    logits = logit_scale * F.cosine_similarity(image_features.unsqueeze(1), text_features, dim=-1)
-                    predicted = torch.argmax(logits, dim=1)
-                else:
-                    norms = torch.norm(text_features, dim=-1)
-                    predicted = torch.argmax(norms, dim=1)
-
-                tuned_features = text_features[torch.arange(text_features.size(0)), predicted].to(torch.float32)
-                tuned_features_cpu = tuned_features.detach().cpu()
-
-                for idx, vec in zip(batch_indices, tuned_features_cpu):
-                    embeddings[int(idx)] = vec
-
-        self.trainer.model.train(original_training_state)
-        return embeddings
-
-    def _collect_logits_for_indices(self, indices):
-        if not indices or self.dataset is None or self.trainer is None:
-            return np.zeros((0, len(self.classnames)), dtype=np.float32), np.zeros((0,), dtype=np.int64), []
-
-        subset = Subset(self.dataset, indices)
-        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-        logits_chunks = []
-        labels_list = []
-        paths = []
-        position = 0
-        self.trainer.model.eval()
-
-        with torch.no_grad():
-            for images, labels in loader:
-                batch_size_local = images.size(0)
-                batch_indices = indices[position:position + batch_size_local]
-                position += batch_size_local
-                images = images.to(self.trainer.device)
-                logits = self.trainer.model(images)
-                if isinstance(logits, (list, tuple)):
-                    logits = logits[0]
-                if self.trainer.cache_adapter is not None:
-                    visual_out = self.trainer.model.vis_encoder(images)
-                    img_feats = visual_out[1]
-                    logits = self.trainer.cache_adapter(img_feats, logits)
-                logits_chunks.append(logits.detach().cpu())
-                labels_list.extend(labels.cpu().numpy().astype(np.int64).tolist())
-                for idx in batch_indices:
-                    if 0 <= idx < len(self.dataset.samples):
-                        paths.append(os.path.abspath(self.dataset.samples[idx][0]))
-                    else:
-                        paths.append('unknown')
-
-        if logits_chunks:
-            logits_tensor = torch.cat(logits_chunks, dim=0)
-            logits_array = logits_tensor.numpy()
-        else:
-            logits_array = np.zeros((0, len(self.classnames)), dtype=np.float32)
-
-        return logits_array, np.asarray(labels_list, dtype=np.int64), paths
-
-    def _run_dn4_mode(self):
-        if not self.use_dn4:
-            return
-        if self.dataset is None or self.trainer is None:
-            return
-        if len(self.val_indices) == 0:
-            msg = "DN4 mode skipped (validation split empty)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        support_indices = list(dict.fromkeys(self.labeled_indices + self.unlabeled_indices))
-        if not support_indices:
-            msg = "DN4 mode skipped (support set empty)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        k_value = self.dn4_cfg.get('k', 7)
-        k_prime_value = self.dn4_cfg.get('k_prime', k_value)
-        alpha_value = self.dn4_cfg.get('alpha', 0.8)
-        max_iter_value = self.dn4_cfg.get('max_iter', 30)
-        tol_value = self.dn4_cfg.get('tol', 1e-4)
-        epsilon_value = self.dn4_cfg.get('epsilon', 1e-8)
-        lambda_values = self.dn4_cfg.get('lambdas', [0.0, 0.25, 0.5, 0.75, 1.0])
-
-        k = coerce_to_int(k_value, 7, key='dn4.k')
-        k_prime = coerce_to_int(k_prime_value, k, key='dn4.k_prime')
-        alpha = coerce_to_float(alpha_value, 0.8, key='dn4.alpha')
-        max_iter = coerce_to_int(max_iter_value, 30, key='dn4.max_iter')
-        tol = coerce_to_float(tol_value, 1e-4, key='dn4.tol')
-        epsilon = coerce_to_float(epsilon_value, 1e-8, key='dn4.epsilon')
-
-        if isinstance(lambda_values, (int, float)):
-            lambda_candidates = [coerce_to_float(lambda_values, 0.0, key='dn4.lambdas')]
-        elif isinstance(lambda_values, (list, tuple)):
-            lambda_candidates = [coerce_to_float(val, 0.0, key='dn4.lambdas') for val in lambda_values]
-        else:
-            lambda_candidates = [0.0, 0.25, 0.5, 0.75, 1.0]
-
-        lambda_candidates = sorted(set(lambda_candidates)) or [1.0]
-
-        combined_indices = list(dict.fromkeys(support_indices + self.val_indices))
-        embedding_map = self._compute_dn4_embeddings(combined_indices)
-        if not embedding_map:
-            msg = "DN4 mode skipped (no embeddings available)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        support_features = []
-        ordered_support = []
-        for idx in support_indices:
-            tensor = embedding_map.get(idx)
-            if tensor is None:
-                continue
-            support_features.append(tensor.detach().cpu().numpy().astype(np.float32))
-            ordered_support.append(idx)
-
-        if not ordered_support:
-            msg = "DN4 mode skipped (no embeddings for support set)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        support_features = np.stack(support_features, axis=0)
-        num_classes = len(self.classnames)
-        seed_labels = np.zeros((support_features.shape[0], num_classes), dtype=np.float32)
-        labeled_lookup = set(self.labeled_indices)
-
-        for pos, idx in enumerate(ordered_support):
-            if idx in labeled_lookup:
-                label = self.dataset.samples[idx][1]
-                seed_labels[pos, label] = 1.0
-
-        val_features = []
-        val_indices_filtered = []
-        for idx in self.val_indices:
-            tensor = embedding_map.get(idx)
-            if tensor is None:
-                continue
-            val_features.append(tensor.detach().cpu().numpy().astype(np.float32))
-            val_indices_filtered.append(idx)
-
-        if not val_indices_filtered:
-            msg = "DN4 mode skipped (no embeddings for validation set)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        val_features = np.stack(val_features, axis=0)
-        logits_np, labels_np, val_paths = self._collect_logits_for_indices(val_indices_filtered)
-        if logits_np.shape[0] == 0:
-            msg = "DN4 mode skipped (no logits for validation set)."
-            print(msg)
-            if self.log_file:
-                with open(self.log_file, 'a') as f:
-                    f.write(msg + '\n')
-            return
-
-        similarity_matrix, sigma = build_similarity_matrix(support_features, k)
-        propagated = label_propagation(similarity_matrix, seed_labels, alpha, max_iter, tol)
-        val_distributions = aggregate_test_distributions(val_features, support_features, propagated, sigma, k_prime)
-
-        graph_logits = np.log(np.clip(val_distributions, epsilon, None))
-        apt_logits = logits_np.astype(np.float32)
-
-        best_lambda = lambda_candidates[0]
-        best_accuracy = -float('inf')
-        lambda_metrics = []
-
-        for candidate in lambda_candidates:
-            blended = candidate * apt_logits + (1 - candidate) * graph_logits
-            preds = np.argmax(blended, axis=1)
-            acc = float((preds == labels_np).mean() * 100.0)
-            lambda_metrics.append({'lambda': float(candidate), 'accuracy': acc})
-            if acc > best_accuracy:
-                best_accuracy = acc
-                best_lambda = candidate
-
-        best_blended = best_lambda * apt_logits + (1 - best_lambda) * graph_logits
-        best_preds = np.argmax(best_blended, axis=1)
-        apt_preds = np.argmax(apt_logits, axis=1)
-        graph_preds = np.argmax(val_distributions, axis=1)
-        idx_array = np.arange(len(val_indices_filtered))
-        apt_scores = apt_logits[idx_array, apt_preds]
-        graph_scores = val_distributions[idx_array, graph_preds]
-        final_scores = best_blended[idx_array, best_preds]
-
-        predictions = []
-        for i, idx in enumerate(val_indices_filtered):
-            predictions.append({
-                'index': int(idx),
-                'path': val_paths[i] if i < len(val_paths) else 'unknown',
-                'label': int(labels_np[i]),
-                'apt_pred': int(apt_preds[i]),
-                'graph_pred': int(graph_preds[i]),
-                'final_pred': int(best_preds[i]),
-                'apt_score': float(apt_scores[i]),
-                'graph_prob': float(graph_scores[i]),
-                'final_score': float(final_scores[i]),
-            })
-
-        results = {
-            'support_size': int(len(ordered_support)),
-            'labeled_support': int(len(self.labeled_indices)),
-            'unlabeled_support': int(len(self.unlabeled_indices)),
-            'validation_size': int(len(val_indices_filtered)),
-            'k': int(k),
-            'k_prime': int(k_prime),
-            'alpha': float(alpha),
-            'max_iter': int(max_iter),
-            'tol': float(tol),
-            'sigma': float(sigma),
-            'epsilon': float(epsilon),
-            'lambda_metrics': lambda_metrics,
-            'best_lambda': float(best_lambda),
-            'best_accuracy': float(best_accuracy),
-        }
-
-        results_path = os.path.join(self.run_dir, 'dn4_results.json')
-        predictions_path = os.path.join(self.run_dir, 'dn4_val_predictions.json')
-
-        with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        with open(predictions_path, 'w') as f:
-            json.dump(predictions, f, indent=2)
-
-        summary = (
-            f"DN4 mode completed: lambda={best_lambda:.2f}, accuracy={best_accuracy:.2f}% "
-            f"on {len(val_indices_filtered)} validation samples."
-        )
-        print(summary)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(summary + '\n')
 
     def _finalize(self):
         if self.trainer is None:

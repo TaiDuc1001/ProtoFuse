@@ -436,58 +436,6 @@ def plot_coreset_embedding_tsne(
     _plot_embedding_projection(coords, statuses, 't-SNE', round_idx, output_path, log_file)
 
 
-def log_decoded_prompts(
-    decoded_prompts: Optional[List[List[Dict[str, str]]]],
-    sample_cache: Dict[str, Any],
-    log_file: Optional[str],
-    epoch: int,
-) -> None:
-    if not decoded_prompts:
-        return
-
-    prompt_str = f"Generated captions from learned prompts for epoch {epoch}:"
-    print(prompt_str)
-    lines = [prompt_str]
-
-    sample_paths = sample_cache.get('paths', []) if sample_cache else []
-    labels_tensor = sample_cache.get('labels') if sample_cache else None
-
-    for i, image_prompts in enumerate(decoded_prompts):
-        image_path = sample_paths[i] if i < len(sample_paths) else "Unknown path"
-        label_value = None
-        if isinstance(labels_tensor, torch.Tensor) and labels_tensor.numel() > i:
-            try:
-                label_value = int(labels_tensor[i])
-            except Exception:
-                label_value = None
-
-        image_str = f"Image ({image_path}):"
-        print(image_str)
-        lines.append(image_str)
-
-        selected_prompt = None
-        if label_value is not None:
-            for prompt in image_prompts:
-                if prompt.get('class_id') == label_value:
-                    selected_prompt = prompt
-                    break
-        if selected_prompt is None and image_prompts:
-            selected_prompt = image_prompts[0]
-
-        class_id = selected_prompt.get('class_id', 'unknown') if selected_prompt else 'unknown'
-        class_name = selected_prompt.get('class_name', f"Class_{class_id}") if selected_prompt else 'unknown'
-        caption = selected_prompt.get('generated_caption', 'No caption generated') if selected_prompt else 'No caption generated'
-        caption_line = f"  Class {class_id} ({class_name}): {caption}"
-        print(caption_line)
-        lines.append(caption_line)
-
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            for line in lines:
-                f.write(line + '\n')
-            f.write('\n')
-
-
 def visualize_attention_maps(
     trainer,
     dataset,
