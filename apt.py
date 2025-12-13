@@ -38,6 +38,7 @@ from apt_ssl import (
     LinearClassifier,
     ImageSSLModel,
     DINOMultiCropTransform,
+    FusionWeightLearner,
     create_teacher_from_student,
     update_teacher_ema,
     get_cosine_ema_momentum,
@@ -1155,6 +1156,7 @@ class APTTrainingPipeline:
         self.ssl_teacher = None
         self.ssl_classifier = None
         self.ssl_center = None
+        self.fusion_weights = None
 
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
@@ -1221,6 +1223,8 @@ class APTTrainingPipeline:
         if self.use_ssl:
             self._train_ssl_stage1()
             self._train_ssl_stage2()
+            if self.ssl_cfg.get('learn_fusion', False):
+                self._train_ssl_stage3()
             self._run_dual_branch_eval()
         self._run_dn4_mode()
         self._finalize()
@@ -1682,6 +1686,94 @@ class APTTrainingPipeline:
             acc = 100 * correct / total
             print(f"  Linear Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
 
+    def _train_ssl_stage3(self):
+        if self.dataset is None or self.trainer is None:
+            print("SSL Stage 3 skipped: pipeline not initialized.")
+            return
+        if self.ssl_student is None or self.ssl_classifier is None:
+            print("SSL Stage 3 skipped: Stage 2 not completed.")
+            return
+        if not self.train_indices:
+            print("SSL Stage 3 skipped: no labeled data available.")
+            return
+
+        fusion_max_iter = coerce_to_int(self.ssl_cfg.get('fusion_max_iter', 20), 20)
+        fusion_lr = coerce_to_float(self.ssl_cfg.get('fusion_lr', 1.0), 1.0)
+
+        print(f"\n[SSL Stage 3] Training fusion weights with LBFGS")
+        print(f"[DEBUG] fusion_max_iter={fusion_max_iter}, fusion_lr={fusion_lr}")
+
+        self.fusion_weights = FusionWeightLearner().to(self.device)
+
+        self.trainer.model.eval()
+        self.ssl_student.encoder.eval()
+        self.ssl_classifier.eval()
+
+        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+        all_apt_logits = []
+        all_img_logits = []
+        all_labels = []
+
+        with torch.no_grad():
+            for images, labels in train_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                logits_apt = self.trainer.model(images)
+                if isinstance(logits_apt, (list, tuple)):
+                    logits_apt = logits_apt[0]
+
+                if self.trainer.cache_adapter is not None:
+                    visual_out = self.trainer.model.vis_encoder(images)
+                    img_feats = visual_out[1]
+                    logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
+
+                visual_out = self.ssl_student.encoder(images)
+                if isinstance(visual_out, tuple):
+                    _, cls_feat = visual_out
+                else:
+                    cls_feat = visual_out
+                logits_img = self.ssl_classifier(cls_feat)
+
+                all_apt_logits.append(logits_apt)
+                all_img_logits.append(logits_img)
+                all_labels.append(labels)
+
+        all_apt_logits = torch.cat(all_apt_logits, dim=0)
+        all_img_logits = torch.cat(all_img_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        fusion_optimizer = torch.optim.LBFGS(
+            self.fusion_weights.parameters(),
+            lr=fusion_lr,
+            max_iter=fusion_max_iter,
+            line_search_fn='strong_wolfe'
+        )
+
+        iteration = [0]
+
+        def closure():
+            fusion_optimizer.zero_grad()
+            logits_fused = self.fusion_weights(all_apt_logits, all_img_logits)
+            loss = F.cross_entropy(logits_fused, all_labels)
+            loss.backward()
+            iteration[0] += 1
+            if iteration[0] % 5 == 0 or iteration[0] == 1:
+                with torch.no_grad():
+                    _, predicted = torch.max(logits_fused, 1)
+                    acc = 100 * (predicted == all_labels).sum().item() / len(all_labels)
+                    w1, w2 = self.fusion_weights.get_weights()
+                    print(f"  LBFGS iter {iteration[0]} - loss={loss.item():.4f} - acc={acc:.2f}% - w1={w1:.4f}, w2={w2:.4f}")
+            return loss
+
+        self.fusion_weights.train()
+        fusion_optimizer.step(closure)
+
+        w1, w2 = self.fusion_weights.get_weights()
+        print(f"\n[SSL Stage 3] Learned fusion weights: w1={w1:.4f}, w2={w2:.4f}")
+
     def _run_dual_branch_eval(self):
         if self.val_loader is None:
             print("Dual-branch evaluation skipped: no validation data available.")
@@ -1763,6 +1855,19 @@ class APTTrainingPipeline:
             print(f"  Both wrong:        {both_wrong:5d} ({100*both_wrong/len(all_labels):.2f}%)")
             print(f"  Disagreement rate: {100*(apt_correct != img_correct).float().mean():.2f}%")
 
+            if self.fusion_weights is not None:
+                self.fusion_weights.eval()
+                with torch.no_grad():
+                    logits_fused = self.fusion_weights(all_apt_logits, all_img_logits)
+                prob_fused = F.softmax(logits_fused, dim=-1)
+                _, pred_fused = torch.max(prob_fused, 1)
+                pred_fused = pred_fused.cpu()
+                learned_acc = 100 * (pred_fused == all_labels).sum().item() / len(all_labels)
+                w1, w2 = self.fusion_weights.get_weights()
+                print(f"\n[Learned Fusion] Accuracy: {learned_acc:.2f}% (w1={w1:.4f}, w2={w2:.4f})")
+            else:
+                learned_acc = None
+
             print(f"\n{'Fusion Weight':<15} {'Fused Acc':>12}")
             print("-" * 30)
 
@@ -1785,8 +1890,10 @@ class APTTrainingPipeline:
                     best_weight = w
 
             print("-" * 30)
+            if learned_acc is not None:
+                print(f"Learned (w1, w2): {learned_acc:.2f}% (+{learned_acc - apt_acc:.2f}%)")
             if best_weight > 0:
-                print(f"Best fusion: w={best_weight:.1f} -> {best_fused_acc:.2f}% (+{best_fused_acc - apt_acc:.2f}%)")
+                print(f"Best scalar fusion: w={best_weight:.1f} -> {best_fused_acc:.2f}% (+{best_fused_acc - apt_acc:.2f}%)")
             else:
                 print(f"Best: APT only -> {apt_acc:.2f}%")
         else:
@@ -1794,6 +1901,7 @@ class APTTrainingPipeline:
             fusion_results = {}
             best_weight = None
             best_fused_acc = None
+            learned_acc = None
 
         print("=" * 60 + "\n")
 
@@ -1803,6 +1911,7 @@ class APTTrainingPipeline:
             'fusion_results': fusion_results,
             'best_weight': best_weight,
             'best_fused_acc': best_fused_acc,
+            'learned_acc': learned_acc,
         }
 
     def _evaluate_with_ssl_fusion(self, dataloader):
@@ -1817,7 +1926,6 @@ class APTTrainingPipeline:
         all_preds = []
         all_labels_list = []
 
-        fusion_weight = coerce_to_float(self.ssl_cfg.get('fusion_weight', 0.5), 0.5) if self.use_ssl else 0.0
         use_ssl_fusion = self.use_ssl and self.ssl_student is not None and self.ssl_classifier is not None
 
         if use_ssl_fusion:
@@ -1839,16 +1947,15 @@ class APTTrainingPipeline:
                     img_feats = visual_out[1]
                     logits_apt = self.trainer.cache_adapter(img_feats, logits_apt)
 
-                if use_ssl_fusion:
+                if use_ssl_fusion and self.fusion_weights is not None:
                     visual_out = self.ssl_student.encoder(images)
                     if isinstance(visual_out, tuple):
                         _, cls_feat = visual_out
                     else:
                         cls_feat = visual_out
                     logits_img = self.ssl_classifier(cls_feat)
-
-                    logits_fused = (1 - fusion_weight) * logits_apt + fusion_weight * logits_img
-                    logits = logits_fused
+                    self.fusion_weights.eval()
+                    logits = self.fusion_weights(logits_apt, logits_img)
                 else:
                     logits = logits_apt
 

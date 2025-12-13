@@ -29,6 +29,25 @@ class LinearClassifier(nn.Module):
         return self.fc(x)
 
 
+class FusionWeightLearner(nn.Module):
+    def __init__(self, num_classes=None, init_w1=1.0, init_w2=1.0):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.tensor(init_w1))
+        self.w2 = nn.Parameter(torch.tensor(init_w2))
+
+    def forward(self, logits_apt, logits_img):
+        device = self.w1.device
+        logits_apt = logits_apt.to(device)
+        logits_img = logits_img.to(device)
+        apt_centered = logits_apt - logits_apt.mean(dim=-1, keepdim=True)
+        img_centered = logits_img - logits_img.mean(dim=-1, keepdim=True)
+        fused = self.w1 * apt_centered + self.w2 * img_centered
+        return fused
+
+    def get_weights(self):
+        return self.w1.detach().item(), self.w2.detach().item()
+
+
 class TransformerAdapter(nn.Module):
     def __init__(self, feature_dim, num_layers=1, num_heads=8, dropout=0.0):
         super().__init__()

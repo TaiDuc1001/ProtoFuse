@@ -65,7 +65,9 @@ ssl:
   eval_linear_epochs: 15
   linear_epochs: 5
   linear_lr: 0.001
-  fusion_weight: 0.5
+  fusion_max_iter: 20
+  fusion_lr: 0.001
+  learn_fusion: true
   num_trans_layers: 1
   num_heads: 8
   global_crop_size: 224
