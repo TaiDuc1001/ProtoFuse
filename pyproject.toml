@@ -7,9 +7,11 @@ requires-python = ">=3.12"
 dependencies = [
     "gdown>=5.2.0",
     "kaggle>=1.7.4.5",
+    "loguru>=0.7.3",
     "matplotlib>=3.0.0",
     "openai-clip>=1.0.1",
     "opencv-python>=4.12.0.88",
+    "rich>=14.2.0",
     "scikit-learn>=1.0.0",
     "seaborn>=0.13.2",
     "thop>=0.1.1.post2209072238",

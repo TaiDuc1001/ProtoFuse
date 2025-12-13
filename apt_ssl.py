@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
+from utils import logger
 
 
 class SSLHead(nn.Module):
@@ -156,7 +157,7 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
     attn_weights = attn_weights_list[-1]
     
     if attn_weights is None:
-        print("  [VIS] Could not capture attention weights")
+        logger.warning("Could not capture attention weights")
         return
     
     B, num_heads, seq_len, _ = attn_weights.shape
@@ -228,7 +229,7 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
-    print(f"  [VIS] Saved DINO-style attention visualizations to {output_dir}")
+    logger.debug(f"Saved DINO attention visualizations")
     model.train()
 
 

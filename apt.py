@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import math
 import copy
@@ -21,6 +22,8 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from typing import Any, Dict, List, Optional
 from utils import (
+    logger,
+    setup_logging,
     run_dataset_eda,
     save_class_distribution_plot,
     save_confusion_artifacts,
@@ -45,6 +48,7 @@ ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
     'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
     'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
+    'debug': {'type': bool, 'help': 'Enable debug output', 'default': False},
 }
 
 
@@ -607,7 +611,7 @@ def load_clip_to_cpu(backbone_name):
     return model
 
 class APT:
-    def __init__(self, cfg, classnames, device="cuda", log_file=None):
+    def __init__(self, cfg, classnames, device="cuda"):
         if not isinstance(cfg, ConfigNode):
             cfg = ConfigNode(cfg)
         self.cfg = cfg
@@ -617,7 +621,6 @@ class APT:
         self.cache_cfg = self.cfg.get('cache', ConfigNode())
         self.classnames = classnames
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.log_file = log_file
         
         self.gradients = None
         self.activations = None
@@ -633,7 +636,7 @@ class APT:
             value = get_config_value(self.cfg, path, sentinel)
             if value is not sentinel:
                 return value
-            print(f"Config path '{path}' not found. Using default value: {default}")
+            logger.debug(f"Config path '{path}' not found. Using default: {default}")
         return default
     
     def _cfg_float(self, default, *paths):
@@ -650,11 +653,7 @@ class APT:
     
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
-        msg = f"Loading CLIP (backbone: {backbone_name})"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
         clip_model = load_clip_to_cpu(backbone_name)
         
@@ -700,17 +699,7 @@ class APT:
             del model_copy
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        msg = f"Learnable parameters: {format_params(learnable_params)} / Total parameters: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
-
-        msg = "Turning off gradients in both the image and the text encoder"
-        # print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Learnable parameters: {format_params(learnable_params)} / Total: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)")
         
         trainable_names = set(self.model.get_trainable_parameter_names())
         for name, param in self.model.named_parameters():
@@ -720,11 +709,7 @@ class APT:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
-        msg = f"Parameters to be updated: {enabled}"
-        # print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+
 
         self.model.to(self.device)
         self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
@@ -826,10 +811,7 @@ class APT:
             'cfg': self.cfg
         }
         torch.save(checkpoint, path)
-        msg = f"Model saved to {path}"
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Model saved to {path}")
     
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
@@ -840,11 +822,7 @@ class APT:
             self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        msg = f"Model loaded from {path}"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Model loaded from {path}")
 
     def generate_gradcam(self, images, target_classes):
         original_mode = self.model.training
@@ -885,7 +863,7 @@ class APT:
             
             if target_unpooled.grad is None:
                 gradcams.append(np.zeros((8, 8)))
-                print("Warning: Empty CAM encountered.")
+                logger.warning("Empty CAM encountered")
                 continue
             gradients = target_unpooled.grad[i]
             activations = target_unpooled[i]
@@ -902,9 +880,9 @@ class APT:
                     cam = cam.reshape(grid_size, grid_size)
                 else:
                     cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
-                    print("Warning: CAM size is not a perfect square, padding to make it square.")
+                    logger.warning("CAM size is not a perfect square, padding")
             else:
-                print("Warning: Empty CAM encountered.")
+                logger.warning("Empty CAM encountered")
                 cam = np.zeros((8, 8))
             
             gradcams.append(cam)
@@ -962,14 +940,13 @@ class APTTrainingPipeline:
         base_output = coerce_to_str(base_output_value, "outputs", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
-        print(f"Run directory: {self.run_dir}")
+        logger.info(f"Run directory: {self.run_dir}")
         self.selection_log_path = os.path.join(self.run_dir, 'al_selected_paths.log')
         self.config_path = os.path.join(self.run_dir, 'config.json')
         self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
         self.final_prompts_path = os.path.join(self.run_dir, 'final_prompts.json')
         self.best_model_path = os.path.join(self.run_dir, 'best.pt')
         self.last_model_path = os.path.join(self.run_dir, 'last.pt')
-        self.log_file = os.path.join(self.run_dir, 'training.log')
         self.eda_dir = os.path.join(self.run_dir, 'eda')
 
         self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
@@ -1032,7 +1009,7 @@ class APTTrainingPipeline:
             cache_dir = checkpoint_cfg.get('cache_dir', DEFAULT_CHECKPOINT_DIR)
             self.checkpoint_cache = CheckpointCache(cache_dir)
             self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
-            print(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+            logger.info(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
 
     def _try_load_checkpoint(self) -> bool:
         if self.checkpoint_cache is None or self.checkpoint_id is None:
@@ -1051,7 +1028,7 @@ class APTTrainingPipeline:
         self.unlabeled_indices = ckpt['unlabeled_indices']
         self.metrics = ckpt['metrics']
         self.global_epoch = len(self.metrics)
-        print(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
         return True
 
     def _save_checkpoint(self):
@@ -1069,28 +1046,40 @@ class APTTrainingPipeline:
             self.metrics,
             self.config
         )
-        print(f"Saved checkpoint to: {path}")
+        logger.debug(f"Saved checkpoint to: {path}")
 
     def run(self):
         set_global_seed(self.seed)
+        
+        logger.section("Initialization", "config")
         self._prepare_directories()
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
+        
+        logger.section("APT Training", "train")
         self._train_epochs()
+        
         if self.use_ssl:
+            logger.section("SSL Stage 1: Self-Supervised Learning", "model")
             self._train_ssl_stage1()
+            
+            logger.section("SSL Stage 2: Linear Classifier Training", "train")
             self._train_ssl_stage2()
+            
             if self.ssl_cfg.get('learn_fusion', False):
+                logger.section("SSL Stage 3: Fusion Weight Learning", "train")
                 self._train_ssl_stage3()
+            
+            logger.section("Dual-Branch Evaluation", "eval")
             self._run_dual_branch_eval()
+        
+        logger.section("Finalization", "save")
         self._finalize()
 
     def _prepare_directories(self):
         os.makedirs(self.run_dir, exist_ok=True)
         os.makedirs(self.eda_dir, exist_ok=True)
-        with open(self.log_file, 'w') as f:
-            f.write('')
 
     def _build_transforms(self):
         base_transforms = [
@@ -1101,7 +1090,7 @@ class APTTrainingPipeline:
         ]
         if bool(get_config_value(self.training_cfg, "use_cutout", False)):
             base_transforms.append(transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0))
-            print("Using Cutout (RandomErasing) augmentation.")
+            logger.debug("Using Cutout (RandomErasing) augmentation")
         return transforms.Compose(base_transforms)
 
     def _load_dataset(self):
@@ -1156,7 +1145,7 @@ class APTTrainingPipeline:
             val_ds = Subset(self.dataset, self.val_indices)
             self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         else:
-            print("Warning: validation split is empty; skipping validation metrics.")
+            logger.warning("Validation split is empty; skipping validation metrics")
 
         self.classnames = list(self.dataset.classes)
 
@@ -1168,20 +1157,13 @@ class APTTrainingPipeline:
             'unlabeled_count': len(self.unlabeled_indices),
             'train_pool_size': len(self.train_indices) + len(self.unlabeled_indices)
         }
-        print(f"Dataset loaded: {stats['total_images']} total images.")
+        logger.info(f"Dataset loaded: {stats['total_images']} total images")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
-        print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
-        print(f"Train split size: {stats['train_count']} images.")
-        if stats['unlabeled_count'] > 0:
-            print(f"Unlabeled pool size: {stats['unlabeled_count']} images.")
+        logger.info(f"Validation: {stats['val_count']} ({val_percentage:.2f}%), Train: {stats['train_count']}, Unlabeled: {stats['unlabeled_count']}")
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
             json.dump(trainer_cfg.to_dict(), f, indent=4)
-
-        with open(self.log_file, 'a') as f:
-            f.write(f"Config: {trainer_cfg.to_dict()}\n\n")
-            f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
@@ -1205,13 +1187,13 @@ class APTTrainingPipeline:
     def _initialize_trainer(self):
         if not self.classnames:
             raise RuntimeError("Class names unavailable before trainer initialization.")
-        self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device), log_file=self.log_file)
+        self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device))
 
     def _train_ssl_stage1(self):
         if self.dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before SSL training.")
         if not self.unlabeled_indices:
-            print("SSL Stage 1 skipped: no unlabeled data available.")
+            logger.warning("SSL Stage 1 skipped: no unlabeled data available")
             return
 
         feature_dim = self.trainer.model.vis_encoder.proj.shape[1]
@@ -1241,12 +1223,11 @@ class APTTrainingPipeline:
             num_unlabeled = coerce_to_int(num_unlabeled, len(self.unlabeled_indices))
         num_plot = coerce_to_int(self.ssl_cfg.get('num_plot', 0), 0)
 
-        print(f"[DEBUG] SSL Stage 1 config: feature_dim={feature_dim}, proj_dim={proj_dim}, num_prototypes={num_prototypes}")
-        print(f"[DEBUG] SSL Stage 1 config: ssl_lr={ssl_lr}, teacher_temp={teacher_temp}, student_temp={student_temp}")
-        print(f"[DEBUG] SSL Stage 1 config: base_ema_momentum={base_ema_momentum}, final_ema_momentum={final_ema_momentum}")
-        print(f"[DEBUG] SSL Stage 1 config: center_momentum={center_momentum}, num_trans_layers={num_trans_layers}, num_heads={num_heads}")
-        print(f"[DEBUG] SSL Stage 1 config: eval_freq={eval_freq}, eval_linear_epochs={eval_linear_epochs}")
-        print(f"[DEBUG] Multi-crop config: global={global_crop_size}, local={local_crop_size}, num_local={num_local_crops}")
+        logger.debug(f"SSL Stage 1 config: feature_dim={feature_dim}, proj_dim={proj_dim}, num_prototypes={num_prototypes}")
+        logger.debug(f"SSL Stage 1 config: ssl_lr={ssl_lr}, teacher_temp={teacher_temp}, student_temp={student_temp}")
+        logger.debug(f"SSL Stage 1 config: ema_momentum={base_ema_momentum}->{final_ema_momentum}, center_momentum={center_momentum}")
+        logger.debug(f"SSL Stage 1 config: trans_layers={num_trans_layers}, heads={num_heads}, eval_freq={eval_freq}")
+        logger.debug(f"Multi-crop config: global={global_crop_size}, local={local_crop_size}, num_local={num_local_crops}")
 
         self.ssl_student = ImageSSLModel(
             copy.deepcopy(self.trainer.model.vis_encoder),
@@ -1261,8 +1242,8 @@ class APTTrainingPipeline:
         self.ssl_center = torch.zeros(num_prototypes, device=self.device)
 
         trainable_params = sum(p.numel() for p in self.ssl_student.parameters() if p.requires_grad)
-        print(f"[DEBUG] SSL student trainable params: {trainable_params:,}")
-        print(f"[DEBUG] SSL center shape: {self.ssl_center.shape}")
+        logger.debug(f"SSL student trainable params: {trainable_params:,}")
+        logger.debug(f"SSL center shape: {self.ssl_center.shape}")
 
         ssl_optimizer = torch.optim.AdamW(
             [p for p in self.ssl_student.parameters() if p.requires_grad],
@@ -1296,7 +1277,7 @@ class APTTrainingPipeline:
         ssl_unlabeled_indices = self.unlabeled_indices
         if num_unlabeled is not None and num_unlabeled < len(ssl_unlabeled_indices):
             ssl_unlabeled_indices = ssl_unlabeled_indices[:num_unlabeled]
-            print(f"[DEBUG] Limited unlabeled samples to {num_unlabeled}")
+            logger.debug(f"Limited unlabeled samples to {num_unlabeled}")
 
         ssl_dataset = DINODataset(self.dataset, ssl_unlabeled_indices, dino_transform)
         ssl_loader = DataLoader(
@@ -1341,10 +1322,10 @@ class APTTrainingPipeline:
                 self.ssl_vis_paths.append(path)
             self.ssl_vis_images = torch.stack(self.ssl_vis_images)
 
-        print(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_unlabeled_indices)} unlabeled samples")
+        logger.info(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_unlabeled_indices)} unlabeled samples")
         for epoch in range(1, ssl_epochs + 1):
             if self.ssl_student is None:
-                print("SSL student is None, skipping epoch")
+                logger.warning("SSL student is None, skipping epoch")
                 return
             self.ssl_student.train()
             running_loss = 0.0
@@ -1393,21 +1374,30 @@ class APTTrainingPipeline:
                 steps += 1
 
             avg_loss = running_loss / max(1, steps)
-            print(f"  SSL Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - time={time.time() - start_time:.2f}s")
+            epoch_time = time.time() - start_time
+
+            ssl1_epoch_dir = os.path.join(self.run_dir, 'ssl_stage1', f'epoch_{epoch:03d}')
+            os.makedirs(ssl1_epoch_dir, exist_ok=True)
+            epoch_result = {'epoch': epoch, 'loss': avg_loss, 'time': epoch_time}
+            with open(os.path.join(ssl1_epoch_dir, 'result.json'), 'w') as f:
+                json.dump(epoch_result, f, indent=2)
+
+            logger.info(f"  SSL1 Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - {epoch_time:.2f}s")
 
             if epoch % eval_freq == 0 or epoch == ssl_epochs:
-                start_time = time.time()
+                eval_start = time.time()
                 linear_acc = self._run_linear_eval(feature_dim, eval_linear_epochs)
-                print(f"  [EVAL] Linear evaluation acc: {linear_acc:.2f}% - time={time.time() - start_time:.2f}s")
+                logger.info(f"  [EVAL] Linear acc: {linear_acc:.2f}% - {time.time() - eval_start:.2f}s")
                 
                 if self.ssl_vis_images is not None:
-                    vis_dir = os.path.join(self.run_dir, 'ssl_attention')
+                    ssl_attn_dir = os.path.join(ssl1_epoch_dir, 'ssl_attention')
+                    os.makedirs(ssl_attn_dir, exist_ok=True)
                     visualize_dino_attention(
                         self.ssl_student,
                         self.ssl_vis_images,
                         self.ssl_vis_paths,
                         epoch,
-                        vis_dir,
+                        ssl_attn_dir,
                         self.clip_mean,
                         self.clip_std
                     )
@@ -1416,7 +1406,7 @@ class APTTrainingPipeline:
         if not self.train_indices or self.val_loader is None:
             return 0.0
         if self.ssl_student is None or self.dataset is None:
-            print("Linear evaluation skipped: SSL student or dataset not available.")
+            logger.warning("Linear evaluation skipped: SSL student or dataset not available")
             return 0.0
 
         eval_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
@@ -1477,20 +1467,20 @@ class APTTrainingPipeline:
 
     def _train_ssl_stage2(self):
         if self.dataset is None or self.trainer is None or self.ssl_student is None:
-            print("SSL Stage 2 skipped: Stage 1 not completed.")
+            logger.warning("SSL Stage 2 skipped: Stage 1 not completed")
             return
         if not self.train_indices:
-            print("SSL Stage 2 skipped: no labeled data available.")
+            logger.warning("SSL Stage 2 skipped: no labeled data available")
             return
 
         feature_dim = self.trainer.model.vis_encoder.proj.shape[1]
         linear_epochs = coerce_to_int(self.ssl_cfg.get('linear_epochs', 10), 10)
         linear_lr = coerce_to_float(self.ssl_cfg.get('linear_lr', 0.001), 0.001)
 
-        print(f"[DEBUG] SSL Stage 2 config: feature_dim={feature_dim}, linear_epochs={linear_epochs}, linear_lr={linear_lr}")
+        logger.debug(f"SSL Stage 2 config: feature_dim={feature_dim}, epochs={linear_epochs}, lr={linear_lr}")
 
         if self.ssl_student is None:
-            print("SSL student is None, skipping stage 2")
+            logger.warning("SSL student is None, skipping stage 2")
             return
         
         for param in self.ssl_student.encoder.parameters():
@@ -1499,13 +1489,13 @@ class APTTrainingPipeline:
         self.ssl_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
         linear_optimizer = torch.optim.AdamW(self.ssl_classifier.parameters(), lr=linear_lr)
 
-        print(f"[DEBUG] SSL classifier params: {sum(p.numel() for p in self.ssl_classifier.parameters()):,}")
-        print(f"[DEBUG] Encoder frozen: {not any(p.requires_grad for p in self.ssl_student.encoder.parameters())}")
+        logger.debug(f"SSL classifier params: {sum(p.numel() for p in self.ssl_classifier.parameters()):,}")
+        logger.debug(f"Encoder frozen: {not any(p.requires_grad for p in self.ssl_student.encoder.parameters())}")
 
         train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
-        print(f"SSL Stage 2: {linear_epochs} epochs on {len(self.train_indices)} labeled samples")
+        logger.info(f"SSL Stage 2: {linear_epochs} epochs on {len(self.train_indices)} labeled samples")
         for epoch in range(1, linear_epochs + 1):
             self.ssl_student.encoder.eval()
             self.ssl_classifier.train()
@@ -1536,24 +1526,30 @@ class APTTrainingPipeline:
 
             avg_loss = running_loss / max(1, len(train_loader))
             acc = 100 * correct / total
-            print(f"  Linear Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
+
+            ssl2_epoch_dir = os.path.join(self.run_dir, 'ssl_stage2', f'epoch_{epoch:03d}')
+            os.makedirs(ssl2_epoch_dir, exist_ok=True)
+            epoch_result = {'epoch': epoch, 'loss': avg_loss, 'acc': acc}
+            with open(os.path.join(ssl2_epoch_dir, 'result.json'), 'w') as f:
+                json.dump(epoch_result, f, indent=2)
+
+            logger.info(f"  SSL2 Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
 
     def _train_ssl_stage3(self):
         if self.dataset is None or self.trainer is None:
-            print("SSL Stage 3 skipped: pipeline not initialized.")
+            logger.warning("SSL Stage 3 skipped: pipeline not initialized")
             return
         if self.ssl_student is None or self.ssl_classifier is None:
-            print("SSL Stage 3 skipped: Stage 2 not completed.")
+            logger.warning("SSL Stage 3 skipped: Stage 2 not completed")
             return
         if not self.train_indices:
-            print("SSL Stage 3 skipped: no labeled data available.")
+            logger.warning("SSL Stage 3 skipped: no labeled data")
             return
 
         fusion_max_iter = coerce_to_int(self.ssl_cfg.get('fusion_max_iter', 20), 20)
         fusion_lr = coerce_to_float(self.ssl_cfg.get('fusion_lr', 1.0), 1.0)
 
-        print("\n[SSL Stage 3] Training fusion weights with LBFGS")
-        print(f"[DEBUG] fusion_max_iter={fusion_max_iter}, fusion_lr={fusion_lr}")
+        logger.info(f"SSL Stage 3: Training fusion weights (max_iter={fusion_max_iter}, lr={fusion_lr})")
 
         self.fusion_weights = FusionWeightLearner().to(self.device)
 
@@ -1614,26 +1610,35 @@ class APTTrainingPipeline:
                     _, predicted = torch.max(logits_fused, 1)
                     acc = 100 * (predicted == all_labels).sum().item() / len(all_labels)
                     w1, w2 = self.fusion_weights.get_weights()
-                    print(f"  LBFGS iter {iteration[0]} - loss={loss.item():.4f} - acc={acc:.2f}% - w1={w1:.4f}, w2={w2:.4f}")
+                    logger.info(f"  LBFGS iter {iteration[0]} - loss={loss.item():.4f} - acc={acc:.2f}% - w1={w1:.4f}, w2={w2:.4f}")
             return loss
 
         self.fusion_weights.train()
         fusion_optimizer.step(closure)
 
         w1, w2 = self.fusion_weights.get_weights()
-        print(f"\n[SSL Stage 3] Learned fusion weights: w1={w1:.4f}, w2={w2:.4f}")
+        with torch.no_grad():
+            logits_fused = self.fusion_weights(all_apt_logits, all_img_logits)
+            _, predicted = torch.max(logits_fused, 1)
+            train_acc = 100 * (predicted == all_labels).sum().item() / len(all_labels)
+
+        ssl3_dir = os.path.join(self.run_dir, 'ssl_stage3')
+        os.makedirs(ssl3_dir, exist_ok=True)
+        stage3_result = {'w1': w1, 'w2': w2, 'train_acc': train_acc}
+        with open(os.path.join(ssl3_dir, 'result.json'), 'w') as f:
+            json.dump(stage3_result, f, indent=2)
+
+        logger.info(f"SSL Stage 3: w1={w1:.4f}, w2={w2:.4f}, train_acc={train_acc:.2f}%")
 
     def _run_dual_branch_eval(self):
         if self.val_loader is None:
-            print("Dual-branch evaluation skipped: no validation data available.")
+            logger.warning("Dual-branch evaluation skipped: no validation data")
             return
         if self.trainer is None:
-            print("Dual-branch evaluation skipped: trainer not initialized.")
+            logger.warning("Dual-branch evaluation skipped: trainer not initialized")
             return
 
-        print("\n" + "=" * 60)
-        print("DUAL-BRANCH EVALUATION ON VALIDATION SET")
-        print("=" * 60)
+        logger.info("\n" + "=" * 50 + " EVALUATION " + "=" * 50)
 
         self.trainer.model.eval()
 
@@ -1675,7 +1680,7 @@ class APTTrainingPipeline:
         all_apt_probs = F.softmax(all_apt_logits, dim=-1)
         _, pred_apt = torch.max(all_apt_probs, 1)
         apt_acc = 100 * (pred_apt == all_labels).sum().item() / len(all_labels)
-        print(f"\n[APT Branch]   Accuracy: {apt_acc:.2f}%")
+        logger.info(f"APT Branch Accuracy: {apt_acc:.2f}%")
 
         if use_ssl_branch:
             all_img_logits = torch.cat(all_img_logits, dim=0)
@@ -1683,7 +1688,7 @@ class APTTrainingPipeline:
             all_img_probs = F.softmax(all_img_logits, dim=-1)
             _, pred_img = torch.max(all_img_probs, 1)
             img_acc = 100 * (pred_img == all_labels).sum().item() / len(all_labels)
-            print(f"[Image Branch] Accuracy: {img_acc:.2f}%")
+            logger.info(f"Image Branch Accuracy: {img_acc:.2f}%")
 
             apt_correct = (pred_apt == all_labels)
             img_correct = (pred_img == all_labels)
@@ -1692,12 +1697,8 @@ class APTTrainingPipeline:
             img_only_correct = (~apt_correct & img_correct).sum().item()
             both_wrong = (~apt_correct & ~img_correct).sum().item()
             
-            print("\n[DEBUG] Complementarity Analysis:")
-            print(f"  Both correct:      {both_correct:5d} ({100*both_correct/len(all_labels):.2f}%)")
-            print(f"  APT only correct:  {apt_only_correct:5d} ({100*apt_only_correct/len(all_labels):.2f}%)")
-            print(f"  Img only correct:  {img_only_correct:5d} ({100*img_only_correct/len(all_labels):.2f}%)")
-            print(f"  Both wrong:        {both_wrong:5d} ({100*both_wrong/len(all_labels):.2f}%)")
-            print(f"  Disagreement rate: {100*(apt_correct != img_correct).float().mean():.2f}%")
+            logger.debug(f"Both correct: {both_correct} ({100*both_correct/len(all_labels):.1f}%), APT only: {apt_only_correct}, Img only: {img_only_correct}, Both wrong: {both_wrong}")
+            logger.debug(f"Disagreement rate: {100*(apt_correct != img_correct).float().mean():.2f}%")
 
             if self.fusion_weights is not None:
                 self.fusion_weights.eval()
@@ -1708,12 +1709,11 @@ class APTTrainingPipeline:
                 pred_fused = pred_fused.cpu()
                 learned_acc = 100 * (pred_fused == all_labels).sum().item() / len(all_labels)
                 w1, w2 = self.fusion_weights.get_weights()
-                print(f"\n[Learned Fusion] Accuracy: {learned_acc:.2f}% (w1={w1:.4f}, w2={w2:.4f})")
+                logger.info(f"Learned Fusion Accuracy: {learned_acc:.2f}% (w1={w1:.4f}, w2={w2:.4f})")
             else:
                 learned_acc = None
 
-            print(f"\n{'Fusion Weight':<15} {'Fused Acc':>12}")
-            print("-" * 30)
+            logger.info("Fusion Weight Grid:")
 
             best_weight = 0.0
             best_fused_acc = apt_acc
@@ -1725,31 +1725,26 @@ class APTTrainingPipeline:
                 _, pred_fused = torch.max(prob_fused, 1)
                 fused_acc = 100 * (pred_fused == all_labels).sum().item() / len(all_labels)
                 fusion_results[w] = fused_acc
-                apt_weight_pct = 100 * (1 - w)
-                img_weight_pct = 100 * w
-                print(f"w = {w:.1f} (APT:{apt_weight_pct:3.0f}% IMG:{img_weight_pct:3.0f}%)  {fused_acc:>7.2f}%")
+                logger.info(f"  w={w:.1f} (APT:{100*(1-w):.0f}% IMG:{100*w:.0f}%) → {fused_acc:.2f}%")
 
                 if fused_acc > best_fused_acc:
                     best_fused_acc = fused_acc
                     best_weight = w
 
-            print("-" * 30)
             if learned_acc is not None:
-                print(f"Learned (w1, w2): {learned_acc:.2f}% (+{learned_acc - apt_acc:.2f}%)")
+                logger.info(f"Learned (w1,w2): {learned_acc:.2f}% (+{learned_acc - apt_acc:.2f}%)")
             if best_weight > 0:
-                print(f"Best scalar fusion: w={best_weight:.1f} -> {best_fused_acc:.2f}% (+{best_fused_acc - apt_acc:.2f}%)")
+                logger.info(f"Best scalar: w={best_weight:.1f} → {best_fused_acc:.2f}% (+{best_fused_acc - apt_acc:.2f}%)")
             else:
-                print(f"Best: APT only -> {apt_acc:.2f}%")
+                logger.info(f"Best: APT only → {apt_acc:.2f}%")
         else:
-            print("\n[Image Branch] Not available (SSL not trained)")
+            logger.info("Image Branch: Not available (SSL not trained)")
             fusion_results = {}
             best_weight = None
             best_fused_acc = None
             learned_acc = None
 
-        print("=" * 60 + "\n")
-
-        return {
+        eval_result = {
             'apt_acc': apt_acc,
             'img_acc': img_acc if use_ssl_branch else None,
             'fusion_results': fusion_results,
@@ -1757,6 +1752,12 @@ class APTTrainingPipeline:
             'best_fused_acc': best_fused_acc,
             'learned_acc': learned_acc,
         }
+        eval_dir = os.path.join(self.run_dir, 'evaluation')
+        os.makedirs(eval_dir, exist_ok=True)
+        with open(os.path.join(eval_dir, 'result.json'), 'w') as f:
+            json.dump(eval_result, f, indent=2)
+
+        return eval_result
 
     def _evaluate_with_ssl_fusion(self, dataloader):
         if self.trainer is None:
@@ -1819,23 +1820,23 @@ class APTTrainingPipeline:
             raise RuntimeError("No training samples available.")
 
         if self._try_load_checkpoint():
-            print("Skipping training (loaded from checkpoint)")
+            logger.info("Skipping training (loaded from checkpoint)")
             return
 
-        round_dir = os.path.join(self.run_dir, 'round_01')
-        os.makedirs(round_dir, exist_ok=True)
+        apt_dir = os.path.join(self.run_dir, 'apt')
+        os.makedirs(apt_dir, exist_ok=True)
         train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
 
         for epoch_idx in range(1, epochs_total + 1):
-            self._run_epoch(1, epoch_idx, epochs_total, train_loader, round_dir)
+            self._run_epoch(epoch_idx, epochs_total, train_loader, apt_dir)
 
         self.trainer_cfg.meta.completed_rounds = 1
         self._save_checkpoint()
 
-    def _run_epoch(self, round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir):
+    def _run_epoch(self, epoch_idx, epochs_total, train_loader, apt_dir):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before epoch run.")
         self.global_epoch += 1
@@ -1866,13 +1867,11 @@ class APTTrainingPipeline:
             all_preds = []
             all_labels = []
 
-        epoch_dir = os.path.join(round_dir, f'epoch_{epoch_in_round:03d}')
+        epoch_dir = os.path.join(apt_dir, f'epoch_{epoch_idx:03d}')
         os.makedirs(epoch_dir, exist_ok=True)
-        maps_dir = os.path.join(epoch_dir, 'maps')
-        os.makedirs(maps_dir, exist_ok=True)
 
         if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:
-            save_confusion_artifacts(all_labels, all_preds, self.global_epoch, epoch_dir, self.log_file)
+            save_confusion_artifacts(all_labels, all_preds, self.global_epoch, epoch_dir)
 
         if self.class_distribution_enabled and all_labels:
             save_class_distribution_plot(
@@ -1880,44 +1879,41 @@ class APTTrainingPipeline:
                 all_preds,
                 self.global_epoch,
                 epoch_dir,
-                self.log_file,
                 self.classnames,
             )
 
         self._refresh_sample_cache(all_labels)
 
         if bool(get_config_value(self.training_cfg, 'visualize_attention', False)):
-            self._export_attention_overlays(maps_dir)
+            attention_dir = os.path.join(epoch_dir, 'attention')
+            os.makedirs(attention_dir, exist_ok=True)
+            self._export_attention_overlays(attention_dir)
 
         if bool(get_config_value(self.training_cfg, 'visualize_gradcam', False)):
-            self._export_gradcam_overlays(maps_dir)
+            gradcam_dir = os.path.join(epoch_dir, 'gradcam')
+            os.makedirs(gradcam_dir, exist_ok=True)
+            self._export_gradcam_overlays(gradcam_dir)
 
         epoch_time = time.time() - start_time
-        self.metrics.append({
-            'round': round_idx,
-            'epoch_in_round': epoch_in_round,
-            'epoch_global': self.global_epoch,
+        epoch_result = {
+            'epoch': epoch_idx,
             'train_loss': avg_loss,
             'train_acc': avg_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
             'time': epoch_time
-        })
+        }
+        with open(os.path.join(epoch_dir, 'result.json'), 'w') as f:
+            json.dump(epoch_result, f, indent=2)
+
+        self.metrics.append(epoch_result)
 
         if self.val_loader is not None and val_acc > self.best_val_acc:
             self.best_val_acc = val_acc
             self.trainer.save_model(self.best_model_path)
 
-        val_loss_display = f"{val_loss:.4f}" if self.val_loader is not None else "N/A"
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        epoch_str = (
-            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}) - " # type: ignore
-            f"loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
-            f"val_loss={val_loss_display} - val_acc={val_acc_display} - time={epoch_time:.2f}s"
-        )
-        print(epoch_str)
-        with open(self.log_file, 'a') as f:
-            f.write(epoch_str + '\n')
+        logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
@@ -1979,7 +1975,6 @@ class APTTrainingPipeline:
             self.classnames,
             self.global_epoch,
             maps_dir,
-            self.log_file,
         )
 
     def _export_gradcam_overlays(self, maps_dir):
@@ -1992,7 +1987,6 @@ class APTTrainingPipeline:
             self.classnames,
             self.global_epoch,
             maps_dir,
-            self.log_file,
         )
 
     def _finalize(self):
@@ -2007,10 +2001,7 @@ class APTTrainingPipeline:
 
         self.trainer.save_model(self.last_model_path)
 
-        completion_msg = f"Training completed. Results written to {self.run_dir}"
-        print(completion_msg)
-        with open(self.log_file, 'a') as f:
-            f.write(completion_msg + '\n')
+        logger.info(f"Training completed. Results written to {self.run_dir}")
 
 def parse_args():
     parser = create_argument_parser("Train APT model", ARG_SCHEMA)
@@ -2021,6 +2012,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
+    setup_logging(getattr(args, 'debug', True))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = APTTrainingPipeline(merged)

@@ -1,24 +1,25 @@
-import os
-import random
-from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence
-
-import cv2
 import matplotlib
 
 if matplotlib.get_backend().lower() != 'agg':
     matplotlib.use('Agg')
 
-import matplotlib.pyplot as plt
-import multiprocessing as mp
-import numpy as np
-import seaborn as sns
-import torch
-from PIL import Image
-from sklearn.metrics import confusion_matrix
-from sklearn.manifold import TSNE
-
+import os
+import sys
+import cv2
 import umap
+import torch
+import random
+import numpy as np
+from PIL import Image
+import seaborn as sns
+import multiprocessing as mp
+from collections import Counter
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from typing import Any, Dict, List, Optional, Sequence
+from sklearn.metrics import confusion_matrix
+
+from logger import logger, setup_logging
 
 
 def generate_confusion_matrix_plot(args):
@@ -57,12 +58,12 @@ def save_confusion_artifacts(
     all_preds: List[int],
     epoch: int,
     epoch_dir: str,
-    log_file: Optional[str],
     chunk_size: int = 50,
     step: int = 50,
     max_processes: int = 8,
 ) -> None:
     if not all_labels or not all_preds:
+        logger.debug("save_confusion_artifacts: empty labels/preds")
         return
 
     cm_dir = os.path.join(epoch_dir, 'confusion_matrices')
@@ -107,11 +108,7 @@ def save_confusion_artifacts(
         plt.savefig(os.path.join(cm_dir, 'confusion_matrix.pdf'), dpi=300, bbox_inches='tight')
         plt.close()
 
-    summary = f"Confusion matrices for epoch {epoch} saved to {cm_dir}"
-    print(summary)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(summary + '\n')
+    logger.debug(f"Confusion matrices for epoch {epoch} saved to {cm_dir}")
 
 
 def save_class_distribution_plot(
@@ -119,10 +116,10 @@ def save_class_distribution_plot(
     all_preds: List[int],
     epoch: int,
     epoch_dir: str,
-    log_file: Optional[str],
     classnames: Optional[List[str]] = None,
 ) -> None:
     if not all_labels and not all_preds:
+        logger.debug("save_class_distribution_plot: empty labels/preds")
         return
 
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -131,6 +128,7 @@ def save_class_distribution_plot(
 
     classes = sorted(set(gt_counts.keys()) | set(pred_counts.keys()))
     if not classes:
+        logger.debug("save_class_distribution_plot: no classes")
         return
 
     labels = [classnames[c] if classnames and c < len(classnames) else str(c) for c in classes]
@@ -178,11 +176,7 @@ def save_class_distribution_plot(
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    summary = f"Class distribution plot for epoch {epoch} saved to {output_path}"
-    print(summary)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(summary + '\n')
+    logger.debug(f"Class distribution plot for epoch {epoch} saved")
 
 
 def _flatten_score_values(score_map: Dict[int, List[Any]]) -> List[float]:
@@ -207,9 +201,9 @@ def _plot_score_distribution(
     xlabel: str,
     output_path: str,
     color: str,
-    log_file: Optional[str],
 ) -> None:
     if not values:
+        logger.debug("_plot_score_distribution: no values")
         return
 
     directory = os.path.dirname(output_path) or '.'
@@ -225,44 +219,37 @@ def _plot_score_distribution(
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     plt.close()
 
-    summary = f"{title} saved to {output_path}"
-    print(summary)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(summary + '\n')
+    logger.debug(f"{title} saved")
 
 
 def plot_entropy_distribution(
     entropy_scores: Dict[int, List[Any]],
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
 ) -> None:
     values = _flatten_score_values(entropy_scores)
     title = f"Entropy Score Distribution - Round {round_idx}"
-    _plot_score_distribution(values, title, 'Entropy', output_path, '#3b7dd8', log_file)
+    _plot_score_distribution(values, title, 'Entropy', output_path, '#3b7dd8')
 
 
 def plot_conflict_distribution(
     conflict_scores: Dict[int, List[Any]],
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
 ) -> None:
     values = _flatten_score_values(conflict_scores)
     title = f"Conflict Score Distribution - Round {round_idx}"
-    _plot_score_distribution(values, title, 'KL-Divergence', output_path, '#d83b73', log_file)
+    _plot_score_distribution(values, title, 'KL-Divergence', output_path, '#d83b73')
 
 
 def plot_bald_distribution(
     bald_scores: Dict[int, List[Any]],
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
 ) -> None:
     values = _flatten_score_values(bald_scores)
     title = f"BALD Score Distribution - Round {round_idx}"
-    _plot_score_distribution(values, title, 'BALD', output_path, '#8b5cf6', log_file)
+    _plot_score_distribution(values, title, 'BALD', output_path, '#8b5cf6')
 
 
 def _prepare_coreset_embedding_matrix(
@@ -313,9 +300,9 @@ def _plot_embedding_projection(
     method_name: str,
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
 ) -> None:
     if coords.size == 0:
+        logger.debug("_plot_embedding_projection: empty coords")
         return
 
     directory = os.path.dirname(output_path) or '.'
@@ -363,11 +350,7 @@ def _plot_embedding_projection(
     plt.savefig(output_path, dpi=250, bbox_inches='tight')
     plt.close()
 
-    summary = f"Coreset embedding plot ({method_name}) saved to {output_path}"
-    print(summary)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(summary + '\n')
+    logger.debug(f"Coreset embedding plot ({method_name}) saved")
 
 
 def plot_coreset_embedding_umap(
@@ -378,28 +361,23 @@ def plot_coreset_embedding_umap(
     selected_indices: Sequence[int],
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
     random_state: int = 42,
 ) -> None:
     if umap is None:
-        msg = "UMAP is not installed; skipping UMAP plot."
-        print(msg)
-        if log_file is not None:
-            with open(log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.warning("UMAP is not installed; skipping UMAP plot")
         return
 
     matrix, statuses = _prepare_coreset_embedding_matrix(
         embeddings, labeled_indices, unlabeled_indices, val_indices, selected_indices
     )
     if matrix is None or statuses is None:
-        print("No embeddings available for UMAP plot; skipping.")
+        logger.debug("No embeddings available for UMAP plot; skipping")
         return
 
     n_neighbors = max(2, min(7, matrix.shape[0] - 1))
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=None, n_jobs=-1)
-    coords = reducer.fit_transform(matrix)
-    _plot_embedding_projection(coords, statuses, 'UMAP', round_idx, output_path, log_file) # type: ignore
+    coords = np.asarray(reducer.fit_transform(matrix))
+    _plot_embedding_projection(coords, statuses, 'UMAP', round_idx, output_path)
 
 
 def plot_coreset_embedding_tsne(
@@ -410,30 +388,24 @@ def plot_coreset_embedding_tsne(
     selected_indices: Sequence[int],
     round_idx: int,
     output_path: str,
-    log_file: Optional[str],
     random_state: int = 42,
 ) -> None:
     matrix, statuses = _prepare_coreset_embedding_matrix(
         embeddings, labeled_indices, unlabeled_indices, val_indices, selected_indices
     )
     if matrix is None or statuses is None:
-        print("No embeddings available for t-SNE plot; skipping.")
+        logger.debug("No embeddings available for t-SNE plot; skipping")
         return
 
     if matrix.shape[0] < 3:
-        msg = "Not enough samples for t-SNE projection; skipping plot."
-        print(msg)
-        if log_file is not None:
-            with open(log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.warning("Not enough samples for t-SNE projection; skipping plot")
         return
     
     n_samples = matrix.shape[0]
     perplexity = max(5, min(50, n_samples // 100))
-    # perplexity = max(5, min(30, matrix.shape[0] - 1))
     reducer = TSNE(n_components=2, perplexity=perplexity, init='pca', random_state=random_state, metric='cosine', n_jobs=-1, early_exaggeration=4.0)
     coords = reducer.fit_transform(matrix)
-    _plot_embedding_projection(coords, statuses, 't-SNE', round_idx, output_path, log_file)
+    _plot_embedding_projection(coords, statuses, 't-SNE', round_idx, output_path)
 
 
 def visualize_attention_maps(
@@ -443,13 +415,13 @@ def visualize_attention_maps(
     classnames: List[str],
     epoch: int,
     maps_dir: str,
-    log_file: Optional[str],
 ) -> None:
     images = sample_cache.get('images') if sample_cache else None
     labels = sample_cache.get('labels') if sample_cache else None
     paths = sample_cache.get('paths', []) if sample_cache else []
 
     if trainer is None or images is None:
+        logger.debug("visualize_attention_maps: missing trainer/images")
         return
 
     trainer.model.cfg['mode'] = 'map'
@@ -476,16 +448,13 @@ def visualize_attention_maps(
     trainer.model.cfg['mode'] = trainer.cfg.get('mode', 'logits')
 
     if not attn_maps:
+        logger.debug("visualize_attention_maps: no attn_maps")
         return
 
     attn_map_to_vis = attn_maps[0]
     try:
         shape_info = getattr(attn_map_to_vis, 'shape', None)
-        shape_msg = f"Epoch {epoch} attention map shape: {shape_info}"
-        print(shape_msg)
-        if log_file is not None:
-            with open(log_file, 'a') as lf:
-                lf.write(shape_msg + '\n')
+        logger.debug(f"Epoch {epoch} attention map shape: {shape_info}")
     except Exception:
         pass
 
@@ -498,13 +467,7 @@ def visualize_attention_maps(
         try:
             weights = attn_map_to_vis[i, label, :]
         except Exception:
-            warn_msg = (
-                f"Warning: unable to index attention map for image {i}, label {label}. Skipping visualization."
-            )
-            print(warn_msg)
-            if log_file is not None:
-                with open(log_file, 'a') as lf:
-                    lf.write(warn_msg + '\n')
+            logger.warning(f"Unable to index attention map for image {i}, label {label}")
             continue
 
         if weights.dim() > 1:
@@ -516,13 +479,7 @@ def visualize_attention_maps(
         num_patches = patch_weights.shape[0]
         h = w = int(np.sqrt(num_patches))
         if h * w != num_patches:
-            warn_msg = (
-                f"Warning: Cannot reshape {num_patches} patches into a square grid. Skipping visualization for image {i}."
-            )
-            print(warn_msg)
-            if log_file is not None:
-                with open(log_file, 'a') as lf:
-                    lf.write(warn_msg + '\n')
+            logger.warning(f"Cannot reshape {num_patches} patches into square grid for image {i}")
             continue
 
         heatmap = patch_weights.reshape(h, w)
@@ -541,11 +498,7 @@ def visualize_attention_maps(
         save_path = os.path.join(maps_dir, save_name)
         cv2.imwrite(save_path, superimposed_img)
 
-    log_str = f"Saved {len(vis_images)} attention visualizations to {maps_dir}"
-    print(log_str)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(log_str + '\n')
+    logger.debug(f"Saved {len(vis_images)} attention visualizations")
 
 
 def visualize_gradcam_maps(
@@ -555,7 +508,6 @@ def visualize_gradcam_maps(
     classnames: List[str],
     epoch: int,
     maps_dir: str,
-    log_file: Optional[str],
 ) -> None:
     images = sample_cache.get('images') if sample_cache else None
     labels = sample_cache.get('labels') if sample_cache else None
@@ -564,14 +516,16 @@ def visualize_gradcam_maps(
         paths = []
 
     if trainer is None or images is None or labels is None:
+        logger.debug("visualize_gradcam_maps: missing trainer/images/labels")
         return
 
     if isinstance(images, torch.Tensor):
         vis_images = images.to(trainer.device)
     elif isinstance(images, (list, tuple)):
+        image_list: List[Any] = list(images)
         vis_images = torch.stack([
             x.to(trainer.device) if isinstance(x, torch.Tensor) else torch.tensor(x).to(trainer.device)
-            for x in images  # type: ignore
+            for x in image_list
         ])
     else:
         vis_images = torch.tensor(images).to(trainer.device)
@@ -604,20 +558,18 @@ def visualize_gradcam_maps(
         save_path = os.path.join(maps_dir, save_name)
         cv2.imwrite(save_path, superimposed_img)
 
-    log_str = f"Saved {len(gradcams)} GradCAM visualizations to {maps_dir}"
-    print(log_str)
-    if log_file is not None:
-        with open(log_file, 'a') as f:
-            f.write(log_str + '\n')
+    logger.debug(f"Saved {len(gradcams)} GradCAM visualizations")
 
 
 def run_dataset_eda(dataset, eda_dir: str, sample_limit: int = 512, seed: int = 42) -> None:
     if dataset is None or not hasattr(dataset, 'samples'):
+        logger.debug("run_dataset_eda: invalid dataset")
         return
 
     os.makedirs(eda_dir, exist_ok=True)
     class_counts = Counter(label for _, label in dataset.samples)
     if not class_counts:
+        logger.debug("run_dataset_eda: no class counts")
         return
 
     classes = list(range(len(dataset.classes)))
@@ -684,4 +636,4 @@ def run_dataset_eda(dataset, eda_dir: str, sample_limit: int = 512, seed: int = 
         plt.savefig(brightness_path, dpi=200)
         plt.close()
 
-    print(f"Dataset EDA artifacts saved to {eda_dir}")
+    logger.debug(f"Dataset EDA artifacts saved to {eda_dir}")

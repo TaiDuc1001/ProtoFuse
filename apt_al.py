@@ -22,6 +22,8 @@ from apt import (
     set_global_seed,
 )
 from utils import (
+    logger,
+    setup_logging,
     plot_bald_distribution,
     plot_entropy_distribution,
 )
@@ -339,7 +341,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
 
         rounds_value = self.active_cfg.get("rounds", None)
         self.rounds = max(1, coerce_to_int(rounds_value, 1, key="active_learning.rounds"))
-        print(f"ActiveLearningPipeline: rounds={self.rounds}")
+        logger.debug(f"ActiveLearningPipeline: rounds={self.rounds}")
 
         incr_value = self.training_cfg.get("increment_epochs", None)
         self.incr_epochs = coerce_to_int(incr_value, 0, key="training.increment_epochs")
@@ -368,7 +370,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         self.plot_bald_distribution = bool(self.config.get("plot_bald_distribution", self.active_cfg.get("plot_bald_distribution", False)))
         self.plot_coreset_embedding_umap = bool(self.config.get("plot_coreset_embedding_umap", self.active_cfg.get("plot_coreset_embedding_umap", False)))
         self.plot_coreset_embedding_tsne = bool(self.config.get("plot_coreset_embedding_tsne", self.active_cfg.get("plot_coreset_embedding_tsne", False)))
-        print(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}, mc_samples={self.mc_samples}, alpha_cap={self.alpha_cap}, reset_model_per_round={self.reset_model_per_round}, plot_entropy_distribution={self.plot_entropy_distribution}, plot_bald_distribution={self.plot_bald_distribution}, plot_coreset_embedding_umap={self.plot_coreset_embedding_umap}, plot_coreset_embedding_tsne={self.plot_coreset_embedding_tsne}")
+        logger.debug(f"ActiveLearningPipeline: strategy={self.strategy}, nshot={self.nshot}")
 
     def run(self):
         set_global_seed(self.seed)
@@ -424,7 +426,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             val_ds = Subset(self.dataset, self.val_indices)
             self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         else:
-            print("Warning: validation split is empty; skipping validation metrics.")
+            logger.warning("Validation split is empty; skipping validation metrics")
 
         self.classnames = list(self.dataset.classes)
 
@@ -436,21 +438,12 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             'train_count': len(self.labeled_indices),
             'train_pool_size': len(self.labeled_indices) + len(self.unlabeled_indices),
         }
-        print(f"Dataset loaded: {stats['total_images']} total images.")
-        val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
-        print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
-        print(
-            f"Train pool size: {stats['train_pool_size']} images "
-            f"({stats['labeled_count']} labeled, {stats['unlabeled_count']} unlabeled)."
-        )
+        logger.info(f"Dataset: {stats['total_images']} total, {stats['val_count']} val, {stats['labeled_count']} labeled, {stats['unlabeled_count']} unlabeled")
 
+        val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
             json.dump(trainer_cfg.to_dict(), f, indent=4)
-
-        with open(self.log_file, 'w') as f:
-            f.write(f"Config: {json.dumps(trainer_cfg.to_dict(), indent=2)}\n\n")
-            f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
         trainer_cfg = super()._build_trainer_config(stats, val_percentage)
@@ -469,8 +462,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         return trainer_cfg
 
     def _active_learning_loop(self):
-        print('\n')
-        print('=' * 50)
+        logger.info("Starting Active Learning")
 
         base_epochs = self._get_training_epochs()
         incr_epochs = self.incr_epochs
@@ -486,35 +478,24 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         os.makedirs(round_dir, exist_ok=True)
 
         if len(self.labeled_indices) == 0:
-            msg = f"Round {round_idx}: no labeled samples available; stopping training."
-            print(msg)
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
-                self.trainer_cfg.meta.completed_rounds = round_idx - 1
+            logger.warning(f"Round {round_idx}: no labeled samples; stopping")
+            self.trainer_cfg.meta.completed_rounds = round_idx - 1
             return
 
         if round_idx == 1 and self._try_load_checkpoint():
-            print("Skipping round 1 training (loaded from checkpoint)")
+            logger.info("Skipping round 1 training (loaded from checkpoint)")
         else:
             train_subset = Subset(self.dataset, list(self.labeled_indices))
             train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
-            msg = (
-                f"Starting round {round_idx}/{self.rounds}: {len(self.labeled_indices)} labeled | "
-                f"{len(self.unlabeled_indices)} unlabeled"
-            )
-            print(msg)
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+            logger.info(f"Round {round_idx}/{self.rounds}: {len(self.labeled_indices)} labeled | {len(self.unlabeled_indices)} unlabeled")
 
             base_epochs = self._get_training_epochs()
             epochs_this_round = base_epochs + (round_idx - 1) * self.incr_epochs
-
-            with open(self.log_file, 'a') as f:
-                f.write(f"  Epochs this round: {epochs_this_round} (base: {base_epochs})\n")
+            logger.debug(f"Epochs this round: {epochs_this_round}")
 
             for epoch_in_round in range(1, epochs_this_round + 1):
-                self._run_epoch(round_idx, epoch_in_round, epochs_this_round, train_loader, round_dir)
+                self._run_epoch(epoch_in_round, epochs_this_round, train_loader, round_dir)
 
             if round_idx == 1:
                 self._save_checkpoint()
@@ -536,25 +517,15 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             return
 
         if not self.unlabeled_indices:
-            skip_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (no unlabeled samples)."
-            )
-            print(skip_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(skip_msg + '\n')
+            logger.warning(f"AL selection ({strategy}) skipped: no unlabeled samples")
             with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
+                f.write(f"round {round_idx}: none\n")
             return
 
         if self.nshot <= 0:
-            no_shot_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) skipped (nshot={self.nshot})."
-            )
-            print(no_shot_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(no_shot_msg + '\n')
+            logger.warning(f"AL selection ({strategy}) skipped: nshot={self.nshot}")
             with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
+                f.write(f"round {round_idx}: none\n")
             return
 
         need_entropy_plot = self.plot_entropy_distribution and strategy == 'entropy'
@@ -579,7 +550,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 entropy_plot_path = os.path.join(
                     selection_plot_dir, f'entropy_distribution_round_{round_idx:02d}.pdf'
                 )
-                plot_entropy_distribution(entropy_scores, round_idx, entropy_plot_path, self.log_file)
+                plot_entropy_distribution(entropy_scores, round_idx, entropy_plot_path)
             raw_selected = select_high_entropy_indices(entropy_scores, self.nshot)
         elif strategy == 'bald':
             bald_scores = compute_bald_scores(
@@ -589,7 +560,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 bald_plot_path = os.path.join(
                     selection_plot_dir, f'bald_distribution_round_{round_idx:02d}.pdf'
                 )
-                plot_bald_distribution(bald_scores, round_idx, bald_plot_path, self.log_file)
+                plot_bald_distribution(bald_scores, round_idx, bald_plot_path)
             raw_selected = select_high_bald_indices(bald_scores, self.nshot)
         elif strategy == 'random':
             seed = self.seed + round_idx
@@ -608,14 +579,9 @@ class ActiveLearningPipeline(APTTrainingPipeline):
             )
         
         if not raw_selected:
-            empty_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}) selected no samples."
-            )
-            print(empty_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(empty_msg + '\n')
+            logger.warning(f"AL selection ({strategy}) selected no samples")
             with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
+                f.write(f"round {round_idx}: none\n")
             return
 
         unlabeled_set = set(self.unlabeled_indices)
@@ -627,30 +593,18 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                 selected_indices.append(idx)
 
         if not selected_indices:
-            duplicate_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
-                "suggested samples were already labeled."
-            )
-            print(duplicate_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(duplicate_msg + '\n')
+            logger.warning(f"AL selection ({strategy}): samples already labeled")
             with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
+                f.write(f"round {round_idx}: none\n")
             return
 
         existing_labeled = set(self.labeled_indices)
         new_indices = [idx for idx in selected_indices if idx not in existing_labeled]
 
         if not new_indices:
-            no_new_msg = (
-                f"Active learning selection ({strategy}) (round {round_idx} -> {round_idx + 1}): "
-                "all suggested samples were already labeled."
-            )
-            print(no_new_msg)
-            with open(self.log_file, 'a') as f:
-                f.write(no_new_msg + '\n')
+            logger.warning(f"AL selection ({strategy}): all already labeled")
             with open(self.selection_log_path, 'a') as f:
-                f.write(f"round {round_idx}: none" + '\n')
+                f.write(f"round {round_idx}: none\n")
             return
 
         prev_labeled = len(self.labeled_indices)
@@ -659,10 +613,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
         self.unlabeled_indices = [idx for idx in self.unlabeled_indices if idx not in new_set]
         after_labeled = len(self.labeled_indices)
 
-        summary = f"Selected {len(new_indices)} new samples. Labeled: {after_labeled} (was {prev_labeled})."
-        print(summary)
-        with open(self.log_file, 'a') as f:
-            f.write(summary + '\n')
+        logger.info(f"Selected {len(new_indices)} new samples. Labeled: {after_labeled} (was {prev_labeled})")
 
         if new_indices:
             new_subset = Subset(self.dataset, new_indices)
@@ -681,9 +632,7 @@ class ActiveLearningPipeline(APTTrainingPipeline):
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
             accuracy = correct / total * 100 if total > 0 else 0
-            print(f"Newly selected images: {correct}/{total} correctly predicted ({accuracy:.2f}%)")
-            with open(self.log_file, 'a') as f:
-                f.write(f"Newly selected images: {correct}/{total} correctly predicted ({accuracy:.2f}%)\n")
+            logger.debug(f"Newly selected: {correct}/{total} correct ({accuracy:.2f}%)")
 
         round_selected_paths = [os.path.abspath(self.dataset.samples[idx][0]) for idx in new_indices]
         with open(self.selection_log_path, 'a') as f:
@@ -701,6 +650,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
+    setup_logging(getattr(args, 'debug', False))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = ActiveLearningPipeline(merged)

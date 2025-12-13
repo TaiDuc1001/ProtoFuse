@@ -34,6 +34,7 @@ from apt import (
     CheckpointCache,
     DEFAULT_CHECKPOINT_DIR,
 )
+from utils import logger, setup_logging
 
 ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
@@ -43,7 +44,7 @@ ARG_SCHEMA = {
 
 
 class APTDirichlet:
-    def __init__(self, cfg, classnames, device="cuda", log_file=None):
+    def __init__(self, cfg, classnames, device="cuda"):
         if not isinstance(cfg, ConfigNode):
             cfg = ConfigNode(cfg)
         self.cfg = cfg
@@ -52,7 +53,6 @@ class APTDirichlet:
         self.data_cfg = self.cfg.get('data', ConfigNode())
         self.classnames = classnames
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.log_file = log_file
 
         self.build_model()
         self.setup_optimizer()
@@ -81,11 +81,7 @@ class APTDirichlet:
 
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
-        msg = f"Loading CLIP (backbone: {backbone_name})"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Loading CLIP (backbone: {backbone_name})")
 
         clip_model = load_clip_to_cpu(backbone_name)
 
@@ -129,11 +125,7 @@ class APTDirichlet:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        msg = f"Learnable parameters: {format_params(learnable_params)} / Total parameters: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.info(f"Parameters: {format_params(learnable_params)} / {format_params(total_params)} ({gflops_thop:.2f} GFLOPs)")
 
         trainable_names = set(self.model.get_trainable_parameter_names())
         for name, param in self.model.named_parameters():
@@ -237,10 +229,7 @@ class APTDirichlet:
             'cfg': self.cfg
         }
         torch.save(checkpoint, path)
-        msg = f"Model saved to {path}"
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.debug(f"Model saved to {path}")
 
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
@@ -251,11 +240,7 @@ class APTDirichlet:
             self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        msg = f"Model loaded from {path}"
-        print(msg)
-        if self.log_file:
-            with open(self.log_file, 'a') as f:
-                f.write(msg + '\n')
+        logger.debug(f"Model loaded from {path}")
 
 
 class APTDirichletPipeline:
@@ -298,12 +283,11 @@ class APTDirichletPipeline:
         base_output = coerce_to_str(base_output_value, "outputs", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
-        print(f"Run directory: {self.run_dir}")
+        logger.debug(f"Run directory: {self.run_dir}")
         self.config_path = os.path.join(self.run_dir, 'config.json')
         self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
         self.best_model_path = os.path.join(self.run_dir, 'best.pt')
         self.last_model_path = os.path.join(self.run_dir, 'last.pt')
-        self.log_file = os.path.join(self.run_dir, 'training.log')
 
         self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
         self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
@@ -339,7 +323,7 @@ class APTDirichletPipeline:
             cache_dir = checkpoint_cfg.get('cache_dir', DEFAULT_CHECKPOINT_DIR)
             self.checkpoint_cache = CheckpointCache(cache_dir)
             self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
-            print(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+            logger.debug(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
 
     def _try_load_checkpoint(self) -> bool:
         if self.checkpoint_cache is None or self.checkpoint_id is None:
@@ -358,7 +342,7 @@ class APTDirichletPipeline:
         self.unlabeled_indices = ckpt['unlabeled_indices']
         self.metrics = ckpt['metrics']
         self.global_epoch = len(self.metrics)
-        print(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
         return True
 
     def _save_checkpoint(self):
@@ -376,7 +360,7 @@ class APTDirichletPipeline:
             self.metrics,
             self.config
         )
-        print(f"Saved checkpoint to: {path}")
+        logger.debug(f"Saved checkpoint to: {path}")
 
     def run(self):
         set_global_seed(self.seed)
@@ -389,8 +373,6 @@ class APTDirichletPipeline:
 
     def _prepare_directories(self):
         os.makedirs(self.run_dir, exist_ok=True)
-        with open(self.log_file, 'w') as f:
-            f.write('')
 
     def _build_transforms(self):
         base_transforms = [
@@ -401,7 +383,7 @@ class APTDirichletPipeline:
         ]
         if bool(get_config_value(self.training_cfg, "use_cutout", False)):
             base_transforms.append(transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0))
-            print("Using Cutout (RandomErasing) augmentation.")
+            logger.debug("Using Cutout augmentation")
         return transforms.Compose(base_transforms)
 
     def _load_dataset(self):
@@ -454,7 +436,7 @@ class APTDirichletPipeline:
             val_ds = Subset(self.dataset, self.val_indices)
             self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         else:
-            print("Warning: validation split is empty; skipping validation metrics.")
+            logger.warning("Validation split is empty; skipping validation metrics")
 
         self.classnames = list(self.dataset.classes)
 
@@ -466,20 +448,12 @@ class APTDirichletPipeline:
             'unlabeled_count': len(self.unlabeled_indices),
             'train_pool_size': len(self.train_indices) + len(self.unlabeled_indices)
         }
-        print(f"Dataset loaded: {stats['total_images']} total images.")
-        val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
-        print(f"Validation split: {stats['val_count']} images ({val_percentage:.2f}%).")
-        print(f"Train split size: {stats['train_count']} images.")
-        if stats['unlabeled_count'] > 0:
-            print(f"Unlabeled pool size: {stats['unlabeled_count']} images.")
+        logger.info(f"Dataset: {stats['total_images']} total, {stats['val_count']} val, {stats['train_count']} train")
 
+        val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
             json.dump(trainer_cfg.to_dict(), f, indent=4)
-
-        with open(self.log_file, 'a') as f:
-            f.write(f"Config: {trainer_cfg.to_dict()}\n\n")
-            f.write('=' * 50 + '\n')
 
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
@@ -503,7 +477,7 @@ class APTDirichletPipeline:
     def _initialize_trainer(self):
         if not self.classnames:
             raise RuntimeError("Class names unavailable before trainer initialization.")
-        self.trainer = APTDirichlet(self.trainer_cfg, self.classnames, device=str(self.device), log_file=self.log_file)
+        self.trainer = APTDirichlet(self.trainer_cfg, self.classnames, device=str(self.device))
 
     def _train_epochs(self):
         if self.dataset is None or self.trainer is None:
@@ -513,7 +487,7 @@ class APTDirichletPipeline:
 
         # Try to load from checkpoint cache
         if self._try_load_checkpoint():
-            print("Skipping training (loaded from checkpoint cache)")
+            logger.info("Skipping training (loaded from checkpoint cache)")
             return
 
         round_dir = os.path.join(self.run_dir, 'round_01')
@@ -579,15 +553,7 @@ class APTDirichletPipeline:
 
         val_loss_display = f"{val_loss:.4f}" if self.val_loader is not None else "N/A"
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        epoch_str = (
-            f"Epoch {self.global_epoch} (round {round_idx}/{self.rounds}) - "
-            f"loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - "
-            f"val_loss={val_loss_display} - val_acc={val_acc_display} - "
-            f"time={epoch_time:.2f}s"
-        )
-        print(epoch_str)
-        with open(self.log_file, 'a') as f:
-            f.write(epoch_str + '\n')
+        logger.info(f"Epoch {self.global_epoch} - loss={avg_loss:.4f} - train_acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
@@ -604,10 +570,7 @@ class APTDirichletPipeline:
 
         self.trainer.save_model(self.last_model_path)
 
-        completion_msg = f"Training completed. Results written to {self.run_dir}"
-        print(completion_msg)
-        with open(self.log_file, 'a') as f:
-            f.write(completion_msg + '\n')
+        logger.info(f"Training completed. Results at {self.run_dir}")
 
 
 def parse_args():
@@ -620,6 +583,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
+    setup_logging(getattr(args, 'debug', False))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = APTDirichletPipeline(merged)
