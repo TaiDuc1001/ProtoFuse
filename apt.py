@@ -804,7 +804,6 @@ class APT:
     
     def save_model(self, path):
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
             'prompt_learner_state_dict': self.model.prompt_learner.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -815,11 +814,10 @@ class APT:
     
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        model_state = checkpoint.get('model_state_dict')
-        if model_state is not None:
-            self.model.load_state_dict(model_state, strict=False)
         if 'prompt_learner_state_dict' in checkpoint:
-            self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'], strict=False)
+            self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'])
+        elif 'model_state_dict' in checkpoint:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         logger.info(f"Model loaded from {path}")
@@ -1021,7 +1019,16 @@ class APTTrainingPipeline:
             return False
         if self.trainer is None:
             return False
-        self.trainer.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        model_state = ckpt['model_state_dict']
+        first_key = next(iter(model_state.keys()), '')
+        if first_key.startswith('0.'):
+            self.trainer.model.prompt_learner.load_state_dict(model_state)
+        else:
+            prompt_state = {k.replace('prompt_learner.', ''): v for k, v in model_state.items() if k.startswith('prompt_learner.')}
+            if prompt_state:
+                self.trainer.model.prompt_learner.load_state_dict(prompt_state)
+            else:
+                self.trainer.model.load_state_dict(model_state, strict=False)
         self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         self.trainer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         self.labeled_indices = ckpt['labeled_indices']
@@ -1038,7 +1045,7 @@ class APTTrainingPipeline:
             return
         path = self.checkpoint_cache.save(
             self.checkpoint_id,
-            self.trainer.model.state_dict(),
+            self.trainer.model.prompt_learner.state_dict(),
             self.trainer.optimizer.state_dict(),
             self.trainer.scheduler.state_dict(),
             self.labeled_indices,
@@ -1382,12 +1389,12 @@ class APTTrainingPipeline:
             with open(os.path.join(ssl1_epoch_dir, 'result.json'), 'w') as f:
                 json.dump(epoch_result, f, indent=2)
 
-            logger.info(f"  SSL1 Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - {epoch_time:.2f}s")
+            logger.info(f"  SSL1 Epoch {epoch}/{ssl_epochs} - loss={avg_loss:.4f} - time={epoch_time:.2f}s")
 
             if epoch % eval_freq == 0 or epoch == ssl_epochs:
                 eval_start = time.time()
                 linear_acc = self._run_linear_eval(feature_dim, eval_linear_epochs)
-                logger.info(f"  [EVAL] Linear acc: {linear_acc:.2f}% - {time.time() - eval_start:.2f}s")
+                logger.info(f"  [EVAL] Linear acc: {linear_acc:.2f}% - time: {time.time() - eval_start:.2f}s")
                 
                 if self.ssl_vis_images is not None:
                     ssl_attn_dir = os.path.join(ssl1_epoch_dir, 'ssl_attention')
@@ -1637,8 +1644,6 @@ class APTTrainingPipeline:
         if self.trainer is None:
             logger.warning("Dual-branch evaluation skipped: trainer not initialized")
             return
-
-        logger.info("\n" + "=" * 50 + " EVALUATION " + "=" * 50)
 
         self.trainer.model.eval()
 

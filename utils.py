@@ -19,7 +19,7 @@ from sklearn.manifold import TSNE
 from typing import Any, Dict, List, Optional, Sequence
 from sklearn.metrics import confusion_matrix
 
-from logger import logger, setup_logging
+from logger import logger, setup_logging # type: ignore
 
 
 def generate_confusion_matrix_plot(args):
