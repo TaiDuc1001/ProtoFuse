@@ -28,8 +28,8 @@ data:
   root: "datasets/cub-200-2011-renamed"
 
 checkpoint:
-  enabled: true
-  cache_dir: "checkpoints"
+  enabled: false
+  cache_dir: "checkpoints/vpt"
 
 logging:
   output_dir: "outputs/vpt"

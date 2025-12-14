@@ -1,9 +1,13 @@
 import os
 import time
 import json
+import math
+import copy
 import torch
+import random
 import hashlib
 import datetime
+import numpy as np
 import torch.nn as nn
 from clip import clip
 from thop import profile
@@ -12,9 +16,10 @@ from PIL import Image as PILImage
 from torchvision import transforms
 from collections import defaultdict
 from torchvision.datasets import ImageFolder
+from typing import Any, Dict, List, Optional
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
-from typing import Any, Dict, List, Optional
+
 from utils import (
     logger,
     setup_logging,
@@ -25,12 +30,9 @@ from utils import (
     visualize_gradcam_maps,
     ConfigNode,
     set_global_seed,
-    deep_merge_dicts,
     build_config_namespace,
     create_argument_parser,
     process_parsed_args,
-    infer_override_value,
-    set_nested_value,
     parse_override_arguments,
     merge_configs,
     load_config_file,
@@ -39,6 +41,7 @@ from utils import (
     coerce_to_int,
     coerce_to_float,
     load_clip_to_cpu,
+    CheckpointCache,
 )
 
 from apt_ssl import (
@@ -61,14 +64,8 @@ ARG_SCHEMA = {
     'debug': {'type': bool, 'help': 'Enable debug output', 'default': False},
 }
 
-
-
-
-
-
 DEFAULT_TRAINING_EPOCHS = 100
 DEFAULT_CHECKPOINT_DIR = 'checkpoints/apt'
-CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
 
 class DINODataset(torch.utils.data.Dataset):
     def __init__(self, base_dataset, indices, transform):
@@ -87,85 +84,6 @@ class DINODataset(torch.utils.data.Dataset):
         img = self.Image.open(path).convert('RGB')
         global_views, local_views = self.transform(img)
         return global_views, local_views, label
-
-class CheckpointCache:
-    def __init__(self, cache_dir: str = DEFAULT_CHECKPOINT_DIR):
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        self.index_path = os.path.join(cache_dir, CHECKPOINT_INDEX_FILE)
-
-    def _get_key_settings(self, config) -> dict:
-        if hasattr(config, 'to_dict'):
-            config = config.to_dict()
-        return {
-            'dataset_root': config.get('data', {}).get('root'),
-            'kshot': config.get('data', {}).get('kshot'),
-            'seed': config.get('data', {}).get('seed'),
-            'epochs': config.get('training', {}).get('epochs'),
-            'backbone': config.get('model', {}).get('backbone'),
-        }
-
-    def compute_checkpoint_id(self, config) -> str:
-        key_settings = self._get_key_settings(config)
-        key_str = json.dumps(key_settings, sort_keys=True)
-        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
-
-    def get_checkpoint_path(self, checkpoint_id: str) -> str:
-        return os.path.join(self.cache_dir, f"init_ckpt_{checkpoint_id}.pt")
-
-    def exists(self, checkpoint_id: str) -> bool:
-        return os.path.exists(self.get_checkpoint_path(checkpoint_id))
-
-    def _update_index(self, checkpoint_id: str, key_settings: dict, path: str):
-        import csv
-        rows = []
-        fieldnames = ['checkpoint_id', 'file', 'dataset_root', 'kshot', 'seed', 
-                      'epochs', 'backbone', 'created_at']
-        if os.path.exists(self.index_path):
-            with open(self.index_path, 'r', newline='') as f:
-                reader = csv.DictReader(f)
-                rows = [row for row in reader if row.get('checkpoint_id') != checkpoint_id]
-        row = {
-            'checkpoint_id': checkpoint_id,
-            'file': os.path.basename(path),
-            'dataset_root': key_settings.get('dataset_root'),
-            'kshot': key_settings.get('kshot'),
-            'seed': key_settings.get('seed'),
-            'epochs': key_settings.get('epochs'),
-            'backbone': key_settings.get('backbone'),
-            'created_at': datetime.datetime.now().isoformat(),
-        }
-        rows.append(row)
-        with open(self.index_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def save(self, checkpoint_id, model_state, optimizer_state, scheduler_state,
-             labeled_indices, unlabeled_indices, metrics, config):
-        key_settings = self._get_key_settings(config)
-        checkpoint = {
-            'model_state_dict': model_state,
-            'optimizer_state_dict': optimizer_state,
-            'scheduler_state_dict': scheduler_state,
-            'labeled_indices': labeled_indices,
-            'unlabeled_indices': unlabeled_indices,
-            'metrics': metrics,
-            'config_snapshot': config.to_dict() if hasattr(config, 'to_dict') else dict(config),
-            'timestamp': datetime.datetime.now().isoformat(),
-        }
-        path = self.get_checkpoint_path(checkpoint_id)
-        torch.save(checkpoint, path)
-        self._update_index(checkpoint_id, key_settings, path)
-        return path
-
-    def load(self, checkpoint_id):
-        path = self.get_checkpoint_path(checkpoint_id)
-        if not os.path.exists(path):
-            return None
-        return torch.load(path, map_location='cpu')
-
-
 
 
 class CrossAttention(nn.Module):
@@ -257,6 +175,7 @@ class ImageEncoder(nn.Module):
 
 CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
+    "StanfordDogs": "a photo of a {}, a type of dog.",
     "OxfordFlowers": "a photo of a {}, a type of flower.",
     "FGVCAircraft": "a photo of a {}, a type of aircraft.",
     "DescribableTextures": "{} texture.",

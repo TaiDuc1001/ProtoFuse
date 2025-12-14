@@ -6,11 +6,15 @@ if matplotlib.get_backend().lower() != 'agg':
 import os
 import sys
 import cv2
+import csv
 import copy
+import json
 import yaml
 import umap
 import torch
 import random
+import hashlib
+import datetime
 import argparse
 import numpy as np
 from clip import clip
@@ -24,6 +28,88 @@ from typing import Any, Dict, List, Optional, Sequence
 from sklearn.metrics import confusion_matrix
 
 from logger import logger, setup_logging # type: ignore
+
+
+class CheckpointCache:
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.index_path = os.path.join(cache_dir, 'index.csv')
+
+    def _get_key_settings(self, config) -> dict:
+        if hasattr(config, 'to_dict'):
+            config = config.to_dict()
+        model_cfg = config.get('model', {})
+        method_params = {k: v for k, v in model_cfg.items() 
+                         if k not in ('backbone', 'dataset_name', 'use_cache')}
+        return {
+            'dataset_root': config.get('data', {}).get('root'),
+            'kshot': config.get('data', {}).get('kshot'),
+            'seed': config.get('data', {}).get('seed'),
+            'epochs': config.get('training', {}).get('epochs'),
+            'backbone': model_cfg.get('backbone'),
+            'method_params': json.dumps(method_params, sort_keys=True),
+        }
+
+    def compute_checkpoint_id(self, config) -> str:
+        key_settings = self._get_key_settings(config)
+        key_str = json.dumps(key_settings, sort_keys=True)
+        return hashlib.md5(key_str.encode()).hexdigest()[:16]
+
+    def get_checkpoint_path(self, checkpoint_id: str) -> str:
+        return os.path.join(self.cache_dir, f'{checkpoint_id}.pt')
+
+    def exists(self, checkpoint_id: str) -> bool:
+        return os.path.exists(self.get_checkpoint_path(checkpoint_id))
+
+    def _update_index(self, checkpoint_id: str, key_settings: dict, path: str):
+        rows = []
+        fieldnames = ['checkpoint_id', 'file', 'dataset_root', 'kshot', 'seed',
+                      'epochs', 'backbone', 'method_params', 'created_at']
+        if os.path.exists(self.index_path):
+            with open(self.index_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = [row for row in reader if row.get('checkpoint_id') != checkpoint_id]
+        row = {
+            'checkpoint_id': checkpoint_id,
+            'file': os.path.basename(path),
+            'dataset_root': key_settings.get('dataset_root'),
+            'kshot': key_settings.get('kshot'),
+            'seed': key_settings.get('seed'),
+            'epochs': key_settings.get('epochs'),
+            'backbone': key_settings.get('backbone'),
+            'method_params': key_settings.get('method_params'),
+            'created_at': datetime.datetime.now().isoformat(),
+        }
+        rows.append(row)
+        with open(self.index_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def save(self, checkpoint_id, model_state, optimizer_state, scheduler_state,
+             labeled_indices, unlabeled_indices, metrics, config):
+        key_settings = self._get_key_settings(config)
+        checkpoint = {
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer_state,
+            'scheduler_state_dict': scheduler_state,
+            'labeled_indices': labeled_indices,
+            'unlabeled_indices': unlabeled_indices,
+            'metrics': metrics,
+            'config_snapshot': config.to_dict() if hasattr(config, 'to_dict') else dict(config),
+            'timestamp': datetime.datetime.now().isoformat(),
+        }
+        path = self.get_checkpoint_path(checkpoint_id)
+        torch.save(checkpoint, path)
+        self._update_index(checkpoint_id, key_settings, path)
+        return path
+
+    def load(self, checkpoint_id):
+        path = self.get_checkpoint_path(checkpoint_id)
+        if not os.path.exists(path):
+            return None
+        return torch.load(path, map_location='cpu')
 
 
 class ConfigNode(dict):

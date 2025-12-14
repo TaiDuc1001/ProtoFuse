@@ -3,20 +3,18 @@ import time
 import math
 import json
 import torch
+import random
 import hashlib
 import datetime
 import torch.nn as nn
-from clip import clip
-from thop import profile
 import torch.nn.functional as F
 from torchvision import transforms
 from collections import defaultdict
-from functools import reduce
-from operator import mul
+from typing import Any, Dict, List, Optional
 from torchvision.datasets import ImageFolder
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
-from typing import Any, Dict, List, Optional
+
 from utils import (
     logger,
     setup_logging,
@@ -25,12 +23,9 @@ from utils import (
     save_confusion_artifacts,
     ConfigNode,
     set_global_seed,
-    deep_merge_dicts,
     build_config_namespace,
     create_argument_parser,
     process_parsed_args,
-    infer_override_value,
-    set_nested_value,
     parse_override_arguments,
     merge_configs,
     load_config_file,
@@ -39,6 +34,7 @@ from utils import (
     coerce_to_int,
     coerce_to_float,
     load_clip_to_cpu,
+    CheckpointCache,
 )
 
 ARG_SCHEMA = {
@@ -50,93 +46,6 @@ ARG_SCHEMA = {
 
 DEFAULT_TRAINING_EPOCHS = 100
 DEFAULT_CHECKPOINT_DIR = 'checkpoints/vpt'
-CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
-
-
-
-
-class CheckpointCache:
-    def __init__(self, cache_dir: str = DEFAULT_CHECKPOINT_DIR):
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        self.index_path = os.path.join(cache_dir, CHECKPOINT_INDEX_FILE)
-
-    def _get_key_settings(self, config) -> dict:
-        if hasattr(config, 'to_dict'):
-            config = config.to_dict()
-        return {
-            'method': 'vpt',
-            'dataset_root': config.get('data', {}).get('root'),
-            'kshot': config.get('data', {}).get('kshot'),
-            'seed': config.get('data', {}).get('seed'),
-            'epochs': config.get('training', {}).get('epochs'),
-            'backbone': config.get('model', {}).get('backbone'),
-            'num_tokens': config.get('model', {}).get('num_tokens'),
-            'deep_prompting': config.get('model', {}).get('deep_prompting'),
-        }
-
-    def compute_checkpoint_id(self, config) -> str:
-        key_settings = self._get_key_settings(config)
-        key_str = json.dumps(key_settings, sort_keys=True)
-        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
-
-    def get_checkpoint_path(self, checkpoint_id: str) -> str:
-        return os.path.join(self.cache_dir, f"vpt_ckpt_{checkpoint_id}.pt")
-
-    def exists(self, checkpoint_id: str) -> bool:
-        return os.path.exists(self.get_checkpoint_path(checkpoint_id))
-
-    def _update_index(self, checkpoint_id: str, key_settings: dict, path: str):
-        import csv
-        rows = []
-        fieldnames = ['checkpoint_id', 'file', 'method', 'dataset_root', 'kshot', 'seed',
-                      'epochs', 'backbone', 'num_tokens', 'deep_prompting', 'created_at']
-        if os.path.exists(self.index_path):
-            with open(self.index_path, 'r', newline='') as f:
-                reader = csv.DictReader(f)
-                rows = [row for row in reader if row.get('checkpoint_id') != checkpoint_id]
-        row = {
-            'checkpoint_id': checkpoint_id,
-            'file': os.path.basename(path),
-            'method': key_settings.get('method'),
-            'dataset_root': key_settings.get('dataset_root'),
-            'kshot': key_settings.get('kshot'),
-            'seed': key_settings.get('seed'),
-            'epochs': key_settings.get('epochs'),
-            'backbone': key_settings.get('backbone'),
-            'num_tokens': key_settings.get('num_tokens'),
-            'deep_prompting': key_settings.get('deep_prompting'),
-            'created_at': datetime.datetime.now().isoformat(),
-        }
-        rows.append(row)
-        with open(self.index_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def save(self, checkpoint_id, model_state, optimizer_state, scheduler_state,
-             labeled_indices, unlabeled_indices, metrics, config):
-        key_settings = self._get_key_settings(config)
-        checkpoint = {
-            'model_state_dict': model_state,
-            'optimizer_state_dict': optimizer_state,
-            'scheduler_state_dict': scheduler_state,
-            'labeled_indices': labeled_indices,
-            'unlabeled_indices': unlabeled_indices,
-            'metrics': metrics,
-            'config_snapshot': config.to_dict() if hasattr(config, 'to_dict') else dict(config),
-            'timestamp': datetime.datetime.now().isoformat(),
-        }
-        path = self.get_checkpoint_path(checkpoint_id)
-        torch.save(checkpoint, path)
-        self._update_index(checkpoint_id, key_settings, path)
-        return path
-
-    def load(self, checkpoint_id):
-        path = self.get_checkpoint_path(checkpoint_id)
-        if not os.path.exists(path):
-            return None
-        return torch.load(path, map_location='cpu')
 
 
 class ImageEncoder(nn.Module):
@@ -416,9 +325,13 @@ class VPT:
                 logits = self.model(images)
                 loss = F.cross_entropy(logits, labels)
             self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
         else:
             logits = self.model(images)
             loss = F.cross_entropy(logits, labels)
@@ -591,7 +504,7 @@ class VPTTrainingPipeline:
         model_state = ckpt['model_state_dict']
         if 'prompt_embeddings' in model_state:
             self.trainer.model.prompt_embeddings.data = model_state['prompt_embeddings']
-            if model_state.get('deep_prompt_embeddings') is not None:
+            if model_state.get('deep_prompt_embeddings') is not None and self.trainer.model.deep_prompt_embeddings is not None:
                 self.trainer.model.deep_prompt_embeddings.data = model_state['deep_prompt_embeddings']
         
         self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])

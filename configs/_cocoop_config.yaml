@@ -6,7 +6,7 @@ model:
 
 training:
   epochs: 100
-  batch_size: 2
+  batch_size: 4
   learning_rate: 0.002
   weight_decay: 0.0005
   optimizer: "SGD"
@@ -26,8 +26,8 @@ data:
   root: "datasets/cub-200-2011-renamed"
 
 checkpoint:
-  enabled: true
-  cache_dir: "checkpoints"
+  enabled: false
+  cache_dir: "checkpoints/cocoop"
 
 logging:
   output_dir: "outputs/cocoop"

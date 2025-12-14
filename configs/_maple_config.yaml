@@ -27,8 +27,8 @@ data:
   root: "datasets/cub-200-2011-renamed"
 
 checkpoint:
-  enabled: true
-  cache_dir: "checkpoints"
+  enabled: false
+  cache_dir: "checkpoints/maple"
 
 logging:
   output_dir: "outputs/maple"
