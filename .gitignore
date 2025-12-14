@@ -20,3 +20,5 @@ to_delete
 uv.lock
 
 checkpoints
+CoOp/
+multimodal-prompt-learning/

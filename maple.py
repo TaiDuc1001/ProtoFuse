@@ -1,18 +1,12 @@
 import os
-import sys
 import time
 import math
-import copy
 import json
 import torch
-import random
 import hashlib
-import argparse
 import datetime
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image as PILImage
 from torchvision import transforms
 from collections import defaultdict, OrderedDict
 from torchvision.datasets import ImageFolder
@@ -20,7 +14,6 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'multimodal-prompt-learning'))
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
@@ -30,6 +23,22 @@ from utils import (
     run_dataset_eda,
     save_class_distribution_plot,
     save_confusion_artifacts,
+    ConfigNode,
+    set_global_seed,
+    deep_merge_dicts,
+    build_config_namespace,
+    create_argument_parser,
+    process_parsed_args,
+    infer_override_value,
+    set_nested_value,
+    parse_override_arguments,
+    merge_configs,
+    load_config_file,
+    get_config_value,
+    coerce_to_str,
+    coerce_to_int,
+    coerce_to_float,
+    load_clip_to_cpu,
 )
 
 _tokenizer = _Tokenizer()
@@ -41,228 +50,11 @@ ARG_SCHEMA = {
     'debug': {'type': bool, 'help': 'Enable debug output', 'default': False},
 }
 
-
-def set_global_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 DEFAULT_TRAINING_EPOCHS = 100
-DEFAULT_CHECKPOINT_DIR = 'checkpoints'
+DEFAULT_CHECKPOINT_DIR = 'checkpoints/maple'
 CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
 
 
-class ConfigNode(dict):
-    def __init__(self, initial: Optional[Dict[str, Any]] = None):
-        super().__init__()
-        if initial:
-            self.update(initial)
-
-    def _convert(self, value: Any) -> Any:
-        if isinstance(value, dict) and not isinstance(value, ConfigNode):
-            return ConfigNode(value)
-        if isinstance(value, list):
-            return [self._convert(item) for item in value]
-        return value
-
-    def __getattr__(self, item: str) -> Any:
-        try:
-            return self[item]
-        except KeyError as exc:
-            raise AttributeError(f"Config key '{item}' not found") from exc
-
-    def __setattr__(self, key: str, value: Any) -> None:
-        self[key] = self._convert(value)
-
-    def update(self, *args, **kwargs) -> None:
-        for key, value in dict(*args, **kwargs).items():
-            super().__setitem__(key, self._convert(value))
-
-    def copy(self) -> "ConfigNode":
-        return ConfigNode(self.to_dict())
-
-    def to_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
-        for key, value in self.items():
-            if isinstance(value, ConfigNode):
-                result[key] = value.to_dict()
-            elif isinstance(value, list):
-                result[key] = [item.to_dict() if isinstance(item, ConfigNode) else item for item in value]
-            else:
-                result[key] = value
-        return result
-
-
-def deep_merge_dicts(target: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
-            deep_merge_dicts(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-    return target
-
-
-def build_config_namespace(base_config: Dict[str, Any], extra_values: Optional[Dict[str, Any]] = None) -> ConfigNode:
-    config_copy = copy.deepcopy(base_config)
-    if extra_values:
-        meta = config_copy.setdefault('meta', {})
-        deep_merge_dicts(meta, extra_values)
-    return ConfigNode(config_copy)
-
-
-def create_argument_parser(description, arg_schema):
-    parser = argparse.ArgumentParser(description=description)
-    for arg_name, spec in arg_schema.items():
-        kwargs = {
-            'type': spec['type'],
-            'help': spec['help']
-        }
-        if spec.get('required'):
-            kwargs['required'] = True
-        else:
-            kwargs['default'] = None
-        parser.add_argument(f'--{arg_name}', **kwargs)
-    return parser
-
-
-def process_parsed_args(parsed_args, arg_schema, overrides):
-    for arg_name, spec in arg_schema.items():
-        value = getattr(parsed_args, arg_name)
-        if value is not None and 'config_path' in spec:
-            keys = spec['config_path'].split('.')
-            set_nested_value(overrides, keys, value)
-    return overrides
-
-
-def infer_override_value(raw):
-    lowered = raw.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if lowered in ("none", "null"):
-        return None
-    try:
-        if raw.startswith(("0x", "-0x", "0X", "-0X")):
-            return int(raw, 16)
-        return int(raw)
-    except ValueError:
-        pass
-    try:
-        return float(raw)
-    except ValueError:
-        return raw
-
-
-def set_nested_value(config, keys, value):
-    current = config
-    for key in keys[:-1]:
-        if key not in current or not isinstance(current[key], dict):
-            current[key] = {}
-        current = current[key]
-    current[keys[-1]] = value
-
-
-def parse_override_arguments(tokens):
-    overrides = {}
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if not token.startswith("--"):
-            i += 1
-            continue
-        key_token = token[2:]
-        if "=" in key_token:
-            key_part, raw_value = key_token.split("=", 1)
-            value = infer_override_value(raw_value)
-        else:
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
-                value = infer_override_value(tokens[i + 1])
-                i += 1
-            else:
-                value = True
-            key_part = key_token
-        if not key_part:
-            i += 1
-            continue
-        keys = key_part.split(".")
-        set_nested_value(overrides, keys, value)
-        i += 1
-    return overrides
-
-
-def merge_configs(base, override):
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            merge_configs(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
-def load_config_file(path):
-    import yaml
-    with open(path, 'r') as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Configuration root must be a mapping.")
-    return data
-
-
-def get_config_value(config, path, default=None):
-    current = config
-    for key in path.split('.'):
-        if not isinstance(current, dict) or key not in current:
-            return default
-        current = current[key]
-    return current
-
-
-def coerce_to_str(value, default, key=None):
-    if value is None:
-        return str(default)
-    if isinstance(value, (list, dict)):
-        raise ValueError(f"Configuration value for {key or 'unknown'} must be a string.")
-    return str(value)
-
-
-def coerce_to_int(value, default, key=None):
-    if value is None:
-        return int(default)
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            try:
-                return int(float(value))
-            except ValueError as exc:
-                raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.") from exc
-    raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.")
-
-
-def coerce_to_float(value, default, key=None):
-    if value is None:
-        return float(default)
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError as exc:
-            raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.") from exc
-    raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.")
 
 
 class CheckpointCache:
@@ -365,9 +157,17 @@ class TextEncoder(nn.Module):
     def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)
-        combined = [x, compound_prompts_deeper_text, 0]
-        outputs = self.transformer(combined)
-        x = outputs[0]
+        n_ctx = compound_prompts_deeper_text[0].shape[0] if len(compound_prompts_deeper_text) > 0 else 0
+        
+        for i, resblock in enumerate(self.transformer.resblocks):
+            if i > 0 and i <= len(compound_prompts_deeper_text):
+                prefix = x[:1, :, :]
+                suffix = x[1 + n_ctx:, :, :]
+                textual_ctx = compound_prompts_deeper_text[i - 1]
+                textual_ctx = textual_ctx.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
+                x = torch.cat([prefix, textual_ctx, suffix], dim=0)
+            x = resblock(x)
+        
         x = x.permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
@@ -469,12 +269,58 @@ class MultiModalPromptLearner(nn.Module):
         return prompts, self.proj(self.ctx), self.compound_prompts_text, visual_deep_prompts
 
 
+class VisionEncoder(nn.Module):
+    def __init__(self, clip_visual):
+        super().__init__()
+        self.visual = clip_visual
+        self.conv1 = clip_visual.conv1
+        self.class_embedding = clip_visual.class_embedding
+        self.positional_embedding = clip_visual.positional_embedding
+        self.ln_pre = clip_visual.ln_pre
+        self.transformer = clip_visual.transformer
+        self.ln_post = clip_visual.ln_post
+        self.proj = clip_visual.proj
+
+    def forward(self, x, shared_ctx, compound_deeper_prompts):
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([
+            self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+            x
+        ], dim=1)
+        x = x + self.positional_embedding.to(x.dtype)
+        
+        visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).to(x.dtype)
+        x = torch.cat([x, visual_ctx], dim=1)
+        n_ctx = shared_ctx.shape[0]
+        
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)
+        
+        for i, resblock in enumerate(self.transformer.resblocks):
+            if i > 0 and i <= len(compound_deeper_prompts):
+                prefix = x[:x.shape[0] - n_ctx, :, :]
+                visual_ctx_i = compound_deeper_prompts[i - 1]
+                visual_ctx_i = visual_ctx_i.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
+                x = torch.cat([prefix, visual_ctx_i], dim=0)
+            x = resblock(x)
+        
+        x = x.permute(1, 0, 2)
+        x = self.ln_post(x[:, 0, :])
+        
+        if self.proj is not None:
+            x = x @ self.proj
+        
+        return x
+
+
 class MaPLeCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = MultiModalPromptLearner(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        self.image_encoder = clip_model.visual
+        self.image_encoder = VisionEncoder(clip_model.visual)
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
@@ -494,26 +340,9 @@ class MaPLeCLIP(nn.Module):
         return logits
 
 
-def load_clip_to_cpu_maple(backbone_name, n_ctx=2):
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, root='./models')
-    
-    try:
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
-    
-    design_details = {
-        "trainer": 'MaPLe',
-        "vision_depth": 0,
-        "language_depth": 0,
-        "vision_ctx": 0,
-        "language_ctx": 0,
-        "maple_length": n_ctx
-    }
-    model = clip.build_model(state_dict or model.state_dict(), design_details)
-    return model
+
+
+
 
 
 class MaPLe:
@@ -559,7 +388,7 @@ class MaPLe:
         
         logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
-        clip_model = load_clip_to_cpu_maple(backbone_name, n_ctx)
+        clip_model = load_clip_to_cpu(backbone_name)
         
         if self._cfg_str('fp32', 'training.precision', 'precision') in ['fp32', 'amp']:
             clip_model.float()
@@ -964,19 +793,17 @@ class MaPLeTrainingPipeline:
             logger.info("Skipping training (loaded from checkpoint)")
             return
 
-        maple_dir = os.path.join(self.run_dir, 'maple')
-        os.makedirs(maple_dir, exist_ok=True)
         train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
 
         for epoch_idx in range(1, epochs_total + 1):
-            self._run_epoch(epoch_idx, epochs_total, train_loader, maple_dir)
+            self._run_epoch(epoch_idx, epochs_total, train_loader, self.run_dir)
 
         self._save_checkpoint()
 
-    def _run_epoch(self, epoch_idx, epochs_total, train_loader, maple_dir):
+    def _run_epoch(self, epoch_idx, epochs_total, train_loader, run_dir):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before epoch run.")
         self.global_epoch += 1
@@ -1007,7 +834,7 @@ class MaPLeTrainingPipeline:
             all_preds = []
             all_labels = []
 
-        epoch_dir = os.path.join(maple_dir, f'epoch_{epoch_idx:03d}')
+        epoch_dir = os.path.join(run_dir, f'epoch_{epoch_idx:03d}')
         os.makedirs(epoch_dir, exist_ok=True)
 
         if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:

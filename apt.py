@@ -1,17 +1,11 @@
 import os
-import sys
 import time
-import math
-import copy
 import json
 import torch
-import random
 import hashlib
-import argparse
 import datetime
-import numpy as np
-from clip import clip
 import torch.nn as nn
+from clip import clip
 from thop import profile
 import torch.nn.functional as F
 from PIL import Image as PILImage
@@ -29,6 +23,22 @@ from utils import (
     save_confusion_artifacts,
     visualize_attention_maps,
     visualize_gradcam_maps,
+    ConfigNode,
+    set_global_seed,
+    deep_merge_dicts,
+    build_config_namespace,
+    create_argument_parser,
+    process_parsed_args,
+    infer_override_value,
+    set_nested_value,
+    parse_override_arguments,
+    merge_configs,
+    load_config_file,
+    get_config_value,
+    coerce_to_str,
+    coerce_to_int,
+    coerce_to_float,
+    load_clip_to_cpu,
 )
 
 from apt_ssl import (
@@ -52,18 +62,12 @@ ARG_SCHEMA = {
 }
 
 
-def set_global_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
+
+
 
 DEFAULT_TRAINING_EPOCHS = 100
-DEFAULT_CHECKPOINT_DIR = 'checkpoints'
+DEFAULT_CHECKPOINT_DIR = 'checkpoints/apt'
 CHECKPOINT_INDEX_FILE = 'checkpoint_index.csv'
 
 class DINODataset(torch.utils.data.Dataset):
@@ -161,203 +165,8 @@ class CheckpointCache:
             return None
         return torch.load(path, map_location='cpu')
 
-class ConfigNode(dict):
-    def __init__(self, initial: Optional[Dict[str, Any]] = None):
-        super().__init__()
-        if initial:
-            self.update(initial)
-
-    def _convert(self, value: Any) -> Any:
-        if isinstance(value, dict) and not isinstance(value, ConfigNode):
-            return ConfigNode(value)
-        if isinstance(value, list):
-            return [self._convert(item) for item in value]
-        return value
-
-    def __getattr__(self, item: str) -> Any:
-        try:
-            return self[item]
-        except KeyError as exc:
-            raise AttributeError(f"Config key '{item}' not found") from exc
-
-    def __setattr__(self, key: str, value: Any) -> None:
-        self[key] = self._convert(value)
-
-    def update(self, *args, **kwargs) -> None:
-        for key, value in dict(*args, **kwargs).items():
-            super().__setitem__(key, self._convert(value))
-
-    def copy(self) -> "ConfigNode":
-        return ConfigNode(self.to_dict())
-
-    def to_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
-        for key, value in self.items():
-            if isinstance(value, ConfigNode):
-                result[key] = value.to_dict()
-            elif isinstance(value, list):
-                result[key] = [item.to_dict() if isinstance(item, ConfigNode) else item for item in value]
-            else:
-                result[key] = value
-        return result
 
 
-def deep_merge_dicts(target: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
-            deep_merge_dicts(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-    return target
-
-
-def build_config_namespace(base_config: Dict[str, Any], extra_values: Optional[Dict[str, Any]] = None) -> ConfigNode:
-    config_copy = copy.deepcopy(base_config)
-    if extra_values:
-        meta = config_copy.setdefault('meta', {})
-        deep_merge_dicts(meta, extra_values)
-    return ConfigNode(config_copy)
-
-def create_argument_parser(description, arg_schema):
-    parser = argparse.ArgumentParser(description=description)
-    
-    for arg_name, spec in arg_schema.items():
-        kwargs = {
-            'type': spec['type'],
-            'help': spec['help']
-        }
-        if spec.get('required'):
-            kwargs['required'] = True
-        else:
-            kwargs['default'] = None
-            
-        parser.add_argument(f'--{arg_name}', **kwargs)
-    
-    return parser
-
-def process_parsed_args(parsed_args, arg_schema, overrides):
-    for arg_name, spec in arg_schema.items():
-        value = getattr(parsed_args, arg_name)
-        if value is not None and 'config_path' in spec:
-            keys = spec['config_path'].split('.')
-            set_nested_value(overrides, keys, value)
-    return overrides
-
-def infer_override_value(raw):
-    lowered = raw.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if lowered in ("none", "null"):
-        return None
-    try:
-        if raw.startswith(("0x", "-0x", "0X", "-0X")):
-            return int(raw, 16)
-        return int(raw)
-    except ValueError:
-        pass
-    try:
-        return float(raw)
-    except ValueError:
-        return raw
-
-def set_nested_value(config, keys, value):
-    current = config
-    for key in keys[:-1]:
-        if key not in current or not isinstance(current[key], dict):
-            current[key] = {}
-        current = current[key]
-    current[keys[-1]] = value
-
-def parse_override_arguments(tokens):
-    overrides = {}
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if not token.startswith("--"):
-            i += 1
-            continue
-        key_token = token[2:]
-        if "=" in key_token:
-            key_part, raw_value = key_token.split("=", 1)
-            value = infer_override_value(raw_value)
-        else:
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
-                value = infer_override_value(tokens[i + 1])
-                i += 1
-            else:
-                value = True
-            key_part = key_token
-        if not key_part:
-            i += 1
-            continue
-        keys = key_part.split(".")
-        set_nested_value(overrides, keys, value)
-        i += 1
-    return overrides
-
-def merge_configs(base, override):
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            merge_configs(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-def load_config_file(path):
-    import yaml
-    with open(path, 'r') as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Configuration root must be a mapping.")
-    return data
-
-def get_config_value(config, path, default=None):
-    current = config
-    for key in path.split('.'):
-        if not isinstance(current, dict) or key not in current:
-            return default
-        current = current[key]
-    return current
-
-def coerce_to_str(value, default, key=None):
-    if value is None:
-        return str(default)
-    if isinstance(value, (list, dict)):
-        raise ValueError(f"Configuration value for {key or 'unknown'} must be a string.")
-    return str(value)
-
-def coerce_to_int(value, default, key=None):
-    if value is None:
-        return int(default)
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            try:
-                return int(float(value))
-            except ValueError as exc:
-                raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.") from exc
-    raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.")
-
-def coerce_to_float(value, default, key=None):
-    if value is None:
-        return float(default)
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError as exc:
-            raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.") from exc
-    raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.")
 
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim, num_heads, dropout):
@@ -597,18 +406,8 @@ class CustomCLIP(nn.Module):
         names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
         return names
 
-def load_clip_to_cpu(backbone_name):
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, root='./models')
 
-    try:
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
 
-    model = clip.build_model(state_dict or model.state_dict())
-    return model
 
 class APT:
     def __init__(self, cfg, classnames, device="cuda"):
@@ -1828,20 +1627,18 @@ class APTTrainingPipeline:
             logger.info("Skipping training (loaded from checkpoint)")
             return
 
-        apt_dir = os.path.join(self.run_dir, 'apt')
-        os.makedirs(apt_dir, exist_ok=True)
         train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
 
         for epoch_idx in range(1, epochs_total + 1):
-            self._run_epoch(epoch_idx, epochs_total, train_loader, apt_dir)
+            self._run_epoch(epoch_idx, epochs_total, train_loader, self.run_dir)
 
         self.trainer_cfg.meta.completed_rounds = 1
         self._save_checkpoint()
 
-    def _run_epoch(self, epoch_idx, epochs_total, train_loader, apt_dir):
+    def _run_epoch(self, epoch_idx, epochs_total, train_loader, run_dir):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before epoch run.")
         self.global_epoch += 1
@@ -1872,7 +1669,7 @@ class APTTrainingPipeline:
             all_preds = []
             all_labels = []
 
-        epoch_dir = os.path.join(apt_dir, f'epoch_{epoch_idx:03d}')
+        epoch_dir = os.path.join(run_dir, f'epoch_{epoch_idx:03d}')
         os.makedirs(epoch_dir, exist_ok=True)
 
         if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:
