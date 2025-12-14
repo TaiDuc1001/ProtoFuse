@@ -331,6 +331,9 @@ class RichLogger:
 logger = RichLogger()
 
 
-def setup_logging(debug: bool = False) -> None:
+def setup_logging(debug: bool = False, no_color: bool = False) -> None:
     level = logging.DEBUG if debug else logging.INFO
+    if no_color:
+        plain_console = Console(no_color=True, force_terminal=False)
+        logger._console = plain_console
     logger._setup_handler(level)

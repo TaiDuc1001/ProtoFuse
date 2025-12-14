@@ -4,7 +4,6 @@ import math
 import json
 import torch
 import random
-import hashlib
 import datetime
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,6 +41,7 @@ ARG_SCHEMA = {
     'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
     'device': {'type': str, 'help': 'Override training.device from config', 'config_path': 'training.device'},
     'debug': {'type': bool, 'help': 'Enable debug output', 'default': False},
+    'disable_coloring': {'type': bool, 'help': 'Disable colored output for log files', 'default': False},
 }
 
 DEFAULT_TRAINING_EPOCHS = 100
@@ -774,7 +774,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
-    setup_logging(getattr(args, 'debug', True))
+    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', False))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = VPTTrainingPipeline(merged)
