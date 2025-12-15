@@ -37,6 +37,8 @@ from utils import (
     coerce_to_float,
     load_clip_to_cpu,
     CheckpointCache,
+    log_experiment_start,
+    log_experiment_accuracy,
 )
 
 _tokenizer = _Tokenizer()
@@ -509,6 +511,9 @@ class CoCoOPTrainingPipeline:
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
+
+        dataset_name = os.path.basename(self.dataset_root.rstrip('/'))
+        log_experiment_start("CoCoOP", dataset_name, self.kshot)
         
         logger.section("CoCoOP Training", "train")
         self._train_epochs()
@@ -726,6 +731,8 @@ class CoCoOPTrainingPipeline:
         self.trainer.save_model(self.last_model_path)
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
+
+        log_experiment_accuracy(self.best_val_acc)
 
 
 def parse_args():

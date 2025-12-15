@@ -34,6 +34,8 @@ from utils import (
     coerce_to_float,
     load_clip_to_cpu,
     CheckpointCache,
+    log_experiment_start,
+    log_experiment_accuracy,
 )
 
 ARG_SCHEMA = {
@@ -49,7 +51,7 @@ DEFAULT_CHECKPOINT_DIR = 'checkpoints/vpt'
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, clip_model):
+    def __init__(self, clip_model, embedding_dropout=0.0):
         super().__init__()
         visual = clip_model.visual
 
@@ -64,6 +66,8 @@ class ImageEncoder(nn.Module):
         self.patch_size = self.conv1.kernel_size[0]
         self.hidden_size = visual.class_embedding.shape[-1]
         self.num_layers = len(visual.transformer.resblocks)
+        
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
 
     def forward(self, x):
         x = x.type(self.conv1.weight.dtype)
@@ -76,27 +80,28 @@ class ImageEncoder(nn.Module):
         )
         x = torch.cat([cls_tokens, x], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
+        x = self.embedding_dropout(x)
 
         x = self.ln_pre(x)
         return x
 
-    def forward_transformer(self, x, prompts=None, deep_prompts=None, num_tokens=0):
+    def forward_transformer(self, x, prompt_embeddings=None, deep_prompt_embeddings=None, num_tokens=0, prompt_dropout=None, prompt_proj=None):
         x = x.permute(1, 0, 2)
+        B = x.shape[1]
         
         for idx, block in enumerate(self.transformer.resblocks):
-            if idx == 0 and prompts is not None:
+            if idx == 0 and prompt_embeddings is not None:
                 x = x.permute(1, 0, 2)
-                B = x.shape[0]
+                prompts = prompt_dropout(prompt_proj(prompt_embeddings)).expand(B, -1, -1)
                 x = torch.cat([
                     x[:, :1, :],
-                    prompts.expand(B, -1, -1),
+                    prompts,
                     x[:, 1:, :]
                 ], dim=1)
                 x = x.permute(1, 0, 2)
-            elif idx > 0 and deep_prompts is not None and idx <= deep_prompts.shape[0]:
+            elif idx > 0 and deep_prompt_embeddings is not None and idx <= deep_prompt_embeddings.shape[0]:
                 x = x.permute(1, 0, 2)
-                B = x.shape[0]
-                deep_prompt = deep_prompts[idx - 1].unsqueeze(0).expand(B, -1, -1)
+                deep_prompt = prompt_dropout(prompt_proj(deep_prompt_embeddings[idx - 1])).unsqueeze(0).expand(B, -1, -1)
                 x = torch.cat([
                     x[:, :1, :],
                     deep_prompt,
@@ -126,7 +131,8 @@ class PromptedCLIP(nn.Module):
         self.model_cfg = cfg.get('model', ConfigNode())
         self.device = device
         
-        self.encoder = ImageEncoder(clip_model)
+        embedding_dropout = coerce_to_float(self.model_cfg.get('embedding_dropout', 0.0), 0.0)
+        self.encoder = ImageEncoder(clip_model, embedding_dropout=embedding_dropout)
         for param in self.encoder.parameters():
             param.requires_grad = False
         
@@ -166,26 +172,16 @@ class PromptedCLIP(nn.Module):
         nn.init.zeros_(self.head.bias)
         nn.init.normal_(self.head.weight, std=0.01)
 
-    def incorporate_prompt(self, x):
-        B = x.shape[0]
-        prompts = self.prompt_dropout(self.prompt_proj(self.prompt_embeddings))
-        return prompts
-
-    def get_deep_prompts(self):
-        if self.deep_prompt_embeddings is None:
-            return None
-        return self.prompt_dropout(self.prompt_proj(self.deep_prompt_embeddings))
-
     def forward(self, x, return_features=False):
         embedded = self.encoder(x)
-        prompts = self.incorporate_prompt(embedded)
-        deep_prompts = self.get_deep_prompts()
         
         cls_features = self.encoder.forward_transformer(
             embedded, 
-            prompts=prompts, 
-            deep_prompts=deep_prompts,
-            num_tokens=self.num_tokens
+            prompt_embeddings=self.prompt_embeddings,
+            deep_prompt_embeddings=self.deep_prompt_embeddings,
+            num_tokens=self.num_tokens,
+            prompt_dropout=self.prompt_dropout,
+            prompt_proj=self.prompt_proj
         )
         
         logits = self.head(cls_features)
@@ -195,8 +191,14 @@ class PromptedCLIP(nn.Module):
         return logits
 
     def train(self, mode=True):
-        super().train(mode)
-        self.encoder.eval()
+        if mode:
+            self.encoder.eval()
+            self.prompt_proj.train()
+            self.prompt_dropout.train()
+            self.head.train()
+        else:
+            for module in self.children():
+                module.train(mode)
         return self
 
     def trainable_parameters(self):
@@ -288,8 +290,8 @@ class VPT:
         self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
     
     def setup_optimizer(self):
-        lr = self._cfg_float(0.001, 'training.learning_rate')
-        weight_decay = self._cfg_float(0.0005, 'training.weight_decay')
+        lr = self._cfg_float(0.1, 'training.learning_rate')
+        weight_decay = self._cfg_float(0.01, 'training.weight_decay')
         optimizer_type = self._cfg_str('SGD', 'training.optimizer')
         trainable_params = self.model.get_trainable_params_list()
         
@@ -301,7 +303,20 @@ class VPT:
             self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         
         num_epochs = self._cfg_int(DEFAULT_TRAINING_EPOCHS, 'training.epochs')
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
+        warmup_epochs = self._cfg_int(10, 'training.warmup_epochs')
+        
+        if warmup_epochs > 0 and warmup_epochs < num_epochs:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=num_epochs - warmup_epochs
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+            )
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
     
     def reset_optimizer_scheduler(self):
         self.setup_optimizer()
@@ -545,6 +560,9 @@ class VPTTrainingPipeline:
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
+
+        dataset_name = os.path.basename(self.dataset_root.rstrip('/'))
+        log_experiment_start("VPT", dataset_name, self.kshot)
         
         logger.section("VPT Training", "train")
         self._train_epochs()
@@ -762,6 +780,8 @@ class VPTTrainingPipeline:
         self.trainer.save_model(self.last_model_path)
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
+
+        log_experiment_accuracy(self.best_val_acc)
 
 
 def parse_args():

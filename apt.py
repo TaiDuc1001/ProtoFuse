@@ -41,6 +41,8 @@ from utils import (
     coerce_to_float,
     load_clip_to_cpu,
     CheckpointCache,
+    log_experiment_start,
+    log_experiment_accuracy,
 )
 
 from apt_ssl import (
@@ -781,6 +783,10 @@ class APTTrainingPipeline:
         self._load_dataset()
         self._split_dataset()
         self._initialize_trainer()
+
+        dataset_name = os.path.basename(self.dataset_root.rstrip('/'))
+        method_name = "ViFE" if self.use_ssl else "APT"
+        log_experiment_start(method_name, dataset_name, self.kshot)
         
         logger.section("APT Training", "train")
         self._train_epochs()
@@ -1723,6 +1729,8 @@ class APTTrainingPipeline:
         self.trainer.save_model(self.last_model_path)
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
+
+        log_experiment_accuracy(self.best_val_acc)
 
 def parse_args():
     parser = create_argument_parser("Train APT model", ARG_SCHEMA)

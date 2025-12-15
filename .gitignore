@@ -22,5 +22,6 @@ uv.lock
 checkpoints
 CoOp/
 multimodal-prompt-learning/
+vpt/
 _*.sh
 *.log
