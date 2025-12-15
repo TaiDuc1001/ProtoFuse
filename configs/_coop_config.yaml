@@ -4,7 +4,7 @@ model:
   ctx_init: ""
   csc: false
   class_token_position: "end"
-  dataset_name: "CUBirds"
+  dataset_name: "CUB-200-2011"
 
 training:
   epochs: 100

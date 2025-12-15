@@ -3,7 +3,7 @@ model:
   num_heads: 8
   num_layers: 1
   backbone: "ViT-B/16"
-  dataset_name: "CUBirds"
+  dataset_name: "CUB-200-2011"
   use_cache: False
 
 checkpoint:

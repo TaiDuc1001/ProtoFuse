@@ -3,7 +3,7 @@ model:
   n_ctx: 2
   prompt_depth: 9
   ctx_init: ""
-  dataset_name: "CUBirds"
+  dataset_name: "CUB-200-2011"
 
 training:
   epochs: 100

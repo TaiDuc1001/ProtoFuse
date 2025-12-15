@@ -178,7 +178,7 @@ class ImageEncoder(nn.Module):
 CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
     "StanfordDogs": "a photo of a {}, a type of dog.",
-    "OxfordFlowers": "a photo of a {}, a type of flower.",
+    "Flowers102": "a photo of a {}, a type of flower.",
     "FGVCAircraft": "a photo of a {}, a type of aircraft.",
     "DescribableTextures": "{} texture.",
     "EuroSAT": "a centered satellite photo of {}.",
@@ -192,7 +192,7 @@ CUSTOM_TEMPLATES = {
     "ImageNetV2": "a photo of a {}.",
     "ImageNetA": "a photo of a {}.",
     "ImageNetR": "a photo of a {}.",
-    "CUBirds": "a photo of a {}, a type of bird.",
+    "CUB-200-2011": "a photo of a {}, a type of bird.",
     "V1922_13": "a photo of a {}, a type of military vehicle."
 }
 
@@ -784,7 +784,7 @@ class APTTrainingPipeline:
         self._split_dataset()
         self._initialize_trainer()
 
-        dataset_name = os.path.basename(self.dataset_root.rstrip('/'))
+        dataset_name = self.config.model.dataset_name
         method_name = "ViFE" if self.use_ssl else "APT"
         log_experiment_start(method_name, dataset_name, self.kshot)
         

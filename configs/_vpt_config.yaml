@@ -4,7 +4,7 @@ model:
   deep_prompting: true
   prompt_dropout: 0.1
   prompt_project: -1
-  dataset_name: "CUBirds"
+  dataset_name: "CUB-200-2011"
 
 training:
   epochs: 100

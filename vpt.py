@@ -561,7 +561,7 @@ class VPTTrainingPipeline:
         self._split_dataset()
         self._initialize_trainer()
 
-        dataset_name = os.path.basename(self.dataset_root.rstrip('/'))
+        dataset_name = self.config.model.dataset_name
         log_experiment_start("VPT", dataset_name, self.kshot)
         
         logger.section("VPT Training", "train")
