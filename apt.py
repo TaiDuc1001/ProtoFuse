@@ -923,7 +923,8 @@ class APTTrainingPipeline:
     def _train_ssl_stage1(self):
         if self.dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before SSL training.")
-        if not self.unlabeled_indices:
+        use_labeled_for_ssl = bool(self.ssl_cfg.get('use_labeled_for_ssl', False))
+        if not use_labeled_for_ssl and not self.unlabeled_indices:
             logger.warning("SSL Stage 1 skipped: no unlabeled data available")
             return
 
@@ -1005,12 +1006,16 @@ class APTTrainingPipeline:
             local_views_batch = [torch.stack(lv_list) for lv_list in local_views_list]
             return global_views_batch, local_views_batch, torch.tensor(labels)
 
-        ssl_unlabeled_indices = self.unlabeled_indices
-        if num_unlabeled is not None and num_unlabeled < len(ssl_unlabeled_indices):
-            ssl_unlabeled_indices = ssl_unlabeled_indices[:num_unlabeled]
-            logger.debug(f"Limited unlabeled samples to {num_unlabeled}")
+        if use_labeled_for_ssl:
+            ssl_data_indices = list(self.train_indices)
+            logger.debug(f"Using labeled set for SSL: {len(ssl_data_indices)} samples")
+        else:
+            ssl_data_indices = self.unlabeled_indices
+            if num_unlabeled is not None and num_unlabeled < len(ssl_data_indices):
+                ssl_data_indices = ssl_data_indices[:num_unlabeled]
+                logger.debug(f"Limited unlabeled samples to {num_unlabeled}")
 
-        ssl_dataset = DINODataset(self.dataset, ssl_unlabeled_indices, dino_transform)
+        ssl_dataset = DINODataset(self.dataset, ssl_data_indices, dino_transform)
         ssl_loader = DataLoader(
             ssl_dataset,
             batch_size=self.ssl_batch_size,
@@ -1024,7 +1029,7 @@ class APTTrainingPipeline:
         self.ssl_vis_paths = None
         if num_plot > 0:
             class_to_indices = defaultdict(list)
-            for idx in ssl_unlabeled_indices:
+            for idx in ssl_data_indices:
                 _, label = self.dataset.samples[idx]
                 class_to_indices[label].append(idx)
             
@@ -1053,7 +1058,7 @@ class APTTrainingPipeline:
                 self.ssl_vis_paths.append(path)
             self.ssl_vis_images = torch.stack(self.ssl_vis_images)
 
-        logger.info(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_unlabeled_indices)} unlabeled samples")
+        logger.info(f"SSL Stage 1: {ssl_epochs} epochs on {len(ssl_data_indices)} samples")
         for epoch in range(1, ssl_epochs + 1):
             if self.ssl_student is None:
                 logger.warning("SSL student is None, skipping epoch")
