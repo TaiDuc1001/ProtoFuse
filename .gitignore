@@ -23,5 +23,6 @@ checkpoints
 CoOp/
 multimodal-prompt-learning/
 vpt/
+fixmatch/
 _*.sh
 *.log

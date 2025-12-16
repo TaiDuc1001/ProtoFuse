@@ -1,16 +1,21 @@
 import os
 import time
-import math
 import json
+import math
+import copy
 import torch
 import random
 import datetime
+import numpy as np
 import torch.nn as nn
+from clip import clip
+from thop import profile
 import torch.nn.functional as F
+from PIL import Image as PILImage
 from torchvision import transforms
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
 from torchvision.datasets import ImageFolder
+from typing import Any, Dict, List, Optional
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 
@@ -20,6 +25,8 @@ from utils import (
     run_dataset_eda,
     save_class_distribution_plot,
     save_confusion_artifacts,
+    visualize_attention_maps,
+    visualize_gradcam_maps,
     ConfigNode,
     set_global_seed,
     build_config_namespace,
@@ -47,11 +54,28 @@ ARG_SCHEMA = {
 }
 
 DEFAULT_TRAINING_EPOCHS = 100
-DEFAULT_CHECKPOINT_DIR = 'checkpoints/vpt'
+DEFAULT_CHECKPOINT_DIR = 'checkpoints/apt'
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, feature_dim, num_heads, dropout):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads)
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.norm2 = nn.LayerNorm(feature_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.feed_forward = nn.Linear(feature_dim, feature_dim)
+
+    def forward(self, unpooled, text_features):
+        out, attn_weights = self.cross_attn(text_features, unpooled, unpooled)
+        text_features = self.norm1(self.dropout(text_features + out))
+        ff = self.feed_forward(text_features)
+        text_features = self.norm2(self.dropout(text_features + ff))
+        return text_features, attn_weights
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, clip_model, embedding_dropout=0.0):
+    def __init__(self, clip_model):
         super().__init__()
         visual = clip_model.visual
 
@@ -64,10 +88,32 @@ class ImageEncoder(nn.Module):
         self.proj = visual.proj
         
         self.patch_size = self.conv1.kernel_size[0]
-        self.hidden_size = visual.class_embedding.shape[-1]
-        self.num_layers = len(visual.transformer.resblocks)
+        self._pos_embed_cache = {}
+
+    def _interpolate_pos_embed(self, pos_embed, num_patches):
+        expected_patches = pos_embed.shape[0] - 1
         
-        self.embedding_dropout = nn.Dropout(embedding_dropout)
+        if num_patches == expected_patches:
+            return pos_embed
+        
+        cache_key = (num_patches, pos_embed.device)
+        if cache_key in self._pos_embed_cache:
+            return self._pos_embed_cache[cache_key]
+        
+        cls_embed = pos_embed[:1]
+        patch_embed = pos_embed[1:]
+        
+        src_size = int(expected_patches ** 0.5)
+        tgt_size = int(num_patches ** 0.5)
+        
+        embed_dim = patch_embed.shape[-1]
+        patch_embed = patch_embed.reshape(1, src_size, src_size, embed_dim).permute(0, 3, 1, 2)
+        patch_embed = F.interpolate(patch_embed, size=(tgt_size, tgt_size), mode='bicubic', align_corners=False)
+        patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(num_patches, embed_dim)
+        
+        result = torch.cat([cls_embed, patch_embed], dim=0)
+        self._pos_embed_cache[cache_key] = result
+        return result
 
     def forward(self, x):
         x = x.type(self.conv1.weight.dtype)
@@ -79,150 +125,186 @@ class ImageEncoder(nn.Module):
             x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
         )
         x = torch.cat([cls_tokens, x], dim=1)
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.embedding_dropout(x)
+        
+        num_patches = x.shape[1] - 1
+        pos_embed = self._interpolate_pos_embed(self.positional_embedding, num_patches)
+        x = x + pos_embed.to(x.dtype)
 
         x = self.ln_pre(x)
-        return x
-
-    def forward_transformer(self, x, prompt_embeddings=None, deep_prompt_embeddings=None, num_tokens=0, prompt_dropout=None, prompt_proj=None):
         x = x.permute(1, 0, 2)
-        B = x.shape[1]
-        
+
         for idx, block in enumerate(self.transformer.resblocks):
-            if idx == 0 and prompt_embeddings is not None:
-                x = x.permute(1, 0, 2)
-                prompts = prompt_dropout(prompt_proj(prompt_embeddings)).expand(B, -1, -1)
-                x = torch.cat([
-                    x[:, :1, :],
-                    prompts,
-                    x[:, 1:, :]
-                ], dim=1)
-                x = x.permute(1, 0, 2)
-            elif idx > 0 and deep_prompt_embeddings is not None and idx <= deep_prompt_embeddings.shape[0]:
-                x = x.permute(1, 0, 2)
-                deep_prompt = prompt_dropout(prompt_proj(deep_prompt_embeddings[idx - 1])).unsqueeze(0).expand(B, -1, -1)
-                x = torch.cat([
-                    x[:, :1, :],
-                    deep_prompt,
-                    x[:, 1 + num_tokens:, :]
-                ], dim=1)
-                x = x.permute(1, 0, 2)
-            
             x = block(x)
 
-        x = x.permute(1, 0, 2)
-        x = self.ln_post(x)
-        
-        cls_output = x[:, 0, :]
+        final_unpooled = x.permute(1, 0, 2)
+        final_unpooled = self.ln_post(final_unpooled)
+
         if self.proj is not None:
-            cls_output = cls_output @ self.proj
-        
-        return cls_output
+            final_unpooled = final_unpooled @ self.proj
+
+        global_feature = final_unpooled[:, 0, :]
+        return final_unpooled, global_feature
 
 
-class PromptedCLIP(nn.Module):
-    def __init__(self, cfg, clip_model, num_classes, device):
+CUSTOM_TEMPLATES = {
+    "OxfordPets": "a photo of a {}, a type of pet.",
+    "StanfordDogs": "a photo of a {}, a type of dog.",
+    "Flowers102": "a photo of a {}, a type of flower.",
+    "FGVCAircraft": "a photo of a {}, a type of aircraft.",
+    "DescribableTextures": "{} texture.",
+    "EuroSAT": "a centered satellite photo of {}.",
+    "StanfordCars": "a photo of a {}.",
+    "Food101": "a photo of {}, a type of food.",
+    "SUN397": "a photo of a {}.",
+    "Caltech101": "a photo of a {}.",
+    "UCF101": "a photo of a person doing {}.",
+    "ImageNet": "a photo of a {}.",
+    "ImageNetSketch": "a photo of a {}.",
+    "ImageNetV2": "a photo of a {}.",
+    "ImageNetA": "a photo of a {}.",
+    "ImageNetR": "a photo of a {}.",
+    "CUB-200-2011": "a photo of a {}, a type of bird.",
+    "V1922_13": "a photo of a {}, a type of military vehicle."
+}
+
+
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
         super().__init__()
-        
+        self.clip_model = clip_model
+        self.dtype = clip_model.dtype
+        self.text_projection = clip_model.text_projection
+
+    def encode_text_tokens(self, text):
+        x = self.clip_model.token_embedding(text).type(self.dtype)
+        x = x + self.clip_model.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)
+        x = self.clip_model.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.clip_model.ln_final(x).type(self.dtype)
+        return x
+
+    def cls_from_tokens(self, tokens, text):
+        eos = text.argmax(dim=-1)
+        cls = tokens[torch.arange(tokens.shape[0]), eos]
+        return cls @ self.text_projection
+
+    def encode_text(self, text):
+        tokens = self.encode_text_tokens(text)
+        return self.cls_from_tokens(tokens, text)
+
+
+class CustomCLIP(nn.Module):
+    def __init__(self, cfg, classnames, clip_model, device):
+        super().__init__()
+        self.clip_model = clip_model.to(device)
         if not isinstance(cfg, ConfigNode):
             cfg = ConfigNode(cfg)
         self.cfg = cfg
-        self.model_cfg = cfg.get('model', ConfigNode())
+        self.model_cfg = getattr(self.cfg, 'model', ConfigNode())
+        self.training_cfg = getattr(self.cfg, 'training', ConfigNode())
         self.device = device
-        
-        embedding_dropout = coerce_to_float(self.model_cfg.get('embedding_dropout', 0.0), 0.0)
-        self.encoder = ImageEncoder(clip_model, embedding_dropout=embedding_dropout)
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        
-        hidden_size = self.encoder.hidden_size
-        num_layers = self.encoder.num_layers
-        patch_size = self.encoder.patch_size
-        
-        self.num_tokens = coerce_to_int(self.model_cfg.get('num_tokens', 10), 10)
-        self.deep_prompting = bool(self.model_cfg.get('deep_prompting', True))
-        prompt_dropout = coerce_to_float(self.model_cfg.get('prompt_dropout', 0.1), 0.1)
-        prompt_project = coerce_to_int(self.model_cfg.get('prompt_project', -1), -1)
-        
-        if prompt_project > 0:
-            prompt_dim = prompt_project
-            self.prompt_proj = nn.Linear(prompt_dim, hidden_size)
-            nn.init.kaiming_normal_(self.prompt_proj.weight, a=0, mode='fan_out')
-        else:
-            prompt_dim = hidden_size
-            self.prompt_proj = nn.Identity()
-        
-        self.prompt_dropout = nn.Dropout(prompt_dropout)
-        
-        val = math.sqrt(6. / float(3 * patch_size * patch_size + prompt_dim))
-        self.prompt_embeddings = nn.Parameter(torch.zeros(1, self.num_tokens, prompt_dim))
-        nn.init.uniform_(self.prompt_embeddings.data, -val, val)
-        
-        if self.deep_prompting:
-            self.deep_prompt_embeddings = nn.Parameter(
-                torch.zeros(num_layers - 1, self.num_tokens, prompt_dim)
-            )
-            nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
-        else:
-            self.deep_prompt_embeddings = None
-        
-        output_dim = self.encoder.proj.shape[1] if self.encoder.proj is not None else hidden_size
-        self.head = nn.Linear(output_dim, num_classes)
-        nn.init.zeros_(self.head.bias)
-        nn.init.normal_(self.head.weight, std=0.01)
 
-    def forward(self, x, return_features=False):
-        embedded = self.encoder(x)
+        prompt_dim = self.clip_model.text_projection.shape[1]
+        num_heads = self.model_cfg.get('num_heads', 8)
+        dropout = self.model_cfg.get('dropout', 0.1)
+
+        prompt_layers = []
+        for _ in range(self.model_cfg.get('num_layers', 1)):
+            prompt_layers.append(
+                CrossAttention(
+                    feature_dim=prompt_dim,
+                    num_heads=num_heads,
+                    dropout=dropout
+                )
+            )
+        self.prompt_learner = nn.ModuleList(prompt_layers)
+
+        if self.training_cfg.get('precision', 'fp32') == 'fp16':
+            self.prompt_learner = self.prompt_learner.half()
+
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+        self.vis_encoder = ImageEncoder(self.clip_model)
+        self.logit_scale = clip_model.logit_scale
+
+        self.text_features, self.prompts, self.text_tokens = self._init_text_feats(self.model_cfg, classnames)
+        self.base_text_features = self.text_features.clone().detach()
+
+    def _init_text_feats(self, cfg, classnames):
+        dataset_name = cfg.get('dataset_name', 'ImageNet')
+        temp = CUSTOM_TEMPLATES.get(dataset_name, "a photo of a {}.")
+        myencoder = TextEncoder(self.clip_model).to(self.device)
+        prompts = [temp.format(c.replace('_', ' ')) for c in classnames]
+
+        prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        prompts = prompts.to(self.device)
+        tokens = myencoder.encode_text_tokens(prompts)
+        text_features = myencoder.cls_from_tokens(tokens, prompts)
+
+        tokens = None
+        return text_features, prompts, tokens
+
+    def forward(self, image, label=None):
+        with torch.no_grad():
+            pass
+
+        visual_output = self.vis_encoder(image)
+        unpooled_levels, image_features = visual_output
+        if not isinstance(unpooled_levels, list):
+            unpooled_levels = [unpooled_levels]
+
+        attn_maps = []
+        base_text_features = self.text_features.clone()
+
+        unpooled_images = unpooled_levels[0].permute(1, 0, 2)
+        text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
+
+        for layer in self.prompt_learner:
+            text_features, attn_weights = layer(unpooled_images, text_features)
+            attn_maps.append(attn_weights)
+
+        text_features = text_features.permute(1, 0, 2)
+        text_features = F.normalize(text_features, dim=-1)
         
-        cls_features = self.encoder.forward_transformer(
-            embedded, 
-            prompt_embeddings=self.prompt_embeddings,
-            deep_prompt_embeddings=self.deep_prompt_embeddings,
-            num_tokens=self.num_tokens,
-            prompt_dropout=self.prompt_dropout,
-            prompt_proj=self.prompt_proj
-        )
+        logit_scale = self.logit_scale.exp()
+        image_features = F.normalize(image_features, dim=-1)
+        image_features = image_features.unsqueeze(1)
         
-        logits = self.head(cls_features)
-        
-        if return_features:
-            return logits, cls_features
+        logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
+
+        mode = self.cfg.get('mode', self.training_cfg.get('mode', 'logits'))
+
+        if self.training and label is not None:
+            loss = F.cross_entropy(logits, label)
+            return loss, logits
+        elif mode == "logits":
+            return logits
+        elif mode == "map":
+            return logits, attn_maps
+        elif mode == "features":
+            return logits, text_features
+
         return logits
 
-    def train(self, mode=True):
-        if mode:
-            self.encoder.eval()
-            self.prompt_proj.train()
-            self.prompt_dropout.train()
-            self.head.train()
-        else:
-            for module in self.children():
-                module.train(mode)
-        return self
+    def _prompt_layers_iter(self):
+        if isinstance(self.prompt_learner, nn.ModuleList):
+            return self.prompt_learner
+        return [self.prompt_learner]
+
+    def _prepare_text_features(self):
+        return self.text_features.clone()
 
     def trainable_parameters(self):
-        yield from self.prompt_embeddings.unsqueeze(0).parameters() if False else [self.prompt_embeddings]
-        if self.deep_prompt_embeddings is not None:
-            yield self.deep_prompt_embeddings
-        yield from self.prompt_proj.parameters()
-        yield from self.head.parameters()
+        return self.prompt_learner.parameters()
 
-    def get_trainable_params_list(self):
-        params = [self.prompt_embeddings]
-        if self.deep_prompt_embeddings is not None:
-            params.append(self.deep_prompt_embeddings)
-        params.extend(list(self.prompt_proj.parameters()))
-        params.extend(list(self.head.parameters()))
-        return params
+    def get_trainable_parameter_names(self):
+        names = [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
+        return names
 
 
-
-
-
-
-
-class VPT:
+class APT:
     def __init__(self, cfg, classnames, device="cuda"):
         if not isinstance(cfg, ConfigNode):
             cfg = ConfigNode(cfg)
@@ -232,6 +314,9 @@ class VPT:
         self.data_cfg = self.cfg.get('data', ConfigNode())
         self.classnames = classnames
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        self.gradients = None
+        self.activations = None
         
         self.build_model()
         self.setup_optimizer()
@@ -244,6 +329,7 @@ class VPT:
             value = get_config_value(self.cfg, path, sentinel)
             if value is not sentinel:
                 return value
+            logger.debug(f"Config path '{path}' not found. Using default: {default}")
         return default
     
     def _cfg_float(self, default, *paths):
@@ -259,7 +345,7 @@ class VPT:
         return coerce_to_str(value, default)
     
     def build_model(self):
-        backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
+        backbone_name = self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
         logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
         clip_model = load_clip_to_cpu(backbone_name)
@@ -267,11 +353,10 @@ class VPT:
         if self._cfg_str('fp32', 'training.precision', 'precision') in ['fp32', 'amp']:
             clip_model.float()
 
-        num_classes = len(self.classnames)
-        self.model = PromptedCLIP(self.cfg, clip_model, num_classes, self.device)
+        self.model = CustomCLIP(self.cfg, self.classnames, clip_model, self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.get_trainable_params_list())
+        learnable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
         def format_params(num):
             if num >= 1e9:
@@ -283,17 +368,49 @@ class VPT:
             else:
                 return str(num)
         
-        logger.info(f"VPT: num_tokens={self.model.num_tokens}, deep_prompting={self.model.deep_prompting}")
-        logger.info(f"Learnable parameters: {format_params(trainable_params)} / Total: {format_params(total_params)}")
+        flops_results = {}
+        self.model.to(self.device)
+        self.model.eval()
         
+        for param in self.model.parameters():
+            if param.device != self.device:
+                param.data = param.data.to(self.device)
+        
+        input_tensor = torch.randn(1, 3, 224, 224, device=self.device, dtype=torch.float32)
+        
+        flops_results = {}
+        with torch.no_grad():
+            model_copy = copy.deepcopy(self.model)
+            model_copy.to(self.device)
+            result = profile(model_copy, inputs=(input_tensor,), verbose=False)
+            if isinstance(result, (list, tuple)):
+                macs = result[0] if len(result) > 0 else 0
+            else:
+                macs = result
+            gflops_thop = macs / 1e9
+            flops_results['thop'] = gflops_thop
+            del model_copy
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        logger.info(f"Learnable parameters: {format_params(learnable_params)} / Total: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)")
+        
+        trainable_names = set(self.model.get_trainable_parameter_names())
+        for name, param in self.model.named_parameters():
+            param.requires_grad_(name in trainable_names)
+        
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+
         self.model.to(self.device)
         self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
     
     def setup_optimizer(self):
-        lr = self._cfg_float(0.1, 'training.learning_rate')
-        weight_decay = self._cfg_float(0.01, 'training.weight_decay')
+        lr = self._cfg_float(0.002, 'training.learning_rate')
+        weight_decay = self._cfg_float(0.0005, 'training.weight_decay')
         optimizer_type = self._cfg_str('SGD', 'training.optimizer')
-        trainable_params = self.model.get_trainable_params_list()
+        trainable_params = list(self.model.trainable_parameters())
         
         if optimizer_type == 'AdamW':
             self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
@@ -303,20 +420,7 @@ class VPT:
             self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         
         num_epochs = self._cfg_int(DEFAULT_TRAINING_EPOCHS, 'training.epochs')
-        warmup_epochs = self._cfg_int(10, 'training.warmup_epochs')
-        
-        if warmup_epochs > 0 and warmup_epochs < num_epochs:
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
-            )
-            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=num_epochs - warmup_epochs
-            )
-            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-                self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
-            )
-        else:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
     
     def reset_optimizer_scheduler(self):
         self.setup_optimizer()
@@ -332,24 +436,19 @@ class VPT:
         labels = labels.to(self.device)
         
         self.model.train()
+        self.model.prompt_learner.train()
         
         precision = self._cfg_str('fp32', 'training.precision', 'precision')
         
         if precision == 'amp':
             with autocast():
-                logits = self.model(images)
-                loss = F.cross_entropy(logits, labels)
+                loss, logits = self.model(images, labels)
             self.optimizer.zero_grad()
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
         else:
-            logits = self.model(images)
-            loss = F.cross_entropy(logits, labels)
+            loss, logits = self.model(images, labels)
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -377,7 +476,10 @@ class VPT:
                 labels = labels.to(self.device)
 
                 logits = self.model(images)
-                loss = F.cross_entropy(logits, labels)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+
+                loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
                 running_loss += loss.item()
                 steps += 1
 
@@ -393,10 +495,7 @@ class VPT:
     
     def save_model(self, path):
         checkpoint = {
-            'prompt_embeddings': self.model.prompt_embeddings.data,
-            'deep_prompt_embeddings': self.model.deep_prompt_embeddings.data if self.model.deep_prompt_embeddings is not None else None,
-            'prompt_proj_state_dict': self.model.prompt_proj.state_dict() if not isinstance(self.model.prompt_proj, nn.Identity) else None,
-            'head_state_dict': self.model.head.state_dict(),
+            'prompt_learner_state_dict': self.model.prompt_learner.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'cfg': self.cfg
@@ -406,18 +505,86 @@ class VPT:
     
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.prompt_embeddings.data = checkpoint['prompt_embeddings']
-        if checkpoint['deep_prompt_embeddings'] is not None and self.model.deep_prompt_embeddings is not None:
-            self.model.deep_prompt_embeddings.data = checkpoint['deep_prompt_embeddings']
-        if checkpoint['prompt_proj_state_dict'] is not None and not isinstance(self.model.prompt_proj, nn.Identity):
-            self.model.prompt_proj.load_state_dict(checkpoint['prompt_proj_state_dict'])
-        self.model.head.load_state_dict(checkpoint['head_state_dict'])
+        if 'prompt_learner_state_dict' in checkpoint:
+            self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'])
+        elif 'model_state_dict' in checkpoint:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         logger.info(f"Model loaded from {path}")
 
+    def generate_gradcam(self, images, target_classes):
+        original_mode = self.model.training
+        self.model.train()
+        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(True)
+            
+        images = images.to(self.device)
+        images.requires_grad_(True)
+        
+        encoder_output = self.model.vis_encoder(images)
+        target_unpooled, _ = encoder_output
 
-class VPTTrainingPipeline:
+        target_unpooled.retain_grad()
+        batch_size = images.shape[0]
+        gradcams = []
+        
+        for i in range(batch_size):
+            base_text = self.model._prepare_text_features()
+            unpooled_single = target_unpooled[i:i+1].permute(1, 0, 2)
+            text_features = base_text.unsqueeze(1).expand(-1, unpooled_single.shape[1], -1)
+            for layer in self.model._prompt_layers_iter():
+                text_features, _ = layer(unpooled_single, text_features)
+
+            text_features = text_features.permute(1, 0, 2)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            image_features = target_unpooled[i:i+1, 0, :]
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = image_features.unsqueeze(1)
+            
+            logit_scale = self.model.logit_scale.exp()
+            logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
+            score = logits[0, target_classes[i]]
+            
+            self.model.zero_grad()
+            score.backward(retain_graph=True)
+            
+            if target_unpooled.grad is None:
+                gradcams.append(np.zeros((8, 8)))
+                logger.warning("Empty CAM encountered")
+                continue
+            gradients = target_unpooled.grad[i]
+            activations = target_unpooled[i]
+            weights = torch.mean(gradients[1:], dim=0)
+            cam = torch.sum(activations[1:] * weights, dim=-1)
+            cam = F.relu(cam)
+            cam_before = cam.detach().cpu().numpy()
+            
+            if cam_before.size > 0:
+                cam = (cam_before - cam_before.min()) / (cam_before.max() - cam_before.min() + 1e-8)
+                num_patches = cam.size
+                grid_size = int(np.sqrt(num_patches))
+                if grid_size * grid_size == num_patches:
+                    cam = cam.reshape(grid_size, grid_size)
+                else:
+                    cam = np.pad(cam, (0, grid_size * grid_size - num_patches), mode='constant').reshape(grid_size, grid_size)
+                    logger.warning("CAM size is not a perfect square, padding")
+            else:
+                logger.warning("Empty CAM encountered")
+                cam = np.zeros((8, 8))
+            
+            gradcams.append(cam)
+            if target_unpooled.grad is not None:
+                target_unpooled.grad.zero_()
+        
+        for param in self.model.vis_encoder.parameters():
+            param.requires_grad_(False)
+        self.model.train(original_mode)
+        return gradcams
+
+
+class APTTrainingPipeline:
     def __init__(self, config):
         if not isinstance(config, ConfigNode):
             config = ConfigNode(config)
@@ -432,7 +599,7 @@ class VPTTrainingPipeline:
         self.device = torch.device(device_name if torch.cuda.is_available() else "cpu")
 
         batch_value = self.training_cfg.get("batch_size", None)
-        self.batch_size = coerce_to_int(batch_value, 32, key="training.batch_size")
+        self.batch_size = coerce_to_int(batch_value, 8, key="training.batch_size")
 
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
@@ -459,8 +626,8 @@ class VPTTrainingPipeline:
         class_dist_value = get_config_value(self.training_cfg, "class_distribution", False)
         self.class_distribution_enabled = bool(False if class_dist_value is None else class_dist_value)
 
-        base_output_value = self.logging_cfg.get("output_dir", "outputs/vpt")
-        base_output = coerce_to_str(base_output_value, "outputs/vpt", key="logging.output_dir")
+        base_output_value = self.logging_cfg.get("output_dir", "outputs/apt_original")
+        base_output = coerce_to_str(base_output_value, "outputs/apt_original", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
         logger.info(f"Run directory: {self.run_dir}")
@@ -483,8 +650,11 @@ class VPTTrainingPipeline:
         self.metrics: List[Dict[str, Any]] = []
         self.best_val_acc = -float('inf')
         self.global_epoch = 0
+        self.sample_cache = {
+            'images': None, 'labels': None, 'paths': [], 'decoded_prompts': None
+        }
 
-        self.trainer: Optional[VPT] = None
+        self.trainer: Optional[APT] = None
         self.trainer_cfg: ConfigNode = ConfigNode({})
 
         self.checkpoint_cache: Optional[CheckpointCache] = None
@@ -515,13 +685,16 @@ class VPTTrainingPipeline:
             return False
         if self.trainer is None:
             return False
-        
         model_state = ckpt['model_state_dict']
-        if 'prompt_embeddings' in model_state:
-            self.trainer.model.prompt_embeddings.data = model_state['prompt_embeddings']
-            if model_state.get('deep_prompt_embeddings') is not None and self.trainer.model.deep_prompt_embeddings is not None:
-                self.trainer.model.deep_prompt_embeddings.data = model_state['deep_prompt_embeddings']
-        
+        first_key = next(iter(model_state.keys()), '')
+        if first_key.startswith('0.'):
+            self.trainer.model.prompt_learner.load_state_dict(model_state)
+        else:
+            prompt_state = {k.replace('prompt_learner.', ''): v for k, v in model_state.items() if k.startswith('prompt_learner.')}
+            if prompt_state:
+                self.trainer.model.prompt_learner.load_state_dict(prompt_state)
+            else:
+                self.trainer.model.load_state_dict(model_state, strict=False)
         self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         self.trainer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         self.labeled_indices = ckpt['labeled_indices']
@@ -536,13 +709,9 @@ class VPTTrainingPipeline:
             return
         if self.trainer is None:
             return
-        model_state = {
-            'prompt_embeddings': self.trainer.model.prompt_embeddings.data,
-            'deep_prompt_embeddings': self.trainer.model.deep_prompt_embeddings.data if self.trainer.model.deep_prompt_embeddings is not None else None,
-        }
         path = self.checkpoint_cache.save(
             self.checkpoint_id,
-            model_state,
+            self.trainer.model.prompt_learner.state_dict(),
             self.trainer.optimizer.state_dict(),
             self.trainer.scheduler.state_dict(),
             self.labeled_indices,
@@ -562,9 +731,9 @@ class VPTTrainingPipeline:
         self._initialize_trainer()
 
         dataset_name = self.config.model.dataset_name
-        log_experiment_start("VPT", dataset_name, self.kshot)
+        log_experiment_start("APT", dataset_name, self.kshot)
         
-        logger.section("VPT Training", "train")
+        logger.section("APT Training", "train")
         self._train_epochs()
         
         logger.section("Finalization", "save")
@@ -675,7 +844,7 @@ class VPTTrainingPipeline:
     def _initialize_trainer(self):
         if not self.classnames:
             raise RuntimeError("Class names unavailable before trainer initialization.")
-        self.trainer = VPT(self.trainer_cfg, self.classnames, device=str(self.device))
+        self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device))
 
     def _train_epochs(self):
         if self.dataset is None or self.trainer is None:
@@ -743,6 +912,18 @@ class VPTTrainingPipeline:
                 self.classnames,
             )
 
+        self._refresh_sample_cache(all_labels)
+
+        if bool(get_config_value(self.training_cfg, 'visualize_attention', False)):
+            attention_dir = os.path.join(epoch_dir, 'attention')
+            os.makedirs(attention_dir, exist_ok=True)
+            self._export_attention_overlays(attention_dir)
+
+        if bool(get_config_value(self.training_cfg, 'visualize_gradcam', False)):
+            gradcam_dir = os.path.join(epoch_dir, 'gradcam')
+            os.makedirs(gradcam_dir, exist_ok=True)
+            self._export_gradcam_overlays(gradcam_dir)
+
         epoch_time = time.time() - start_time
         epoch_result = {
             'epoch': epoch_idx,
@@ -762,10 +943,81 @@ class VPTTrainingPipeline:
             self.trainer.save_model(self.best_model_path)
 
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        logger.info(f"VPT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+        logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
+
+    def _refresh_sample_cache(self, all_labels):
+        if self.dataset is None:
+            return
+        if self.val_loader is None or len(self.val_indices) == 0:
+            return
+
+        num_display = min(10, len(self.classnames), len(self.val_indices))
+        selected_indices = []
+        seen_classes = set()
+        for idx in self.val_indices:
+            cls_idx = self.dataset.samples[idx][1]
+            if cls_idx not in seen_classes:
+                seen_classes.add(cls_idx)
+                selected_indices.append(idx)
+            if len(selected_indices) >= num_display:
+                break
+
+        if len(selected_indices) == 0:
+            try:
+                batch_data = next(iter(self.val_loader))
+                if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                    self.sample_cache['images'] = batch_data[0]
+                    self.sample_cache['labels'] = batch_data[1]
+                    batch_indices = self.val_indices[:len(batch_data[0])]
+                    self.sample_cache['paths'] = [os.path.abspath(self.dataset.samples[idx][0]) for idx in batch_indices]
+                else:
+                    self.sample_cache['images'] = batch_data
+                    self.sample_cache['labels'] = None
+                    self.sample_cache['paths'] = []
+            except StopIteration:
+                self.sample_cache['images'] = None
+                self.sample_cache['labels'] = None
+                self.sample_cache['paths'] = []
+        else:
+            sample_images_list = []
+            sample_labels_list = []
+            sample_paths = []
+            for idx in selected_indices:
+                img, lbl = self.dataset[idx]
+                sample_images_list.append(img)
+                sample_labels_list.append(lbl)
+                sample_paths.append(os.path.abspath(self.dataset.samples[idx][0]))
+
+            self.sample_cache['images'] = torch.stack(sample_images_list)
+            self.sample_cache['labels'] = torch.tensor(sample_labels_list)
+            self.sample_cache['paths'] = sample_paths
+
+    def _export_attention_overlays(self, maps_dir):
+        if self.trainer is None:
+            return
+        visualize_attention_maps(
+            self.trainer,
+            self.dataset,
+            self.sample_cache,
+            self.classnames,
+            self.global_epoch,
+            maps_dir,
+        )
+
+    def _export_gradcam_overlays(self, maps_dir):
+        if self.trainer is None:
+            return
+        visualize_gradcam_maps(
+            self.trainer,
+            self.dataset,
+            self.sample_cache,
+            self.classnames,
+            self.global_epoch,
+            maps_dir,
+        )
 
     def _finalize(self):
         if self.trainer is None:
@@ -785,7 +1037,7 @@ class VPTTrainingPipeline:
 
 
 def parse_args():
-    parser = create_argument_parser("Train VPT model", ARG_SCHEMA)
+    parser = create_argument_parser("Train APT model (Original)", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
@@ -797,7 +1049,7 @@ def main():
     setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', False))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
-    pipeline = VPTTrainingPipeline(merged)
+    pipeline = APTTrainingPipeline(merged)
     pipeline.run()
 
 

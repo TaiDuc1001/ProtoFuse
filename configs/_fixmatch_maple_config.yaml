@@ -1,14 +1,19 @@
 model:
-  dropout: 0.2
-  num_heads: 8
-  num_layers: 1
+  n_ctx: 2
+  ctx_init: "a photo of a"
+  prompt_depth: 9
   backbone: "ViT-B/16"
   dataset_name: "CUB-200-2011"
-  use_cache: false
+
+fixmatch:
+  enabled: true
+  confidence: 0.95
+  wu: 1.0
+  unlabeled_batch_size: 56
 
 checkpoint:
   enabled: false
-  cache_dir: "checkpoints"
+  cache_dir: "checkpoints/fixmatch_maple"
 
 training:
   epochs: 10
@@ -17,24 +22,18 @@ training:
   device: "cuda:0"
   precision: "fp32"
   optimizer: "SGD"
-  use_cutout: false
-  increment_epochs: 0
-  learning_rate: 0.001
+  learning_rate: 0.0035
   weight_decay: 0.0005
-  confusion_matrix: false
-  visualize_gradcam: false
-  class_distribution: false
-  visualize_attention: false
 
 data:
-  kshot: 1
+  kshot: 16
   seed: 42
-  val_size: 0.7
-  num_workers: 4
+  val_size: 0.2
+  num_workers: 8
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
   root: "datasets/cub-200-2011-renamed"
 
 logging:
-  output_dir: "outputs/analyze"
+  output_dir: "outputs/fixmatch_maple"
