@@ -590,7 +590,7 @@ class MaPLeTrainingPipeline:
         self._initialize_trainer()
 
         dataset_name = self.config.model.dataset_name
-        log_experiment_start("MaPLe", dataset_name, self.kshot)
+        log_experiment_start("MaPLe", dataset_name, self.kshot, self.seed)
         
         logger.section("MaPLe Training", "train")
         self._train_epochs()

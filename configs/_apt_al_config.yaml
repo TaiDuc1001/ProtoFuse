@@ -7,7 +7,7 @@ model:
   use_cache: False
 
 checkpoint:
-  enabled: false
+  enabled: true
   cache_dir: "checkpoints"
 
 training:

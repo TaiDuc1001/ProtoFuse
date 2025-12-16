@@ -28,7 +28,7 @@ data:
   root: "datasets/cub-200-2011-renamed"
 
 checkpoint:
-  enabled: false
+  enabled: true
   cache_dir: "checkpoints/coop"
 
 logging:

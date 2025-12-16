@@ -7,7 +7,7 @@ model:
   use_cache: false
   
 checkpoint:
-  enabled: false
+  enabled: true
   cache_dir: "checkpoints/apt"
 
 training:

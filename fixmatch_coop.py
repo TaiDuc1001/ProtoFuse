@@ -68,7 +68,7 @@ class FixMatchCoOPTrainingPipeline(CoOPTrainingPipeline, FixMatchMixin):
         self._initialize_trainer()
 
         dataset_name = self.config.model.dataset_name
-        log_experiment_start("CoOP+FixMatch", dataset_name, self.kshot)
+        log_experiment_start("CoOP+FixMatch", dataset_name, self.kshot, self.seed)
         
         if len(self.unlabeled_indices) == 0:
             logger.warning("No unlabeled samples available, falling back to standard CoOP training")

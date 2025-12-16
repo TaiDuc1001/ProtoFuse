@@ -786,7 +786,7 @@ class APTTrainingPipeline:
 
         dataset_name = self.config.model.dataset_name
         method_name = "ViFE" if self.use_ssl else "APT"
-        log_experiment_start(method_name, dataset_name, self.kshot)
+        log_experiment_start(method_name, dataset_name, self.kshot, self.seed)
         
         logger.section("APT Training", "train")
         self._train_epochs()

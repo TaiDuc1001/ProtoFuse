@@ -962,11 +962,12 @@ def run_dataset_eda(dataset, eda_dir: str, sample_limit: int = 512, seed: int = 
     logger.debug(f"Dataset EDA artifacts saved to {eda_dir}")
 
 
-def log_experiment_start(method_name: str, dataset_name: str, kshot: int) -> None:
+def log_experiment_start(method_name: str, dataset_name: str, kshot: int, seed: int) -> None:
     logger.info(f"{'='*60}")
     logger.info(f"Method:   {method_name}")
     logger.info(f"Dataset:  {dataset_name}")
     logger.info(f"K-shot:   {kshot}")
+    logger.info(f"Seed:     {seed}")
     logger.info(f"{'='*60}")
 
 

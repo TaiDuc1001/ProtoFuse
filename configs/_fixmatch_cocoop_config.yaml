@@ -12,7 +12,7 @@ fixmatch:
   unlabeled_batch_size: 56
 
 checkpoint:
-  enabled: false
+  enabled: true
   cache_dir: "checkpoints/fixmatch_cocoop"
 
 training:

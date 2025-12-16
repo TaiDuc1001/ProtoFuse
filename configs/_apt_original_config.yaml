@@ -6,7 +6,7 @@ model:
   dataset_name: "CUB-200-2011"
 
 checkpoint:
-  enabled: false
+  enabled: true
   cache_dir: "checkpoints/apt"
 
 training:
