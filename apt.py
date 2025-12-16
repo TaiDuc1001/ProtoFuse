@@ -803,7 +803,8 @@ class APTTrainingPipeline:
                 self._train_ssl_stage3()
             
             logger.section("Dual-Branch Evaluation", "eval")
-            self._run_dual_branch_eval()
+            eval_result = self._run_dual_branch_eval()
+            self.learned_acc = eval_result.get('learned_acc') if eval_result else None
         
         logger.section("Finalization", "save")
         self._finalize()
@@ -1735,7 +1736,11 @@ class APTTrainingPipeline:
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
-        log_experiment_accuracy(self.best_val_acc)
+        if self.use_ssl and hasattr(self, 'learned_acc') and self.learned_acc is not None:
+            final_acc = self.learned_acc
+        else:
+            final_acc = self.metrics[-1]['val_acc'] if self.metrics else 0.0
+        log_experiment_accuracy(final_acc)
 
 def parse_args():
     parser = create_argument_parser("Train APT model", ARG_SCHEMA)

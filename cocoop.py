@@ -143,12 +143,14 @@ class PromptLearner(nn.Module):
         ctx = ctx.unsqueeze(0)
         ctx_shifted = ctx + bias
 
-        prompts = []
-        for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
-            pts_i = self.construct_prompts(ctx_i, prefix, suffix)
-            prompts.append(pts_i)
-        prompts = torch.stack(prompts)
+        B = im_features.shape[0]
+        n_cls = self.n_cls
+
+        ctx_expanded = ctx_shifted.unsqueeze(1).expand(-1, n_cls, -1, -1)
+        prefix_expanded = prefix.unsqueeze(0).expand(B, -1, -1, -1)
+        suffix_expanded = suffix.unsqueeze(0).expand(B, -1, -1, -1)
+
+        prompts = torch.cat([prefix_expanded, ctx_expanded, suffix_expanded], dim=2)
 
         return prompts
 
@@ -172,13 +174,22 @@ class CoCoOPCLIP(nn.Module):
 
         prompts = self.prompt_learner(image_features)
 
-        logits = []
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-        logits = torch.stack(logits)
+        B, n_cls, L, D = prompts.shape
+        prompts_flat = prompts.view(B * n_cls, L, D)
+        tokenized_flat = tokenized_prompts.unsqueeze(0).expand(B, -1, -1).reshape(B * n_cls, -1)
+
+        CHUNK_SIZE = 512
+        text_features_list = []
+        for i in range(0, prompts_flat.shape[0], CHUNK_SIZE):
+            end = min(i + CHUNK_SIZE, prompts_flat.shape[0])
+            tf_chunk = self.text_encoder(prompts_flat[i:end], tokenized_flat[i:end])
+            text_features_list.append(tf_chunk)
+        text_features = torch.cat(text_features_list, dim=0)
+
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = text_features.view(B, n_cls, -1)
+
+        logits = logit_scale * torch.einsum('bd,bcd->bc', image_features, text_features)
 
         return logits
 
@@ -732,7 +743,8 @@ class CoCoOPTrainingPipeline:
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
-        log_experiment_accuracy(self.best_val_acc)
+        final_acc = self.metrics[-1]['val_acc'] if self.metrics else 0.0
+        log_experiment_accuracy(final_acc)
 
 
 def parse_args():

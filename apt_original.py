@@ -1033,7 +1033,8 @@ class APTTrainingPipeline:
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
-        log_experiment_accuracy(self.best_val_acc)
+        final_acc = self.metrics[-1]['val_acc'] if self.metrics else 0.0
+        log_experiment_accuracy(final_acc)
 
 
 def parse_args():
