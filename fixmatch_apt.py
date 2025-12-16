@@ -68,7 +68,7 @@ class FixMatchAPTTrainingPipeline(APTTrainingPipeline, FixMatchMixin):
         self._initialize_trainer()
 
         dataset_name = self.config.model.dataset_name
-        log_experiment_start("FixMatch-APT", dataset_name, self.kshot)
+        log_experiment_start("APT+FixMatch", dataset_name, self.kshot)
         
         if len(self.unlabeled_indices) == 0:
             logger.warning("No unlabeled samples available, falling back to standard APT training")
@@ -175,7 +175,7 @@ class FixMatchAPTTrainingPipeline(APTTrainingPipeline, FixMatchMixin):
 
 
 def parse_args():
-    parser = create_argument_parser("Train FixMatch-APT model", ARG_SCHEMA)
+    parser = create_argument_parser("Train APT+FixMatch model", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)

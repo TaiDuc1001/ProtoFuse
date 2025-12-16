@@ -68,7 +68,7 @@ class FixMatchCoCoOPTrainingPipeline(CoCoOPTrainingPipeline, FixMatchMixin):
         self._initialize_trainer()
 
         dataset_name = self.config.model.dataset_name
-        log_experiment_start("FixMatch-CoCoOP", dataset_name, self.kshot)
+        log_experiment_start("CoCoOP+FixMatch", dataset_name, self.kshot)
         
         if len(self.unlabeled_indices) == 0:
             logger.warning("No unlabeled samples available, falling back to standard CoCoOP training")
@@ -175,7 +175,7 @@ class FixMatchCoCoOPTrainingPipeline(CoCoOPTrainingPipeline, FixMatchMixin):
 
 
 def parse_args():
-    parser = create_argument_parser("Train FixMatch-CoCoOP model", ARG_SCHEMA)
+    parser = create_argument_parser("Train CoCoOP+FixMatch model", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
