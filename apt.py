@@ -3,6 +3,7 @@ import time
 import json
 import math
 import copy
+import hashlib
 import torch
 import random
 import datetime
@@ -793,7 +794,10 @@ class APTTrainingPipeline:
         
         if self.use_ssl:
             logger.section("SSL Stage 1: Self-Supervised Learning", "model")
-            self._train_ssl_stage1()
+            if self._try_load_ssl_stage1_checkpoint():
+                logger.info("Skipping SSL Stage 1 training (loaded from checkpoint)")
+            else:
+                self._train_ssl_stage1()
             
             logger.section("SSL Stage 2: Linear Classifier Training", "train")
             self._train_ssl_stage2()
@@ -1139,6 +1143,89 @@ class APTTrainingPipeline:
                         self.clip_std
                     )
 
+        if self.ssl_cfg.get('save_stage1_checkpoint', False):
+            self._save_ssl_stage1_checkpoint()
+
+    def _get_ssl_stage1_checkpoint_path(self):
+        ssl_key_settings = {
+            'ssl_epochs': self.ssl_cfg.get('ssl_epochs'),
+            'ssl_lr': self.ssl_cfg.get('ssl_lr'),
+            'ssl_batch_size': self.ssl_cfg.get('ssl_batch_size'),
+            'proj_dim': self.ssl_cfg.get('proj_dim'),
+            'num_prototypes': self.ssl_cfg.get('num_prototypes'),
+            'teacher_temp': self.ssl_cfg.get('teacher_temp'),
+            'student_temp': self.ssl_cfg.get('student_temp'),
+            'ema_momentum': self.ssl_cfg.get('ema_momentum'),
+            'final_ema_momentum': self.ssl_cfg.get('final_ema_momentum'),
+            'center_momentum': self.ssl_cfg.get('center_momentum'),
+            'num_trans_layers': self.ssl_cfg.get('num_trans_layers'),
+            'num_heads': self.ssl_cfg.get('num_heads'),
+            'global_crop_size': self.ssl_cfg.get('global_crop_size'),
+            'local_crop_size': self.ssl_cfg.get('local_crop_size'),
+            'num_local_crops': self.ssl_cfg.get('num_local_crops'),
+            'global_crop_scale_min': self.ssl_cfg.get('global_crop_scale_min'),
+            'global_crop_scale_max': self.ssl_cfg.get('global_crop_scale_max'),
+            'local_crop_scale_min': self.ssl_cfg.get('local_crop_scale_min'),
+            'local_crop_scale_max': self.ssl_cfg.get('local_crop_scale_max'),
+            'num_unlabeled': self.ssl_cfg.get('num_unlabeled'),
+            'use_labeled_for_ssl': self.ssl_cfg.get('use_labeled_for_ssl'),
+        }
+        key_settings = {
+            'dataset_root': self.data_cfg.get('root'),
+            'kshot': self.data_cfg.get('kshot'),
+            'seed': self.data_cfg.get('seed'),
+            'backbone': self.model_cfg.get('backbone'),
+            'ssl': json.dumps(ssl_key_settings, sort_keys=True),
+        }
+        key_str = json.dumps(key_settings, sort_keys=True)
+        ssl_checkpoint_id = hashlib.md5(key_str.encode()).hexdigest()[:16]
+        ssl1_dir = os.path.join('checkpoints/apt_ssl', ssl_checkpoint_id)
+        os.makedirs(ssl1_dir, exist_ok=True)
+        return os.path.join(ssl1_dir, 'checkpoint.pt')
+
+    def _save_ssl_stage1_checkpoint(self):
+        if self.ssl_student is None or self.ssl_teacher is None:
+            return
+        checkpoint_path = self._get_ssl_stage1_checkpoint_path()
+        torch.save({
+            'ssl_student_state_dict': self.ssl_student.state_dict(),
+            'ssl_teacher_state_dict': self.ssl_teacher.state_dict(),
+            'ssl_center': self.ssl_center,
+        }, checkpoint_path)
+        logger.info(f"Saved SSL Stage 1 checkpoint to: {checkpoint_path}")
+
+    def _try_load_ssl_stage1_checkpoint(self):
+        checkpoint_path = self._get_ssl_stage1_checkpoint_path()
+        if not os.path.exists(checkpoint_path):
+            return False
+        
+        if self.trainer is None:
+            return False
+        
+        feature_dim = self.trainer.model.vis_encoder.proj.shape[1]
+        proj_dim = coerce_to_int(self.ssl_cfg.get('proj_dim', 256), 256)
+        num_prototypes = coerce_to_int(self.ssl_cfg.get('num_prototypes', 4096), 4096)
+        num_trans_layers = coerce_to_int(self.ssl_cfg.get('num_trans_layers', 1), 1)
+        num_heads = coerce_to_int(self.ssl_cfg.get('num_heads', 8), 8)
+
+        self.ssl_student = ImageSSLModel(
+            copy.deepcopy(self.trainer.model.vis_encoder),
+            feature_dim,
+            proj_dim,
+            num_prototypes,
+            num_trans_layers=num_trans_layers,
+            num_heads=num_heads
+        ).to(self.device)
+        self.ssl_teacher = create_teacher_from_student(self.ssl_student)
+        self.ssl_center = torch.zeros(num_prototypes, device=self.device)
+
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.ssl_student.load_state_dict(ckpt['ssl_student_state_dict'])
+        self.ssl_teacher.load_state_dict(ckpt['ssl_teacher_state_dict'])
+        self.ssl_center = ckpt['ssl_center'].to(self.device)
+        logger.info(f"Loaded SSL Stage 1 checkpoint from: {checkpoint_path}")
+        return True
+
     def _run_linear_eval(self, feature_dim, num_epochs):
         if not self.train_indices or self.val_loader is None:
             return 0.0
@@ -1243,11 +1330,7 @@ class APTTrainingPipeline:
                 images, labels = images.to(self.device), labels.to(self.device)
 
                 with torch.no_grad():
-                    visual_out = self.ssl_student.encoder(images)
-                    if isinstance(visual_out, tuple):
-                        _, cls_feat = visual_out
-                    else:
-                        cls_feat = visual_out
+                    _, cls_feat = self.ssl_student(images)
 
                 logits = self.ssl_classifier(cls_feat)
                 loss = F.cross_entropy(logits, labels)
@@ -1310,11 +1393,7 @@ class APTTrainingPipeline:
                 if isinstance(logits_apt, (list, tuple)):
                     logits_apt = logits_apt[0]
 
-                visual_out = self.ssl_student.encoder(images)
-                if isinstance(visual_out, tuple):
-                    _, cls_feat = visual_out
-                else:
-                    cls_feat = visual_out
+                _, cls_feat = self.ssl_student(images)
                 logits_img = self.ssl_classifier(cls_feat)
 
                 all_apt_logits.append(logits_apt)
@@ -1399,11 +1478,7 @@ class APTTrainingPipeline:
                 all_apt_logits.append(logits_apt.cpu())
 
                 if use_ssl_branch and self.ssl_student is not None and self.ssl_classifier is not None:
-                    visual_out = self.ssl_student.encoder(images)
-                    if isinstance(visual_out, tuple):
-                        _, cls_feat = visual_out
-                    else:
-                        cls_feat = visual_out
+                    _, cls_feat = self.ssl_student(images)
                     logits_img = self.ssl_classifier(cls_feat)
                     all_img_logits.append(logits_img.cpu())
 
@@ -1523,11 +1598,7 @@ class APTTrainingPipeline:
                     logits_apt = logits_apt[0]
 
                 if use_ssl_fusion and self.fusion_weights is not None and self.ssl_student is not None and self.ssl_classifier is not None:
-                    visual_out = self.ssl_student.encoder(images)
-                    if isinstance(visual_out, tuple):
-                        _, cls_feat = visual_out
-                    else:
-                        cls_feat = visual_out
+                    _, cls_feat = self.ssl_student(images)
                     logits_img = self.ssl_classifier(cls_feat)
                     self.fusion_weights.eval()
                     logits = self.fusion_weights(logits_apt, logits_img)
