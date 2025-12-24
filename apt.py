@@ -711,6 +711,7 @@ class APTTrainingPipeline:
         self.ssl_classifier = None
         self.ssl_center = None
         self.fusion_weights = None
+        self.cached_apt_predictions = None
 
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
@@ -756,14 +757,35 @@ class APTTrainingPipeline:
         self.unlabeled_indices = ckpt['unlabeled_indices']
         self.metrics = ckpt['metrics']
         self.global_epoch = len(self.metrics)
+        self.cached_apt_predictions = ckpt.get('apt_predictions', None)
         logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
         return True
+
+    def _compute_apt_predictions(self):
+        if self.trainer is None or self.val_loader is None:
+            return None
+        self.trainer.model.eval()
+        all_logits = []
+        all_labels = []
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images = images.to(self.device)
+                logits = self.trainer.model(images)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+                all_logits.append(logits.cpu())
+                all_labels.append(labels)
+        return {
+            'logits': torch.cat(all_logits, dim=0),
+            'labels': torch.cat(all_labels, dim=0),
+        }
 
     def _save_checkpoint(self):
         if self.checkpoint_cache is None or self.checkpoint_id is None:
             return
         if self.trainer is None:
             return
+        apt_predictions = self._compute_apt_predictions()
         path = self.checkpoint_cache.save(
             self.checkpoint_id,
             self.trainer.model.prompt_learner.state_dict(),
@@ -772,7 +794,8 @@ class APTTrainingPipeline:
             self.labeled_indices,
             self.unlabeled_indices,
             self.metrics,
-            self.config
+            self.config,
+            apt_predictions=apt_predictions
         )
         logger.debug(f"Saved checkpoint to: {path}")
 
@@ -1187,9 +1210,17 @@ class APTTrainingPipeline:
         if self.ssl_student is None or self.ssl_teacher is None:
             return
         checkpoint_path = self._get_ssl_stage1_checkpoint_path()
+        student_trainable = {
+            'adapter': self.ssl_student.adapter.state_dict(),
+            'ssl_head': self.ssl_student.ssl_head.state_dict(),
+        }
+        teacher_trainable = {
+            'adapter': self.ssl_teacher.adapter.state_dict(),
+            'ssl_head': self.ssl_teacher.ssl_head.state_dict(),
+        }
         torch.save({
-            'ssl_student_state_dict': self.ssl_student.state_dict(),
-            'ssl_teacher_state_dict': self.ssl_teacher.state_dict(),
+            'ssl_student_trainable': student_trainable,
+            'ssl_teacher_trainable': teacher_trainable,
             'ssl_center': self.ssl_center,
         }, checkpoint_path)
         logger.info(f"Saved SSL Stage 1 checkpoint to: {checkpoint_path}")
@@ -1220,8 +1251,14 @@ class APTTrainingPipeline:
         self.ssl_center = torch.zeros(num_prototypes, device=self.device)
 
         ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.ssl_student.load_state_dict(ckpt['ssl_student_state_dict'])
-        self.ssl_teacher.load_state_dict(ckpt['ssl_teacher_state_dict'])
+        if 'ssl_student_trainable' in ckpt:
+            self.ssl_student.adapter.load_state_dict(ckpt['ssl_student_trainable']['adapter'])
+            self.ssl_student.ssl_head.load_state_dict(ckpt['ssl_student_trainable']['ssl_head'])
+            self.ssl_teacher.adapter.load_state_dict(ckpt['ssl_teacher_trainable']['adapter'])
+            self.ssl_teacher.ssl_head.load_state_dict(ckpt['ssl_teacher_trainable']['ssl_head'])
+        else:
+            self.ssl_student.load_state_dict(ckpt['ssl_student_state_dict'])
+            self.ssl_teacher.load_state_dict(ckpt['ssl_teacher_state_dict'])
         self.ssl_center = ckpt['ssl_center'].to(self.device)
         logger.info(f"Loaded SSL Stage 1 checkpoint from: {checkpoint_path}")
         return True
@@ -1245,8 +1282,7 @@ class APTTrainingPipeline:
         with torch.no_grad():
             for images, labels in train_loader:
                 images = images.to(self.device)
-                visual_out = self.ssl_student.encoder(images)
-                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                _, cls_feat = self.ssl_student(images)
                 train_features.append(cls_feat.cpu())
                 train_labels.append(labels)
         train_features = torch.cat(train_features, dim=0)
@@ -1256,8 +1292,7 @@ class APTTrainingPipeline:
         with torch.no_grad():
             for images, labels in self.val_loader:
                 images = images.to(self.device)
-                visual_out = self.ssl_student.encoder(images)
-                cls_feat = visual_out[1] if isinstance(visual_out, tuple) else visual_out
+                _, cls_feat = self.ssl_student(images)
                 val_features.append(cls_feat.cpu())
                 val_labels.append(labels)
         val_features = torch.cat(val_features, dim=0)
@@ -1462,30 +1497,35 @@ class APTTrainingPipeline:
             self.ssl_student.encoder.eval()
             self.ssl_classifier.eval()
 
-        all_apt_logits = []
+        if self.cached_apt_predictions is not None:
+            all_apt_logits = self.cached_apt_predictions['logits']
+            all_labels = self.cached_apt_predictions['labels']
+            logger.debug("Using cached APT predictions")
+        else:
+            all_apt_logits = []
+            all_labels_list = []
+            with torch.no_grad():
+                for images, labels in self.val_loader:
+                    images = images.to(self.device)
+                    logits_apt = self.trainer.model(images)
+                    if isinstance(logits_apt, (list, tuple)):
+                        logits_apt = logits_apt[0]
+                    all_apt_logits.append(logits_apt.cpu())
+                    all_labels_list.append(labels)
+            all_apt_logits = torch.cat(all_apt_logits, dim=0)
+            all_labels = torch.cat(all_labels_list, dim=0)
+            self.cached_apt_predictions = {'logits': all_apt_logits, 'labels': all_labels}
+            self._save_checkpoint()
+            logger.debug("Computed and saved APT predictions to checkpoint")
+
         all_img_logits = []
-        all_labels = []
-
-        with torch.no_grad():
-            for images, labels in self.val_loader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-
-                logits_apt = self.trainer.model(images)
-                if isinstance(logits_apt, (list, tuple)):
-                    logits_apt = logits_apt[0]
-
-                all_apt_logits.append(logits_apt.cpu())
-
-                if use_ssl_branch and self.ssl_student is not None and self.ssl_classifier is not None:
+        if use_ssl_branch and self.ssl_student is not None and self.ssl_classifier is not None:
+            with torch.no_grad():
+                for images, _ in self.val_loader:
+                    images = images.to(self.device)
                     _, cls_feat = self.ssl_student(images)
                     logits_img = self.ssl_classifier(cls_feat)
                     all_img_logits.append(logits_img.cpu())
-
-                all_labels.append(labels.cpu())
-
-        all_apt_logits = torch.cat(all_apt_logits, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
 
         all_apt_probs = F.softmax(all_apt_logits, dim=-1)
         _, pred_apt = torch.max(all_apt_probs, 1)

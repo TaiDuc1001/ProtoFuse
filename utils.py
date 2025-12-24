@@ -88,7 +88,7 @@ class CheckpointCache:
             writer.writerows(rows)
 
     def save(self, checkpoint_id, model_state, optimizer_state, scheduler_state,
-             labeled_indices, unlabeled_indices, metrics, config):
+             labeled_indices, unlabeled_indices, metrics, config, apt_predictions=None):
         key_settings = self._get_key_settings(config)
         checkpoint = {
             'model_state_dict': model_state,
@@ -100,6 +100,8 @@ class CheckpointCache:
             'config_snapshot': config.to_dict() if hasattr(config, 'to_dict') else dict(config),
             'timestamp': datetime.datetime.now().isoformat(),
         }
+        if apt_predictions is not None:
+            checkpoint['apt_predictions'] = apt_predictions
         path = self.get_checkpoint_path(checkpoint_id)
         torch.save(checkpoint, path)
         self._update_index(checkpoint_id, key_settings, path)

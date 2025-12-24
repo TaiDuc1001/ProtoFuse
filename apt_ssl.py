@@ -87,7 +87,7 @@ class TransformerAdapter(nn.Module):
             x = (attn @ v).transpose(1, 2).reshape(B, seq_len, -1)
             x = layer['proj'](x)
             x = residual + x
-            x = x + layer['feed_forward'](layer['norm2'](x))
+            x = layer['feed_forward'](layer['norm2'](residual))
         x = self.norm(x)
         if seq_len == 1:
             x = x.squeeze(1)
@@ -116,13 +116,16 @@ class ImageSSLModel(nn.Module):
                 all_tokens, _ = visual_output
             else:
                 all_tokens = visual_output
+        encoder_cls = all_tokens[:, 0, :] if all_tokens.dim() == 3 else all_tokens
         if return_attention:
             adapted_tokens, attn_weights = self.adapter(all_tokens, return_attention=True)
-            cls_feat = adapted_tokens[:, 0, :]
+            adapted_cls = adapted_tokens[:, 0, :] if adapted_tokens.dim() == 3 else adapted_tokens
+            cls_feat = adapted_cls + encoder_cls
             u = self.ssl_head(cls_feat)
             return u, cls_feat, attn_weights
         adapted_tokens = self.adapter(all_tokens)
-        cls_feat = adapted_tokens[:, 0, :]
+        adapted_cls = adapted_tokens[:, 0, :] if adapted_tokens.dim() == 3 else adapted_tokens
+        cls_feat = adapted_cls + encoder_cls
         u = self.ssl_head(cls_feat)
         return u, cls_feat
 
