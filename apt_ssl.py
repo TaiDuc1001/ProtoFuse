@@ -174,6 +174,7 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
     clip_std_arr = np.array(clip_std)
     
     img_size = images.shape[-1]
+    scale_factor = img_size / grid_size
     
     for img_idx in range(min(len(images), 8)):
         img_tensor = images[img_idx].cpu()
@@ -181,58 +182,28 @@ def visualize_dino_attention(model, images, image_paths, epoch, output_dir, clip
         img_np = img_np * clip_std_arr + clip_mean_arr
         img_np = np.clip(img_np, 0, 1)
         
-        ncols = min(num_heads + 1, 7)
-        nrows = (num_heads + 1 + ncols - 1) // ncols
-        fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
-        axes = np.array(axes).flatten()
+        max_attn = cls_attn[img_idx].max(dim=0)[0].cpu().numpy()
+        max_attn = (max_attn - max_attn.min()) / (max_attn.max() - max_attn.min() + 1e-8)
+        max_attn_resized = zoom(max_attn, scale_factor, order=1)
+        
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
         
         axes[0].imshow(img_np)
-        axes[0].set_title("Original", fontsize=10)
+        axes[0].set_title("Original", fontsize=11)
         axes[0].axis('off')
         
-        for head_idx in range(num_heads):
-            ax = axes[head_idx + 1]
-            attn_map = cls_attn[img_idx, head_idx].cpu().numpy()
-            
-            attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-            
-            scale_factor = img_size / grid_size
-            attn_map_resized = zoom(attn_map, scale_factor, order=1)
-            
-            ax.imshow(img_np)
-            ax.imshow(attn_map_resized, cmap='inferno', alpha=0.6)
-            ax.set_title(f"Head {head_idx}", fontsize=10)
-            ax.axis('off')
+        axes[1].imshow(img_np)
+        axes[1].imshow(max_attn_resized, cmap='inferno', alpha=0.6)
+        axes[1].set_title("Attention", fontsize=11)
+        axes[1].axis('off')
         
-        for ax_idx in range(num_heads + 1, len(axes)):
-            axes[ax_idx].axis('off')
-        
-        plt.suptitle(f"CLS Attention Maps (Epoch {epoch})", fontsize=12)
+        plt.suptitle(f"Epoch {epoch}", fontsize=12)
         plt.tight_layout()
-        save_path = os.path.join(output_dir, f'dino_attention_epoch{epoch:03d}_img{img_idx}.png')
+        save_path = os.path.join(output_dir, f'attn_epoch{epoch:03d}_img{img_idx}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
     
-    mean_cls_attn = cls_attn.mean(dim=0)
-    fig, axes = plt.subplots(1, min(num_heads, 6), figsize=(3 * min(num_heads, 6), 3))
-    if num_heads == 1:
-        axes = [axes]
-    
-    for head_idx in range(min(num_heads, 6)):
-        ax = axes[head_idx]
-        attn_map = mean_cls_attn[head_idx].cpu().numpy()
-        attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-        ax.imshow(attn_map, cmap='inferno')
-        ax.set_title(f"Head {head_idx}", fontsize=10)
-        ax.axis('off')
-    
-    plt.suptitle(f"Mean CLS Attention Across Batch (Epoch {epoch})", fontsize=12)
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, f'dino_attention_epoch{epoch:03d}_summary.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    
-    logger.debug(f"Saved DINO attention visualizations")
+    logger.info(f"Saved DINO attention visualizations to: {output_dir}")
     model.train()
 
 
