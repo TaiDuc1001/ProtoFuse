@@ -817,7 +817,7 @@ class APTTrainingPipeline:
         
         if self.use_ssl:
             logger.section("SSL Stage 1: Self-Supervised Learning", "model")
-            if self._try_load_ssl_stage1_checkpoint():
+            if self.ssl_cfg.get('save_stage1_checkpoint', False) and self._try_load_ssl_stage1_checkpoint():
                 logger.info("Skipping SSL Stage 1 training (loaded from checkpoint)")
             else:
                 self._train_ssl_stage1()
