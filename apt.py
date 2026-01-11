@@ -816,22 +816,42 @@ class APTTrainingPipeline:
         self._train_epochs()
         
         if self.use_ssl:
-            logger.section("SSL Stage 1: Self-Supervised Learning", "model")
-            if self.ssl_cfg.get('save_stage1_checkpoint', False) and self._try_load_ssl_stage1_checkpoint():
-                logger.info("Skipping SSL Stage 1 training (loaded from checkpoint)")
+            enable_stage1 = self.ssl_cfg.get('enable_stage1', True)
+            enable_stage2 = self.ssl_cfg.get('enable_stage2', True)
+            enable_stage3 = self.ssl_cfg.get('enable_stage3', True)
+            
+            if enable_stage1:
+                logger.section("SSL Stage 1: Self-Supervised Learning", "model")
+                if self.ssl_cfg.get('save_stage1_checkpoint', False) and self._try_load_ssl_stage1_checkpoint():
+                    logger.info("Skipping SSL Stage 1 training (loaded from checkpoint)")
+                else:
+                    self._train_ssl_stage1()
             else:
-                self._train_ssl_stage1()
+                logger.info("Skipping SSL Stage 1 (disabled in config)")
             
-            logger.section("SSL Stage 2: Linear Classifier Training", "train")
-            self._train_ssl_stage2()
+            if enable_stage2:
+                logger.section("SSL Stage 2: Linear Classifier Training", "train")
+                self._train_ssl_stage2()
+            else:
+                logger.info("Skipping SSL Stage 2 (disabled in config)")
             
-            if self.ssl_cfg.get('learn_fusion', False):
+            if enable_stage3 and self.ssl_cfg.get('learn_fusion', False):
                 logger.section("SSL Stage 3: Fusion Weight Learning", "train")
                 self._train_ssl_stage3()
+            elif not enable_stage3:
+                logger.info("Skipping SSL Stage 3 (disabled in config)")
             
             logger.section("Dual-Branch Evaluation", "eval")
             eval_result = self._run_dual_branch_eval()
-            self.learned_acc = eval_result.get('learned_acc') if eval_result else None
+            if enable_stage3:
+                self.learned_acc = eval_result.get('learned_acc') if eval_result else None
+            else:
+                default_weight = coerce_to_float(self.ssl_cfg.get('default_fusion_weight', 0.5), 0.5)
+                if eval_result and eval_result.get('fusion_results'):
+                    self.learned_acc = eval_result['fusion_results'].get(default_weight)
+                    logger.info(f"Using default fusion weight {default_weight} → {self.learned_acc:.2f}%")
+                else:
+                    self.learned_acc = eval_result.get('apt_acc') if eval_result else None
         
         logger.section("Finalization", "save")
         self._finalize()
@@ -1637,11 +1657,15 @@ class APTTrainingPipeline:
                 if isinstance(logits_apt, (list, tuple)):
                     logits_apt = logits_apt[0]
 
-                if use_ssl_fusion and self.fusion_weights is not None and self.ssl_student is not None and self.ssl_classifier is not None:
+                if use_ssl_fusion and self.ssl_student is not None and self.ssl_classifier is not None:
                     _, cls_feat = self.ssl_student(images)
                     logits_img = self.ssl_classifier(cls_feat)
-                    self.fusion_weights.eval()
-                    logits = self.fusion_weights(logits_apt, logits_img)
+                    if self.fusion_weights is not None:
+                        self.fusion_weights.eval()
+                        logits = self.fusion_weights(logits_apt, logits_img)
+                    else:
+                        default_weight = coerce_to_float(self.ssl_cfg.get('default_fusion_weight', 0.5), 0.5)
+                        logits = (1 - default_weight) * logits_apt + default_weight * logits_img
                 else:
                     logits = logits_apt
 

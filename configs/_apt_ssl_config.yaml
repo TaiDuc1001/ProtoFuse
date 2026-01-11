@@ -49,6 +49,10 @@ active_learning:
 
 ssl:
   enabled: true
+  enable_stage1: true
+  enable_stage2: true
+  enable_stage3: true
+  default_fusion_weight: 0.5
   ssl_batch_size: 32
   eval_batch_size: 128
   proj_dim: 256
@@ -78,7 +82,7 @@ ssl:
   local_crop_scale_max: 0.4
   num_unlabeled: 500
   use_labeled_for_ssl: false
-  num_plot: 0
+  num_plot: 8
   save_stage1_checkpoint: true
 
 logging:
