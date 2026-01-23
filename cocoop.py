@@ -456,6 +456,12 @@ class CoCoOPTrainingPipeline:
         self.checkpoint_id: Optional[str] = None
         self._init_checkpoint_cache()
 
+        base_novel_cfg = self.data_cfg.get('base_novel', ConfigNode())
+        self.base_novel_enabled = bool(base_novel_cfg.get('enabled', False))
+        self.base_novel_split_ratio = coerce_to_float(base_novel_cfg.get('split_ratio', 0.5), 0.5)
+        self.base_class_indices: List[int] = []
+        self.novel_class_indices: List[int] = []
+
     def _get_training_epochs(self):
         epochs_value = None
         if isinstance(self.training_cfg, dict):
@@ -601,6 +607,18 @@ class CoCoOPTrainingPipeline:
 
         self.classnames = list(self.dataset.classes)
 
+        if self.base_novel_enabled:
+            num_classes = len(self.classnames)
+            num_base = int(num_classes * self.base_novel_split_ratio)
+            all_class_indices = list(range(num_classes))
+            rng.shuffle(all_class_indices)
+            self.base_class_indices = sorted(all_class_indices[:num_base])
+            self.novel_class_indices = sorted(all_class_indices[num_base:])
+            base_set = set(self.base_class_indices)
+            self.train_indices = [i for i in self.train_indices if self.dataset.samples[i][1] in base_set]
+            self.labeled_indices = list(self.train_indices)
+            logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base, {len(self.novel_class_indices)} novel classes")
+
         stats = {
             'total_images': len(self.dataset),
             'val_count': len(self.val_indices),
@@ -706,12 +724,33 @@ class CoCoOPTrainingPipeline:
             )
 
         epoch_time = time.time() - start_time
+
+        base_val_acc = None
+        novel_val_acc = None
+        harmonic_mean = None
+        if self.base_novel_enabled and all_labels:
+            base_set = set(self.base_class_indices)
+            novel_set = set(self.novel_class_indices)
+            base_correct = sum(1 for p, l in zip(all_preds, all_labels) if l in base_set and p == l)
+            base_total = sum(1 for l in all_labels if l in base_set)
+            novel_correct = sum(1 for p, l in zip(all_preds, all_labels) if l in novel_set and p == l)
+            novel_total = sum(1 for l in all_labels if l in novel_set)
+            if base_total > 0:
+                base_val_acc = 100 * base_correct / base_total
+            if novel_total > 0:
+                novel_val_acc = 100 * novel_correct / novel_total
+            if base_val_acc is not None and novel_val_acc is not None and (base_val_acc + novel_val_acc) > 0:
+                harmonic_mean = 2 * base_val_acc * novel_val_acc / (base_val_acc + novel_val_acc)
+
         epoch_result = {
             'epoch': epoch_idx,
             'train_loss': avg_loss,
             'train_acc': avg_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
+            'base_val_acc': base_val_acc,
+            'novel_val_acc': novel_val_acc,
+            'harmonic_mean': harmonic_mean,
             'time': epoch_time
         }
         with open(os.path.join(epoch_dir, 'result.json'), 'w') as f:
@@ -723,8 +762,11 @@ class CoCoOPTrainingPipeline:
             self.best_val_acc = val_acc
             self.trainer.save_model(self.best_model_path)
 
-        val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        logger.info(f"CoCoOP Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+        if self.base_novel_enabled and base_val_acc is not None:
+            logger.info(f"CoCoOP Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc:.2f}% - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
+        else:
+            val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
+            logger.info(f"CoCoOP Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()

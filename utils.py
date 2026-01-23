@@ -41,7 +41,7 @@ class CheckpointCache:
             config = config.to_dict()
         model_cfg = config.get('model', {})
         method_params = {k: v for k, v in model_cfg.items() 
-                         if k not in ('backbone', 'dataset_name', 'use_cache')}
+                         if k not in ('backbone', 'dataset_name')}
         return {
             'dataset_root': config.get('data', {}).get('root'),
             'kshot': config.get('data', {}).get('kshot'),
@@ -49,6 +49,7 @@ class CheckpointCache:
             'epochs': config.get('training', {}).get('epochs'),
             'backbone': model_cfg.get('backbone'),
             'method_params': json.dumps(method_params, sort_keys=True),
+            'base_novel': json.dumps(config.get('data', {}).get('base_novel', {}), sort_keys=True),
         }
 
     def compute_checkpoint_id(self, config) -> str:

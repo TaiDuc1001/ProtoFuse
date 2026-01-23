@@ -26,6 +26,9 @@ data:
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
   root: "datasets/cub-200-2011-renamed"
+  base_novel:
+    enabled: true
+    split_ratio: 0.5
 
 checkpoint:
   enabled: true

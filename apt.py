@@ -713,6 +713,18 @@ class APTTrainingPipeline:
         self.fusion_weights = None
         self.cached_apt_predictions = None
 
+        raw_base_novel_cfg = self.data_cfg.get('base_novel', ConfigNode())
+        if not isinstance(raw_base_novel_cfg, ConfigNode):
+            raw_base_novel_cfg = ConfigNode(raw_base_novel_cfg)
+        self.base_novel_cfg = raw_base_novel_cfg
+        self.base_novel_enabled = bool(self.base_novel_cfg.get('enabled', False))
+        self.base_novel_split_ratio = coerce_to_float(self.base_novel_cfg.get('split_ratio', 0.5), 0.5)
+        
+        self.base_class_indices: List[int] = []
+        self.novel_class_indices: List[int] = []
+        self.base_val_loader: Optional[DataLoader] = None
+        self.novel_val_loader: Optional[DataLoader] = None
+
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
         self._init_checkpoint_cache()
@@ -852,7 +864,7 @@ class APTTrainingPipeline:
                     logger.info(f"Using default fusion weight {default_weight} → {self.learned_acc:.2f}%")
                 else:
                     self.learned_acc = eval_result.get('apt_acc') if eval_result else None
-        
+
         logger.section("Finalization", "save")
         self._finalize()
 
@@ -888,12 +900,24 @@ class APTTrainingPipeline:
         for idx, (_, class_idx) in enumerate(self.dataset.samples):
             samples_by_class_idx[class_idx].append(idx)
 
+        self.classnames = list(self.dataset.classes)
+        all_class_indices = sorted(samples_by_class_idx.keys())
+        
+        if self.base_novel_enabled:
+            self._compute_base_novel_classes(all_class_indices)
+            active_class_indices = self.base_class_indices
+            logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base classes, {len(self.novel_class_indices)} novel classes")
+        else:
+            active_class_indices = all_class_indices
+
         rng = random.Random(self.seed)
         val_indices = []
         train_indices = []
         unlabeled_indices = []
+        base_val_indices = []
+        novel_val_indices = []
 
-        for class_idx in sorted(samples_by_class_idx.keys()):
+        for class_idx in all_class_indices:
             class_samples = list(samples_by_class_idx[class_idx])
             class_samples.sort()
             rng.shuffle(class_samples)
@@ -904,16 +928,33 @@ class APTTrainingPipeline:
 
             val_part = class_samples[:val_count]
             train_candidates = class_samples[val_count:]
-            if self.kshot > 0:
-                labeled_part = train_candidates[:self.kshot]
-                leftover_part = train_candidates[self.kshot:]
-            else:
-                labeled_part = train_candidates
-                leftover_part = []
 
-            val_indices.extend(val_part)
-            train_indices.extend(labeled_part)
-            unlabeled_indices.extend(leftover_part)
+            if self.base_novel_enabled:
+                if class_idx in self.base_class_indices:
+                    base_val_indices.extend(val_part)
+                    if self.kshot > 0:
+                        labeled_part = train_candidates[:self.kshot]
+                        leftover_part = train_candidates[self.kshot:]
+                    else:
+                        labeled_part = train_candidates
+                        leftover_part = []
+                    train_indices.extend(labeled_part)
+                    unlabeled_indices.extend(leftover_part)
+                else:
+                    novel_val_indices.extend(val_part)
+            else:
+                val_indices.extend(val_part)
+                if self.kshot > 0:
+                    labeled_part = train_candidates[:self.kshot]
+                    leftover_part = train_candidates[self.kshot:]
+                else:
+                    labeled_part = train_candidates
+                    leftover_part = []
+                train_indices.extend(labeled_part)
+                unlabeled_indices.extend(leftover_part)
+
+        if self.base_novel_enabled:
+            val_indices = base_val_indices + novel_val_indices
 
         self.val_indices = val_indices
         self.train_indices = train_indices
@@ -926,7 +967,15 @@ class APTTrainingPipeline:
         else:
             logger.warning("Validation split is empty; skipping validation metrics")
 
-        self.classnames = list(self.dataset.classes)
+        if self.base_novel_enabled:
+            if len(base_val_indices) > 0:
+                base_val_ds = Subset(self.dataset, base_val_indices)
+                self.base_val_loader = DataLoader(base_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+                logger.info(f"Base validation: {len(base_val_indices)} samples")
+            if len(novel_val_indices) > 0:
+                novel_val_ds = Subset(self.dataset, novel_val_indices)
+                self.novel_val_loader = DataLoader(novel_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+                logger.info(f"Novel validation: {len(novel_val_indices)} samples")
 
         stats = {
             'total_images': len(self.dataset),
@@ -943,6 +992,17 @@ class APTTrainingPipeline:
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
             json.dump(trainer_cfg.to_dict(), f, indent=4)
+
+    def _compute_base_novel_classes(self, all_class_indices):
+        rng = random.Random(self.seed)
+        shuffled_classes = list(all_class_indices)
+        rng.shuffle(shuffled_classes)
+        
+        num_base = int(len(shuffled_classes) * self.base_novel_split_ratio)
+        num_base = max(1, min(num_base, len(shuffled_classes) - 1))
+        
+        self.base_class_indices = sorted(shuffled_classes[:num_base])
+        self.novel_class_indices = sorted(shuffled_classes[num_base:])
 
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
@@ -1222,7 +1282,7 @@ class APTTrainingPipeline:
         }
         key_str = json.dumps(key_settings, sort_keys=True)
         ssl_checkpoint_id = hashlib.md5(key_str.encode()).hexdigest()[:16]
-        ssl1_dir = os.path.join('checkpoints/apt_ssl', ssl_checkpoint_id)
+        ssl1_dir = os.path.join('checkpoints/vife', ssl_checkpoint_id)
         os.makedirs(ssl1_dir, exist_ok=True)
         return os.path.join(ssl1_dir, 'checkpoint.pt')
 
@@ -1552,6 +1612,30 @@ class APTTrainingPipeline:
         apt_acc = 100 * (pred_apt == all_labels).sum().item() / len(all_labels)
         logger.info(f"APT Branch Accuracy: {apt_acc:.2f}%")
 
+        base_acc = None
+        novel_acc = None
+        harmonic_mean = None
+        if self.base_novel_enabled and self.base_class_indices and self.novel_class_indices:
+            base_set = set(self.base_class_indices)
+            novel_set = set(self.novel_class_indices)
+            
+            base_mask = torch.tensor([int(lbl.item()) in base_set for lbl in all_labels])
+            novel_mask = torch.tensor([int(lbl.item()) in novel_set for lbl in all_labels])
+            
+            if base_mask.sum() > 0:
+                base_correct = (pred_apt[base_mask] == all_labels[base_mask]).sum().item()
+                base_acc = 100 * base_correct / base_mask.sum().item()
+                logger.info(f"  Base Classes ({base_mask.sum().item()} samples): {base_acc:.2f}%")
+            
+            if novel_mask.sum() > 0:
+                novel_correct = (pred_apt[novel_mask] == all_labels[novel_mask]).sum().item()
+                novel_acc = 100 * novel_correct / novel_mask.sum().item()
+                logger.info(f"  Novel Classes ({novel_mask.sum().item()} samples): {novel_acc:.2f}%")
+            
+            if base_acc is not None and novel_acc is not None and (base_acc + novel_acc) > 0:
+                harmonic_mean = 2 * base_acc * novel_acc / (base_acc + novel_acc)
+                logger.info(f"  Harmonic Mean (H): {harmonic_mean:.2f}%")
+
         if use_ssl_branch:
             all_img_logits = torch.cat(all_img_logits, dim=0)
 
@@ -1621,6 +1705,9 @@ class APTTrainingPipeline:
             'best_weight': best_weight,
             'best_fused_acc': best_fused_acc,
             'learned_acc': learned_acc,
+            'base_acc': base_acc,
+            'novel_acc': novel_acc,
+            'harmonic_mean': harmonic_mean,
         }
         eval_dir = os.path.join(self.run_dir, 'evaluation')
         os.makedirs(eval_dir, exist_ok=True)
@@ -1771,6 +1858,23 @@ class APTTrainingPipeline:
             'val_acc': val_acc,
             'time': epoch_time
         }
+
+        base_val_acc = None
+        novel_val_acc = None
+        harmonic_mean = None
+        if self.base_novel_enabled:
+            if self.base_val_loader is not None:
+                base_results = self._evaluate_with_ssl_fusion(self.base_val_loader)
+                base_val_acc = base_results['accuracy']
+                epoch_result['base_val_acc'] = base_val_acc
+            if self.novel_val_loader is not None:
+                novel_results = self._evaluate_with_ssl_fusion(self.novel_val_loader)
+                novel_val_acc = novel_results['accuracy']
+                epoch_result['novel_val_acc'] = novel_val_acc
+            if base_val_acc is not None and novel_val_acc is not None and (base_val_acc + novel_val_acc) > 0:
+                harmonic_mean = 2 * base_val_acc * novel_val_acc / (base_val_acc + novel_val_acc)
+                epoch_result['harmonic_mean'] = harmonic_mean
+
         with open(os.path.join(epoch_dir, 'result.json'), 'w') as f:
             json.dump(epoch_result, f, indent=2)
 
@@ -1781,7 +1885,10 @@ class APTTrainingPipeline:
             self.trainer.save_model(self.best_model_path)
 
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+        if self.base_novel_enabled and harmonic_mean is not None:
+            logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
+        else:
+            logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
