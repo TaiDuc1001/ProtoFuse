@@ -26,3 +26,4 @@ vpt/
 fixmatch/
 *.sh
 *.log
+test/tsne_output
