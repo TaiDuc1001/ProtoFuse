@@ -633,8 +633,8 @@ class APTTrainingPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
-        val_value = self.data_cfg.get("val_size", None)
-        self.val_fraction = coerce_to_float(val_value, 0.2, key="data.val_size")
+        val_value = self.data_cfg.get("val_size", 0.7)
+        self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
         if self.val_fraction > 1.0:
             self.val_fraction = self.val_fraction / 100.0
         if self.val_fraction < 0 or self.val_fraction >= 1.0:
@@ -1653,6 +1653,42 @@ class APTTrainingPipeline:
             
             logger.debug(f"Both correct: {both_correct} ({100*both_correct/len(all_labels):.1f}%), APT only: {apt_only_correct}, Img only: {img_only_correct}, Both wrong: {both_wrong}")
             logger.debug(f"Disagreement rate: {100*(apt_correct != img_correct).float().mean():.2f}%")
+
+            output_dir = coerce_to_str(self.logging_cfg.get('output_dir', 'outputs'), 'outputs')
+            os.makedirs(output_dir, exist_ok=True)
+            
+            positive_conflicts = []
+            negative_conflicts = []
+            
+            for i in range(len(all_labels)):
+                apt_pred_i = pred_apt[i].item()
+                img_pred_i = pred_img[i].item()
+                true_label_i = all_labels[i].item()
+                
+                if apt_pred_i != img_pred_i:
+                    val_idx = self.val_indices[i]
+                    img_path, _ = self.dataset.samples[val_idx]
+                    true_name = self.classnames[true_label_i]
+                    apt_name = self.classnames[apt_pred_i]
+                    img_name = self.classnames[img_pred_i]
+                    
+                    line = f"{img_path}, {true_name}, {apt_name}, {img_name}"
+                    
+                    if img_pred_i == true_label_i and apt_pred_i != true_label_i:
+                        positive_conflicts.append(line)
+                    elif apt_pred_i == true_label_i and img_pred_i != true_label_i:
+                        negative_conflicts.append(line)
+            
+            positive_path = os.path.join(output_dir, 'positive_conflict.txt')
+            with open(positive_path, 'w') as f:
+                f.write('\n'.join(positive_conflicts))
+            logger.info(f"Positive conflicts (ViFE correct, APT wrong): {len(positive_conflicts)} → {positive_path}")
+            
+            negative_path = os.path.join(output_dir, 'negative_conflict.txt')
+            with open(negative_path, 'w') as f:
+                f.write('\n'.join(negative_conflicts))
+            logger.info(f"Negative conflicts (APT correct, ViFE wrong): {len(negative_conflicts)} → {negative_path}")
+
 
             if self.fusion_weights is not None:
                 self.fusion_weights.eval()

@@ -402,8 +402,8 @@ class CoOPTrainingPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
-        val_value = self.data_cfg.get("val_size", None)
-        self.val_fraction = coerce_to_float(val_value, 0.2, key="data.val_size")
+        val_value = self.data_cfg.get("val_size", 0.7)
+        self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
         if self.val_fraction > 1.0:
             self.val_fraction = self.val_fraction / 100.0
         if self.val_fraction < 0 or self.val_fraction >= 1.0:
