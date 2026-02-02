@@ -25,7 +25,7 @@ from collections import Counter
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from typing import Any, Dict, List, Optional, Sequence
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
 
 from logger import logger, setup_logging # type: ignore
 
@@ -974,7 +974,54 @@ def log_experiment_start(method_name: str, dataset_name: str, kshot: int, seed: 
     logger.info(f"{'='*60}")
 
 
+
+def compute_metrics(true_labels: Sequence[int], predictions: Sequence[int]) -> Dict[str, float]:
+    if not true_labels or not predictions:
+        return {}
+    
+    y_true = np.array(true_labels)
+    y_pred = np.array(predictions)
+    
+    metrics = {}
+    
+    metrics['accuracy'] = accuracy_score(y_true, y_pred) * 100
+    
+    metrics['mca'] = balanced_accuracy_score(y_true, y_pred) * 100
+    
+    metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['f1_micro'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['precision_micro'] = precision_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics['recall_micro'] = recall_score(y_true, y_pred, average='micro', zero_division=0)
+    metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    return metrics
+
+
+def log_experiment_metrics(metrics: Dict[str, float]) -> None:
+    logger.info(f"{'='*60}")
+    logger.info("Evaluation Metrics:")
+    logger.info(f"  Accuracy:          {metrics.get('accuracy', 0.0):.2f}%")
+    logger.info(f"  MCA:               {metrics.get('mca', 0.0):.2f}%")
+    logger.info(f"{'-'*30}")
+    logger.info(f"  F1 (Macro):        {metrics.get('f1_macro', 0.0):.4f}")
+    logger.info(f"  F1 (Micro):        {metrics.get('f1_micro', 0.0):.4f}")
+    logger.info(f"  F1 (Weighted):     {metrics.get('f1_weighted', 0.0):.4f}")
+    logger.info(f"{'-'*30}")
+    logger.info(f"  Precision (Macro): {metrics.get('precision_macro', 0.0):.4f}")
+    logger.info(f"  Precision (Micro): {metrics.get('precision_micro', 0.0):.4f}")
+    logger.info(f"  Precision (Weighted): {metrics.get('precision_weighted', 0.0):.4f}")
+    logger.info(f"{'-'*30}")
+    logger.info(f"  Recall (Macro):    {metrics.get('recall_macro', 0.0):.4f}")
+    logger.info(f"  Recall (Micro):    {metrics.get('recall_micro', 0.0):.4f}")
+    logger.info(f"  Recall (Weighted): {metrics.get('recall_weighted', 0.0):.4f}")
+    logger.info(f"{'='*60}")
+
+
 def log_experiment_accuracy(accuracy: float) -> None:
-    logger.info(f"{'='*60}")
-    logger.info(f"Final Accuracy: {accuracy:.2f}%")
-    logger.info(f"{'='*60}")
+    log_experiment_metrics({'accuracy': accuracy})

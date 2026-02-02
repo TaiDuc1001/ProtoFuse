@@ -44,7 +44,8 @@ from utils import (
     load_clip_to_cpu,
     CheckpointCache,
     log_experiment_start,
-    log_experiment_accuracy,
+    log_experiment_metrics,
+    compute_metrics,
 )
 
 from apt_ssl import (
@@ -520,9 +521,12 @@ class APT:
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels_list.extend(labels.cpu().numpy())
         
-        accuracy = 100 * correct / total
+        metrics = compute_metrics(all_labels_list, all_preds)
         avg_loss = running_loss / max(1, steps)
-        return {"accuracy": accuracy, "loss": avg_loss, "predictions": all_preds, "true_labels": all_labels_list}
+        metrics['loss'] = avg_loss
+        metrics['predictions'] = all_preds
+        metrics['true_labels'] = all_labels_list
+        return metrics
     
     def save_model(self, path):
         checkpoint = {
@@ -1867,9 +1871,12 @@ class APTTrainingPipeline:
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels_list.extend(labels.cpu().numpy())
 
-        accuracy = 100 * correct / total
+        metrics = compute_metrics(all_labels_list, all_preds)
         avg_loss = running_loss / max(1, steps)
-        return {"accuracy": accuracy, "loss": avg_loss, "predictions": all_preds, "true_labels": all_labels_list}
+        metrics['loss'] = avg_loss
+        metrics['predictions'] = all_preds
+        metrics['true_labels'] = all_labels_list
+        return metrics
 
     def _train_epochs(self):
         if self.dataset is None or self.trainer is None:
@@ -2083,7 +2090,8 @@ class APTTrainingPipeline:
             final_acc = self.learned_acc
         else:
             final_acc = self.metrics[-1]['val_acc'] if self.metrics else 0.0
-        log_experiment_accuracy(final_acc)
+        final_metrics = self.metrics[-1] if self.metrics else {}
+        log_experiment_metrics(final_metrics)
 
 def parse_args():
     parser = create_argument_parser("Train APT model", ARG_SCHEMA)
