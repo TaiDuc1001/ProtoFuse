@@ -755,7 +755,18 @@ class CoOPTrainingPipeline:
             'base_val_acc': base_val_acc,
             'novel_val_acc': novel_val_acc,
             'harmonic_mean': harmonic_mean,
-            'time': epoch_time
+            'time': epoch_time,
+            'accuracy': results.get('accuracy', val_acc) if self.val_loader else 0.0,
+            'mca': results.get('mca', 0.0) if self.val_loader else 0.0,
+            'f1_macro': results.get('f1_macro', 0.0) if self.val_loader else 0.0,
+            'f1_micro': results.get('f1_micro', 0.0) if self.val_loader else 0.0,
+            'f1_weighted': results.get('f1_weighted', 0.0) if self.val_loader else 0.0,
+            'precision_macro': results.get('precision_macro', 0.0) if self.val_loader else 0.0,
+            'precision_micro': results.get('precision_micro', 0.0) if self.val_loader else 0.0,
+            'precision_weighted': results.get('precision_weighted', 0.0) if self.val_loader else 0.0,
+            'recall_macro': results.get('recall_macro', 0.0) if self.val_loader else 0.0,
+            'recall_micro': results.get('recall_micro', 0.0) if self.val_loader else 0.0,
+            'recall_weighted': results.get('recall_weighted', 0.0) if self.val_loader else 0.0,
         }
         with open(os.path.join(epoch_dir, 'result.json'), 'w') as f:
             json.dump(epoch_result, f, indent=2)

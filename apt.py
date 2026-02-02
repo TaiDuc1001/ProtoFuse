@@ -860,6 +860,7 @@ class APTTrainingPipeline:
             
             logger.section("Dual-Branch Evaluation", "eval")
             eval_result = self._run_dual_branch_eval()
+            self.dual_branch_eval_result = eval_result
             if enable_stage3:
                 self.learned_acc = eval_result.get('learned_acc') if eval_result else None
             else:
@@ -1803,6 +1804,14 @@ class APTTrainingPipeline:
             best_fused_acc = None
             learned_acc = None
 
+        if use_ssl_branch and self.fusion_weights is not None:
+            final_preds = pred_fused.numpy().tolist()
+        else:
+            final_preds = pred_apt.numpy().tolist()
+        
+        final_labels = all_labels.numpy().tolist()
+        full_metrics = compute_metrics(final_labels, final_preds)
+        
         eval_result = {
             'apt_acc': apt_acc,
             'img_acc': img_acc if use_ssl_branch else None,
@@ -1813,6 +1822,7 @@ class APTTrainingPipeline:
             'base_acc': base_acc,
             'novel_acc': novel_acc,
             'harmonic_mean': harmonic_mean,
+            **full_metrics,
         }
         eval_dir = os.path.join(self.run_dir, 'evaluation')
         os.makedirs(eval_dir, exist_ok=True)
@@ -1964,7 +1974,18 @@ class APTTrainingPipeline:
             'train_acc': avg_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
-            'time': epoch_time
+            'time': epoch_time,
+            'accuracy': results.get('accuracy', val_acc) if self.val_loader else 0.0,
+            'mca': results.get('mca', 0.0) if self.val_loader else 0.0,
+            'f1_macro': results.get('f1_macro', 0.0) if self.val_loader else 0.0,
+            'f1_micro': results.get('f1_micro', 0.0) if self.val_loader else 0.0,
+            'f1_weighted': results.get('f1_weighted', 0.0) if self.val_loader else 0.0,
+            'precision_macro': results.get('precision_macro', 0.0) if self.val_loader else 0.0,
+            'precision_micro': results.get('precision_micro', 0.0) if self.val_loader else 0.0,
+            'precision_weighted': results.get('precision_weighted', 0.0) if self.val_loader else 0.0,
+            'recall_macro': results.get('recall_macro', 0.0) if self.val_loader else 0.0,
+            'recall_micro': results.get('recall_micro', 0.0) if self.val_loader else 0.0,
+            'recall_weighted': results.get('recall_weighted', 0.0) if self.val_loader else 0.0,
         }
 
         base_val_acc = None
@@ -2086,11 +2107,10 @@ class APTTrainingPipeline:
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
-        if self.use_ssl and hasattr(self, 'learned_acc') and self.learned_acc is not None:
-            final_acc = self.learned_acc
+        if self.use_ssl and hasattr(self, 'dual_branch_eval_result') and self.dual_branch_eval_result is not None:
+            final_metrics = self.dual_branch_eval_result
         else:
-            final_acc = self.metrics[-1]['val_acc'] if self.metrics else 0.0
-        final_metrics = self.metrics[-1] if self.metrics else {}
+            final_metrics = self.metrics[-1] if self.metrics else {}
         log_experiment_metrics(final_metrics)
 
 def parse_args():
