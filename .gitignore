@@ -20,10 +20,6 @@ to_delete
 uv.lock
 
 checkpoints
-CoOp/
-multimodal-prompt-learning/
-vpt/
-fixmatch/
+
 *.sh
 # *.log
-test/tsne_output
