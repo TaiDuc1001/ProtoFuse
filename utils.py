@@ -40,15 +40,23 @@ class CheckpointCache:
         if hasattr(config, 'to_dict'):
             config = config.to_dict()
         model_cfg = config.get('model', {})
+        training_cfg = config.get('training', {})
         method_params = {k: v for k, v in model_cfg.items() 
                          if k not in ('backbone', 'dataset_name')}
+        training_params = {
+            'learning_rate': training_cfg.get('learning_rate'),
+            'weight_decay': training_cfg.get('weight_decay'),
+            'optimizer': training_cfg.get('optimizer'),
+        }
         return {
             'dataset_root': config.get('data', {}).get('root'),
             'kshot': config.get('data', {}).get('kshot'),
             'seed': config.get('data', {}).get('seed'),
-            'epochs': config.get('training', {}).get('epochs'),
+            'epochs': training_cfg.get('epochs'),
+            'batch_size': training_cfg.get('batch_size'),
             'backbone': model_cfg.get('backbone'),
             'method_params': json.dumps(method_params, sort_keys=True),
+            'training_params': json.dumps(training_params, sort_keys=True),
             'base_novel': json.dumps(config.get('data', {}).get('base_novel', {}), sort_keys=True),
         }
 
@@ -66,7 +74,7 @@ class CheckpointCache:
     def _update_index(self, checkpoint_id: str, key_settings: dict, path: str):
         rows = []
         fieldnames = ['checkpoint_id', 'file', 'dataset_root', 'kshot', 'seed',
-                      'epochs', 'backbone', 'method_params', 'created_at']
+                      'epochs', 'batch_size', 'backbone', 'method_params', 'training_params', 'created_at']
         if os.path.exists(self.index_path):
             with open(self.index_path, 'r', newline='') as f:
                 reader = csv.DictReader(f)
@@ -78,8 +86,10 @@ class CheckpointCache:
             'kshot': key_settings.get('kshot'),
             'seed': key_settings.get('seed'),
             'epochs': key_settings.get('epochs'),
+            'batch_size': key_settings.get('batch_size'),
             'backbone': key_settings.get('backbone'),
             'method_params': key_settings.get('method_params'),
+            'training_params': key_settings.get('training_params'),
             'created_at': datetime.datetime.now().isoformat(),
         }
         rows.append(row)

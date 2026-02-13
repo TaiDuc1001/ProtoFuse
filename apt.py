@@ -1804,14 +1804,19 @@ class APTTrainingPipeline:
             best_fused_acc = None
             learned_acc = None
 
+        apt_preds = pred_apt.cpu().numpy().tolist()
+        final_labels = all_labels.cpu().numpy().tolist()
+        apt_metrics = compute_metrics(final_labels, apt_preds)
+        
+        fusion_metrics = {}
         if use_ssl_branch and self.fusion_weights is not None:
-            final_preds = pred_fused.numpy().tolist()
-        else:
-            final_preds = pred_apt.numpy().tolist()
-        
-        final_labels = all_labels.numpy().tolist()
-        full_metrics = compute_metrics(final_labels, final_preds)
-        
+            with torch.no_grad():
+                logits_fused = self.fusion_weights(all_apt_logits, all_img_logits)
+            prob_fused = F.softmax(logits_fused, dim=-1)
+            _, pred_learned_fused = torch.max(prob_fused, 1)
+            fusion_preds = pred_learned_fused.cpu().numpy().tolist()
+            fusion_metrics = compute_metrics(final_labels, fusion_preds)
+
         eval_result = {
             'apt_acc': apt_acc,
             'img_acc': img_acc if use_ssl_branch else None,
@@ -1822,7 +1827,8 @@ class APTTrainingPipeline:
             'base_acc': base_acc,
             'novel_acc': novel_acc,
             'harmonic_mean': harmonic_mean,
-            **full_metrics,
+            'apt_metrics': apt_metrics,
+            'fusion_metrics': fusion_metrics
         }
         eval_dir = os.path.join(self.run_dir, 'evaluation')
         os.makedirs(eval_dir, exist_ok=True)
@@ -2107,11 +2113,19 @@ class APTTrainingPipeline:
 
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
-        if self.use_ssl and hasattr(self, 'dual_branch_eval_result') and self.dual_branch_eval_result is not None:
-            final_metrics = self.dual_branch_eval_result
+        if self.use_ssl and hasattr(self, 'dual_branch_eval_result') and self.dual_branch_eval_result:
+            apt_metrics = self.dual_branch_eval_result.get('apt_metrics', {})
+            fusion_metrics = self.dual_branch_eval_result.get('fusion_metrics', {})
+            
+            logger.info("Orbit - APT Metrics:")
+            log_experiment_metrics(apt_metrics)
+            
+            if fusion_metrics:
+                logger.info("Orbit - ViFE (Fusion) Metrics:")
+                log_experiment_metrics(fusion_metrics)
         else:
             final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics)
+            log_experiment_metrics(final_metrics)
 
 def parse_args():
     parser = create_argument_parser("Train APT model", ARG_SCHEMA)

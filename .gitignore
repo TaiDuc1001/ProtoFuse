@@ -25,5 +25,5 @@ multimodal-prompt-learning/
 vpt/
 fixmatch/
 *.sh
-*.log
+# *.log
 test/tsne_output

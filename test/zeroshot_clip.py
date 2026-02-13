@@ -7,6 +7,8 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from clip import clip
@@ -101,13 +103,12 @@ def evaluate_zeroshot(model, dataset, template):
     
     text_features = zeroshot_classifier(model, dataset.classnames, template)
     
-    correct = 0
-    total = 0
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for images, labels in tqdm(dataloader, desc="  Evaluating", leave=False):
             images = images.to(DEVICE)
-            labels = labels.to(DEVICE)
             
             image_features = model.encode_image(images)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -115,11 +116,23 @@ def evaluate_zeroshot(model, dataset, template):
             logits = 100.0 * image_features @ text_features.T
             predictions = logits.argmax(dim=-1)
             
-            correct += (predictions == labels).sum().item()
-            total += labels.size(0)
-    
-    accuracy = 100.0 * correct / total
-    return accuracy
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.numpy())
+            
+    metrics = {
+        "acc": accuracy_score(all_labels, all_preds) * 100,
+        "mca": balanced_accuracy_score(all_labels, all_preds) * 100,
+        "f1_weighted": f1_score(all_labels, all_preds, average="weighted") * 100,
+        "f1_macro": f1_score(all_labels, all_preds, average="macro") * 100,
+        "f1_micro": f1_score(all_labels, all_preds, average="micro") * 100,
+        "precision_weighted": precision_score(all_labels, all_preds, average="weighted", zero_division=0) * 100,
+        "precision_macro": precision_score(all_labels, all_preds, average="macro", zero_division=0) * 100,
+        "precision_micro": precision_score(all_labels, all_preds, average="micro", zero_division=0) * 100,
+        "recall_weighted": recall_score(all_labels, all_preds, average="weighted", zero_division=0) * 100,
+        "recall_macro": recall_score(all_labels, all_preds, average="macro", zero_division=0) * 100,
+        "recall_micro": recall_score(all_labels, all_preds, average="micro", zero_division=0) * 100,
+    }
+    return metrics
 
 
 def run_experiment():
@@ -151,18 +164,32 @@ def run_experiment():
             print(f"  ⚠ Failed: {e}")
             continue
         
-        acc = evaluate_zeroshot(model, dataset, config["template"])
-        results[dataset_name] = acc
-        print(f"  → Accuracy: {acc:.2f}%")
+        metrics = evaluate_zeroshot(model, dataset, config["template"])
+        results[dataset_name] = metrics
+        
+        print(f"  → Accuracy: {metrics['acc']:.2f}%")
+        print(f"  → MCA: {metrics['mca']:.2f}%")
+        print("  → F1:")
+        print(f"      Weighted: {metrics['f1_weighted']:.2f}%")
+        print(f"      Macro:    {metrics['f1_macro']:.2f}%")
+        print(f"      Micro:    {metrics['f1_micro']:.2f}%")
+        print("  → Precision:")
+        print(f"      Weighted: {metrics['precision_weighted']:.2f}%")
+        print(f"      Macro:    {metrics['precision_macro']:.2f}%")
+        print(f"      Micro:    {metrics['precision_micro']:.2f}%")
+        print("  → Recall:")
+        print(f"      Weighted: {metrics['recall_weighted']:.2f}%")
+        print(f"      Macro:    {metrics['recall_macro']:.2f}%")
+        print(f"      Micro:    {metrics['recall_micro']:.2f}%")
     
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"{'Dataset':<15} {'Accuracy':>10}")
-    print("-" * 30)
+    print(f"{'Dataset':<15} {'Acc':>8} {'MCA':>8} {'F1-Ma':>8} {'P-Ma':>8} {'R-Ma':>8}")
+    print("-" * 60)
     
-    for dataset_name, acc in results.items():
-        print(f"{dataset_name:<15} {acc:>9.2f}%")
+    for dataset_name, m in results.items():
+        print(f"{dataset_name:<15} {m['acc']:>8.2f} {m['mca']:>8.2f} {m['f1_macro']:>8.2f} {m['precision_macro']:>8.2f} {m['recall_macro']:>8.2f}")
     
     print("=" * 60)
     
