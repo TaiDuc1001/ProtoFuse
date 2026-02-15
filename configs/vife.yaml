@@ -3,7 +3,6 @@ model:
   num_heads: 8
   num_layers: 1
   backbone: "ViT-B/16"
-  dataset_name: "CUB-200-2011"
   
 checkpoint:
   enabled: true
@@ -17,7 +16,6 @@ training:
   precision: "fp32"
   optimizer: "SGD"
   use_cutout: false
-  increment_epochs: 0
   learning_rate: 0.001
   weight_decay: 0.0005
   confusion_matrix: false
@@ -26,6 +24,7 @@ training:
   visualize_attention: false
 
 data:
+  dataset_name: "CUB-200-2011"
   kshot: 4
   seed: 1
   num_workers: 8

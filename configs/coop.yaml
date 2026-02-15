@@ -4,7 +4,6 @@ model:
   ctx_init: ""
   csc: false
   class_token_position: "end"
-  dataset_name: "CUB-200-2011"
 
 training:
   epochs: 100
@@ -18,6 +17,7 @@ training:
   class_distribution: false
 
 data:
+  dataset_name: "CUB-200-2011"
   kshot: 4
   seed: 1
   num_workers: 4

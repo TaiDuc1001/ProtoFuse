@@ -3,15 +3,14 @@ model:
   num_heads: 8
   num_layers: 1
   backbone: "ViT-B/16"
-  dataset_name: "CUB-200-2011"
 
 checkpoint:
   enabled: true
   cache_dir: "checkpoints/apt"
 
 training:
-  epochs: 10
-  batch_size: 8
+  epochs: 50
+  batch_size: 2
   mode: "logits"
   device: "cuda:0"
   precision: "fp32"
@@ -24,6 +23,7 @@ training:
   visualize_attention: false
 
 data:
+  dataset_name: "CUB-200-2011"
   kshot: 4
   seed: 1
   num_workers: 8

@@ -67,7 +67,7 @@ class FixMatchCoOPTrainingPipeline(CoOPTrainingPipeline, FixMatchMixin):
         self._split_dataset()
         self._initialize_trainer()
 
-        dataset_name = self.config.model.dataset_name
+        dataset_name = self.config.data.dataset_name
         log_experiment_start("CoOP+FixMatch", dataset_name, self.kshot, self.seed)
         
         if len(self.unlabeled_indices) == 0:

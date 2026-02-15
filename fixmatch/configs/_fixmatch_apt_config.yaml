@@ -32,7 +32,6 @@ training:
 data:
   kshot: 16
   seed: 42
-  val_size: 0.2
   num_workers: 8
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]

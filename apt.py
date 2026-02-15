@@ -196,7 +196,9 @@ CUSTOM_TEMPLATES = {
     "ImageNetA": "a photo of a {}.",
     "ImageNetR": "a photo of a {}.",
     "CUB-200-2011": "a photo of a {}, a type of bird.",
-    "V1922_13": "a photo of a {}, a type of military vehicle."
+    "V1922_13": "a photo of a {}, a type of military vehicle.",
+    "NEU-CLS": "a photo of a {}, a type of defect on steel surface.",
+    "MVTEC-CLS": "a photo of a {}, a type of defect on steel strip surface.",
 }
 
 class TextEncoder(nn.Module):
@@ -263,7 +265,8 @@ class CustomCLIP(nn.Module):
         self.base_text_features = self.text_features.clone().detach()
 
     def _init_text_feats(self, cfg, classnames):
-        dataset_name = cfg.get('dataset_name', 'ImageNet')
+        data_cfg = getattr(self.cfg, 'data', ConfigNode())
+        dataset_name = data_cfg.get('dataset_name', cfg.get('dataset_name', 'ImageNet'))
         temp = CUSTOM_TEMPLATES.get(dataset_name, "a photo of a {}.")
         myencoder = TextEncoder(self.clip_model).to(self.device)
         prompts = [temp.format(c.replace('_', ' ')) for c in classnames]
@@ -638,13 +641,6 @@ class APTTrainingPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
-        val_value = self.data_cfg.get("val_size", 0.7)
-        self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
-        if self.val_fraction > 1.0:
-            self.val_fraction = self.val_fraction / 100.0
-        if self.val_fraction < 0 or self.val_fraction >= 1.0:
-            raise ValueError("data.val_size must be in [0, 1) or 0-100 range when expressed as percentage.")
-
         dataset_root_value = self.data_cfg.get("root", "./datasets/cub-200-2011-renamed")
         self.dataset_root = coerce_to_str(dataset_root_value, "./datasets/cub-200-2011-renamed", key="data.root")
 
@@ -676,11 +672,11 @@ class APTTrainingPipeline:
         self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
         self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
 
-        self.dataset: Optional[ImageFolder] = None
+        self.train_dataset: Optional[ImageFolder] = None
+        self.val_dataset: Optional[ImageFolder] = None
         self.val_loader: Optional[DataLoader] = None
         self.classnames: List[str] = []
         self.train_indices: List[int] = []
-        self.val_indices: List[int] = []
         self.labeled_indices: List[int] = []
         self.unlabeled_indices: List[int] = []
         self.metrics: List[Dict[str, Any]] = []
@@ -825,7 +821,7 @@ class APTTrainingPipeline:
         self._split_dataset()
         self._initialize_trainer()
 
-        dataset_name = self.config.model.dataset_name
+        dataset_name = self.config.data.dataset_name
         method_name = "ViFE" if self.use_ssl else "APT"
         log_experiment_start(method_name, dataset_name, self.kshot, self.seed)
         
@@ -892,100 +888,87 @@ class APTTrainingPipeline:
 
     def _load_dataset(self):
         transform = self._build_transforms()
+        train_path = os.path.join(self.dataset_root, 'train')
+        val_path = os.path.join(self.dataset_root, 'val')
+        if not os.path.isdir(val_path):
+            val_path = os.path.join(self.dataset_root, 'test')
         try:
-            self.dataset = ImageFolder(self.dataset_root, transform=transform)
+            self.train_dataset = ImageFolder(train_path, transform=transform)
         except Exception as exc:
-            raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
+            raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
+        try:
+            self.val_dataset = ImageFolder(val_path, transform=transform)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load val dataset from {val_path}: {exc}")
         if self.run_eda:
-            run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+            run_dataset_eda(self.train_dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
     def _split_dataset(self):
-        if self.dataset is None:
+        if self.train_dataset is None:
             raise RuntimeError("Dataset must be loaded before splitting.")
         samples_by_class_idx = defaultdict(list)
-        for idx, (_, class_idx) in enumerate(self.dataset.samples):
+        for idx, (_, class_idx) in enumerate(self.train_dataset.samples):
             samples_by_class_idx[class_idx].append(idx)
 
-        self.classnames = list(self.dataset.classes)
+        self.classnames = list(self.train_dataset.classes)
         all_class_indices = sorted(samples_by_class_idx.keys())
-        
+
         if self.base_novel_enabled:
             self._compute_base_novel_classes(all_class_indices)
-            active_class_indices = self.base_class_indices
             logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base classes, {len(self.novel_class_indices)} novel classes")
-        else:
-            active_class_indices = all_class_indices
 
         rng = random.Random(self.seed)
-        val_indices = []
         train_indices = []
         unlabeled_indices = []
-        base_val_indices = []
-        novel_val_indices = []
 
         for class_idx in all_class_indices:
             class_samples = list(samples_by_class_idx[class_idx])
             class_samples.sort()
             rng.shuffle(class_samples)
 
-            val_count = int(math.floor(len(class_samples) * self.val_fraction))
-            if self.val_fraction > 0 and val_count == 0 and len(class_samples) > 0:
-                val_count = 1
-
-            val_part = class_samples[:val_count]
-            train_candidates = class_samples[val_count:]
-
             if self.base_novel_enabled:
                 if class_idx in self.base_class_indices:
-                    base_val_indices.extend(val_part)
                     if self.kshot > 0:
-                        labeled_part = train_candidates[:self.kshot]
-                        leftover_part = train_candidates[self.kshot:]
+                        labeled_part = class_samples[:self.kshot]
+                        leftover_part = class_samples[self.kshot:]
                     else:
-                        labeled_part = train_candidates
+                        labeled_part = class_samples
                         leftover_part = []
                     train_indices.extend(labeled_part)
                     unlabeled_indices.extend(leftover_part)
-                else:
-                    novel_val_indices.extend(val_part)
             else:
-                val_indices.extend(val_part)
                 if self.kshot > 0:
-                    labeled_part = train_candidates[:self.kshot]
-                    leftover_part = train_candidates[self.kshot:]
+                    labeled_part = class_samples[:self.kshot]
+                    leftover_part = class_samples[self.kshot:]
                 else:
-                    labeled_part = train_candidates
+                    labeled_part = class_samples
                     leftover_part = []
                 train_indices.extend(labeled_part)
                 unlabeled_indices.extend(leftover_part)
 
-        if self.base_novel_enabled:
-            val_indices = base_val_indices + novel_val_indices
-
-        self.val_indices = val_indices
         self.train_indices = train_indices
         self.labeled_indices = list(train_indices)
         self.unlabeled_indices = unlabeled_indices
 
-        if len(self.val_indices) > 0:
-            val_ds = Subset(self.dataset, self.val_indices)
-            self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-        else:
-            logger.warning("Validation split is empty; skipping validation metrics")
+        self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
 
         if self.base_novel_enabled:
+            base_set = set(self.base_class_indices)
+            novel_set = set(self.novel_class_indices)
+            base_val_indices = [i for i, (_, c) in enumerate(self.val_dataset.samples) if c in base_set]
+            novel_val_indices = [i for i, (_, c) in enumerate(self.val_dataset.samples) if c in novel_set]
             if len(base_val_indices) > 0:
-                base_val_ds = Subset(self.dataset, base_val_indices)
+                base_val_ds = Subset(self.val_dataset, base_val_indices)
                 self.base_val_loader = DataLoader(base_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
                 logger.info(f"Base validation: {len(base_val_indices)} samples")
             if len(novel_val_indices) > 0:
-                novel_val_ds = Subset(self.dataset, novel_val_indices)
+                novel_val_ds = Subset(self.val_dataset, novel_val_indices)
                 self.novel_val_loader = DataLoader(novel_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
                 logger.info(f"Novel validation: {len(novel_val_indices)} samples")
 
         stats = {
-            'total_images': len(self.dataset),
-            'val_count': len(self.val_indices),
+            'total_images': len(self.train_dataset) + len(self.val_dataset),
+            'val_count': len(self.val_dataset),
             'train_count': len(self.train_indices),
             'labeled_count': len(self.train_indices),
             'unlabeled_count': len(self.unlabeled_indices),
@@ -1013,12 +996,10 @@ class APTTrainingPipeline:
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
             'dataset_root': self.dataset_root,
-            'val_size': self.val_fraction,
             'rounds': self.rounds,
             'classnames': self.classnames,
             'num_classes': len(self.classnames),
             'train_size': stats.get('labeled_count', stats['train_count']),
-            'val_size_count': stats['val_count'],
             'train_pool_size': stats.get('train_pool_size', stats['train_count'] + stats.get('unlabeled_count', 0)),
             'unlabeled_pool_size': stats.get('unlabeled_count', 0),
             'val_percentage_actual': val_percentage,
@@ -1035,7 +1016,7 @@ class APTTrainingPipeline:
         self.trainer = APT(self.trainer_cfg, self.classnames, device=str(self.device))
 
     def _train_ssl_stage1(self):
-        if self.dataset is None or self.trainer is None:
+        if self.train_dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before SSL training.")
         use_labeled_for_ssl = bool(self.ssl_cfg.get('use_labeled_for_ssl', False))
         if not use_labeled_for_ssl and not self.unlabeled_indices:
@@ -1129,7 +1110,7 @@ class APTTrainingPipeline:
                 ssl_data_indices = ssl_data_indices[:num_unlabeled]
                 logger.debug(f"Limited unlabeled samples to {num_unlabeled}")
 
-        ssl_dataset = DINODataset(self.dataset, ssl_data_indices, dino_transform)
+        ssl_dataset = DINODataset(self.train_dataset, ssl_data_indices, dino_transform)
         ssl_loader = DataLoader(
             ssl_dataset,
             batch_size=self.ssl_batch_size,
@@ -1144,7 +1125,7 @@ class APTTrainingPipeline:
         if num_plot > 0:
             class_to_indices = defaultdict(list)
             for idx in ssl_data_indices:
-                _, label = self.dataset.samples[idx]
+                _, label = self.train_dataset.samples[idx]
                 class_to_indices[label].append(idx)
             
             all_classes = list(class_to_indices.keys())
@@ -1166,7 +1147,7 @@ class APTTrainingPipeline:
                 transforms.Normalize(mean=self.clip_mean, std=self.clip_std),
             ])
             for idx in vis_indices:
-                path, _ = self.dataset.samples[idx]
+                path, _ = self.train_dataset.samples[idx]
                 img = PILImage.open(path).convert('RGB')
                 self.ssl_vis_images.append(vis_transform(img))
                 self.ssl_vis_paths.append(path)
@@ -1352,14 +1333,14 @@ class APTTrainingPipeline:
     def _run_linear_eval(self, feature_dim, num_epochs):
         if not self.train_indices or self.val_loader is None:
             return 0.0
-        if self.ssl_student is None or self.dataset is None:
+        if self.ssl_student is None or self.train_dataset is None:
             logger.warning("Linear evaluation skipped: SSL student or dataset not available")
             return 0.0
 
         eval_classifier = LinearClassifier(feature_dim, len(self.classnames)).to(self.device)
         eval_optimizer = torch.optim.AdamW(eval_classifier.parameters(), lr=0.001)
 
-        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_subset = Subset(self.train_dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.eval_batch_size, shuffle=False, num_workers=self.num_workers)
 
         self.ssl_student.encoder.eval()
@@ -1411,7 +1392,7 @@ class APTTrainingPipeline:
 
 
     def _train_ssl_stage2(self):
-        if self.dataset is None or self.trainer is None or self.ssl_student is None:
+        if self.train_dataset is None or self.trainer is None or self.ssl_student is None:
             logger.warning("SSL Stage 2 skipped: Stage 1 not completed")
             return
         if not self.train_indices:
@@ -1437,7 +1418,7 @@ class APTTrainingPipeline:
         logger.debug(f"SSL classifier params: {sum(p.numel() for p in self.ssl_classifier.parameters()):,}")
         logger.debug(f"Encoder frozen: {not any(p.requires_grad for p in self.ssl_student.encoder.parameters())}")
 
-        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_subset = Subset(self.train_dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         logger.info(f"SSL Stage 2: {linear_epochs} epochs on {len(self.train_indices)} labeled samples")
@@ -1477,7 +1458,7 @@ class APTTrainingPipeline:
             logger.info(f"  SSL2 Epoch {epoch}/{linear_epochs} - loss={avg_loss:.4f} - acc={acc:.2f}%")
 
     def _train_ssl_stage3(self):
-        if self.dataset is None or self.trainer is None:
+        if self.train_dataset is None or self.trainer is None:
             logger.warning("SSL Stage 3 skipped: pipeline not initialized")
             return
         if self.ssl_student is None or self.ssl_classifier is None:
@@ -1498,7 +1479,7 @@ class APTTrainingPipeline:
         self.ssl_student.encoder.eval()
         self.ssl_classifier.eval()
 
-        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_subset = Subset(self.train_dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
 
         all_apt_logits = []
@@ -1672,8 +1653,7 @@ class APTTrainingPipeline:
                 img_pred_i = pred_img[i].item()
                 true_label_i = all_labels[i].item()
                 
-                val_idx = self.val_indices[i]
-                img_path, _ = self.dataset.samples[val_idx]
+                img_path, _ = self.val_dataset.samples[i]
                 apt_name = self.classnames[apt_pred_i]
                 img_name = self.classnames[img_pred_i]
                 
@@ -1895,7 +1875,7 @@ class APTTrainingPipeline:
         return metrics
 
     def _train_epochs(self):
-        if self.dataset is None or self.trainer is None:
+        if self.train_dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before training.")
         if not self.train_indices:
             raise RuntimeError("No training samples available.")
@@ -1904,7 +1884,7 @@ class APTTrainingPipeline:
             logger.info("Skipping training (loaded from checkpoint)")
             return
 
-        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_subset = Subset(self.train_dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
@@ -2029,16 +2009,16 @@ class APTTrainingPipeline:
             self.trainer.scheduler.step()
 
     def _refresh_sample_cache(self, all_labels):
-        if self.dataset is None:
+        if self.val_dataset is None:
             return
-        if self.val_loader is None or len(self.val_indices) == 0:
+        if self.val_loader is None or len(self.val_dataset) == 0:
             return
 
-        num_display = min(10, len(self.classnames), len(self.val_indices))
+        num_display = min(10, len(self.classnames), len(self.val_dataset))
         selected_indices = []
         seen_classes = set()
-        for idx in self.val_indices:
-            cls_idx = self.dataset.samples[idx][1]
+        for idx in range(len(self.val_dataset)):
+            cls_idx = self.val_dataset.samples[idx][1]
             if cls_idx not in seen_classes:
                 seen_classes.add(cls_idx)
                 selected_indices.append(idx)
@@ -2051,8 +2031,7 @@ class APTTrainingPipeline:
                 if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
                     self.sample_cache['images'] = batch_data[0]
                     self.sample_cache['labels'] = batch_data[1]
-                    batch_indices = self.val_indices[:len(batch_data[0])]
-                    self.sample_cache['paths'] = [os.path.abspath(self.dataset.samples[idx][0]) for idx in batch_indices]
+                    self.sample_cache['paths'] = [os.path.abspath(self.val_dataset.samples[idx][0]) for idx in range(len(batch_data[0]))]
                 else:
                     self.sample_cache['images'] = batch_data
                     self.sample_cache['labels'] = None
@@ -2066,10 +2045,10 @@ class APTTrainingPipeline:
             sample_labels_list = []
             sample_paths = []
             for idx in selected_indices:
-                img, lbl = self.dataset[idx]
+                img, lbl = self.val_dataset[idx]
                 sample_images_list.append(img)
                 sample_labels_list.append(lbl)
-                sample_paths.append(os.path.abspath(self.dataset.samples[idx][0]))
+                sample_paths.append(os.path.abspath(self.val_dataset.samples[idx][0]))
 
             self.sample_cache['images'] = torch.stack(sample_images_list)
             self.sample_cache['labels'] = torch.tensor(sample_labels_list)
@@ -2080,7 +2059,7 @@ class APTTrainingPipeline:
             return
         visualize_attention_maps(
             self.trainer,
-            self.dataset,
+            self.val_dataset,
             self.sample_cache,
             self.classnames,
             self.global_epoch,
@@ -2092,7 +2071,7 @@ class APTTrainingPipeline:
             return
         visualize_gradcam_maps(
             self.trainer,
-            self.dataset,
+            self.val_dataset,
             self.sample_cache,
             self.classnames,
             self.global_epoch,

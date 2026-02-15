@@ -2,7 +2,6 @@ model:
   backbone: "ViT-B/16"
   n_ctx: 4
   ctx_init: ""
-  dataset_name: "CUB-200-2011"
 
 training:
   epochs: 10
@@ -16,9 +15,9 @@ training:
   class_distribution: false
 
 data:
+  dataset_name: "CUB-200-2011"
   kshot: 1
   seed: 1
-  val_size: 0.7
   num_workers: 4
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
