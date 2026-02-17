@@ -1,23 +1,21 @@
 model:
   dropout: 0.2
-  num_heads: 8
-  num_layers: 1
   backbone: "ViT-B/16"
-  dataset_name: "CUB-200-2011"
-
-fixmatch:
-  enabled: true
-  confidence: 0.95
-  wu: 1.0
-  unlabeled_batch_size: 56
+  moe:
+    num_experts: 8
+    top_k: 2
+    diversity_weight: 0.1
+    load_balance_weight: 0.01
+    warmup_epochs: 10
+    intermediate_layers: [3, 6, 9, 12]
 
 checkpoint:
   enabled: true
-  cache_dir: "checkpoints/fixmatch_apt"
+  cache_dir: "checkpoints/moe"
 
 training:
-  epochs: 10
-  batch_size: 8
+  epochs: 50
+  batch_size: 16
   mode: "logits"
   device: "cuda:0"
   precision: "fp32"
@@ -30,14 +28,18 @@ training:
   visualize_attention: false
 
 data:
-  val_size: 0.2
-  kshot: 16
-  seed: 42
+  dataset_name: "CUB-200-2011"
+  val_size: 0.7
+  kshot: 4
+  seed: 1
   num_workers: 8
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
   root: "datasets/cub-200-2011-renamed"
+  base_novel:
+    enabled: false
+    split_ratio: 0.5
 
 logging:
-  output_dir: "outputs/fixmatch_apt"
+  output_dir: "outputs/moe"

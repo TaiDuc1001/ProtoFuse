@@ -22,4 +22,4 @@ uv.lock
 checkpoints
 
 *.sh
-# *.log
+*.log

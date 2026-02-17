@@ -26,6 +26,7 @@ training:
   weight_decay: 0.0005
 
 data:
+  val_size: 0.2
   kshot: 16
   seed: 42
   num_workers: 8

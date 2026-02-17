@@ -9,6 +9,7 @@ import cv2
 import csv
 import copy
 import json
+import math
 import time
 import yaml
 import umap
@@ -1264,6 +1265,16 @@ class BaseTrainingPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
+        val_value = self.data_cfg.get("val_size", None)
+        if val_value is not None:
+            self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
+            if self.val_fraction > 1.0:
+                self.val_fraction = self.val_fraction / 100.0
+            if self.val_fraction < 0 or self.val_fraction >= 1.0:
+                raise ValueError("data.val_size must be in [0, 1) or 0-100 range when expressed as percentage.")
+        else:
+            self.val_fraction = None
+
         dataset_root_value = self.data_cfg.get("root", "./datasets/cub-200-2011-renamed")
         self.dataset_root = coerce_to_str(dataset_root_value, "./datasets/cub-200-2011-renamed", key="data.root")
 
@@ -1293,8 +1304,7 @@ class BaseTrainingPipeline:
         self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
         self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
 
-        self.train_dataset: Optional[ImageFolder] = None
-        self.val_dataset: Optional[ImageFolder] = None
+        self.dataset: Optional[ImageFolder] = None
         self.val_loader: Optional[DataLoader] = None
         self.classnames: List[str] = []
         self.train_indices: List[int] = []
@@ -1409,54 +1419,93 @@ class BaseTrainingPipeline:
 
     def _load_dataset(self):
         transform = self._build_transforms()
-        train_path = os.path.join(self.dataset_root, 'train')
-        val_path = os.path.join(self.dataset_root, 'val')
-        if not os.path.isdir(val_path):
-            val_path = os.path.join(self.dataset_root, 'test')
-        try:
-            self.train_dataset = ImageFolder(train_path, transform=transform)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
-        try:
-            self.val_dataset = ImageFolder(val_path, transform=transform)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load val dataset from {val_path}: {exc}")
-        if self.run_eda:
-            run_dataset_eda(self.train_dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+        if self.val_fraction is not None:
+            try:
+                self.dataset = ImageFolder(self.dataset_root, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
+            if self.run_eda:
+                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+        else:
+            train_path = os.path.join(self.dataset_root, 'train')
+            val_path = os.path.join(self.dataset_root, 'val')
+            if not os.path.isdir(val_path):
+                val_path = os.path.join(self.dataset_root, 'test')
+            try:
+                self.dataset = ImageFolder(train_path, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
+            try:
+                self._val_dataset = ImageFolder(val_path, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load val dataset from {val_path}: {exc}")
+            if self.run_eda:
+                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
     def _split_dataset(self):
-        if self.train_dataset is None:
+        if self.dataset is None:
             raise RuntimeError("Dataset must be loaded before splitting.")
         samples_by_class_idx = defaultdict(list)
-        for idx, (_, class_idx) in enumerate(self.train_dataset.samples):
+        for idx, (_, class_idx) in enumerate(self.dataset.samples):
             samples_by_class_idx[class_idx].append(idx)
 
         rng = random.Random(self.seed)
+        val_indices = []
         train_indices = []
         unlabeled_indices = []
 
-        for class_idx in sorted(samples_by_class_idx.keys()):
-            class_samples = list(samples_by_class_idx[class_idx])
-            class_samples.sort()
-            rng.shuffle(class_samples)
+        if self.val_fraction is not None:
+            for class_idx in sorted(samples_by_class_idx.keys()):
+                class_samples = list(samples_by_class_idx[class_idx])
+                class_samples.sort()
+                rng.shuffle(class_samples)
 
-            if self.kshot > 0:
-                labeled_part = class_samples[:self.kshot]
-                leftover_part = class_samples[self.kshot:]
-            else:
-                labeled_part = class_samples
-                leftover_part = []
+                val_count = int(math.floor(len(class_samples) * self.val_fraction))
+                if self.val_fraction > 0 and val_count == 0 and len(class_samples) > 0:
+                    val_count = 1
 
-            train_indices.extend(labeled_part)
-            unlabeled_indices.extend(leftover_part)
+                val_part = class_samples[:val_count]
+                train_candidates = class_samples[val_count:]
+                if self.kshot > 0:
+                    labeled_part = train_candidates[:self.kshot]
+                    leftover_part = train_candidates[self.kshot:]
+                else:
+                    labeled_part = train_candidates
+                    leftover_part = []
 
+                val_indices.extend(val_part)
+                train_indices.extend(labeled_part)
+                unlabeled_indices.extend(leftover_part)
+        else:
+            for class_idx in sorted(samples_by_class_idx.keys()):
+                class_samples = list(samples_by_class_idx[class_idx])
+                class_samples.sort()
+                rng.shuffle(class_samples)
+
+                if self.kshot > 0:
+                    labeled_part = class_samples[:self.kshot]
+                    leftover_part = class_samples[self.kshot:]
+                else:
+                    labeled_part = class_samples
+                    leftover_part = []
+                train_indices.extend(labeled_part)
+                unlabeled_indices.extend(leftover_part)
+
+        self.val_indices = val_indices
         self.train_indices = train_indices
         self.labeled_indices = list(train_indices)
         self.unlabeled_indices = unlabeled_indices
 
-        self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        if self.val_fraction is not None:
+            if len(self.val_indices) > 0:
+                val_ds = Subset(self.dataset, self.val_indices)
+                self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+            else:
+                logger.warning("Validation split is empty; skipping validation metrics")
+        else:
+            self.val_loader = DataLoader(self._val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
 
-        self.classnames = list(self.train_dataset.classes)
+        self.classnames = list(self.dataset.classes)
 
         if self.base_novel_enabled:
             num_classes = len(self.classnames)
@@ -1466,13 +1515,20 @@ class BaseTrainingPipeline:
             self.base_class_indices = sorted(all_class_indices[:num_base])
             self.novel_class_indices = sorted(all_class_indices[num_base:])
             base_set = set(self.base_class_indices)
-            self.train_indices = [i for i in self.train_indices if self.train_dataset.samples[i][1] in base_set]
+            self.train_indices = [i for i in self.train_indices if self.dataset.samples[i][1] in base_set]
             self.labeled_indices = list(self.train_indices)
             logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base, {len(self.novel_class_indices)} novel classes")
 
+        if self.val_fraction is not None:
+            total_images = len(self.dataset)
+            val_count = len(self.val_indices)
+        else:
+            total_images = len(self.dataset) + len(self._val_dataset)
+            val_count = len(self._val_dataset)
+
         stats = {
-            'total_images': len(self.train_dataset) + len(self.val_dataset),
-            'val_count': len(self.val_dataset),
+            'total_images': total_images,
+            'val_count': val_count,
             'train_count': len(self.train_indices),
             'labeled_count': len(self.train_indices),
             'unlabeled_count': len(self.unlabeled_indices),
@@ -1489,9 +1545,11 @@ class BaseTrainingPipeline:
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
             'dataset_root': self.dataset_root,
+            'val_size': self.val_fraction,
             'classnames': self.classnames,
             'num_classes': len(self.classnames),
             'train_size': stats.get('labeled_count', stats['train_count']),
+            'val_size_count': stats['val_count'],
             'train_pool_size': stats.get('train_pool_size', stats['train_count'] + stats.get('unlabeled_count', 0)),
             'unlabeled_pool_size': stats.get('unlabeled_count', 0),
             'val_percentage_actual': val_percentage,
@@ -1509,7 +1567,7 @@ class BaseTrainingPipeline:
         self.trainer = self.TRAINER_CLASS(self.trainer_cfg, self.classnames, device=str(self.device))
 
     def _train_epochs(self):
-        if self.train_dataset is None or self.trainer is None:
+        if self.dataset is None or self.trainer is None:
             raise RuntimeError("Pipeline not initialized before training.")
         if not self.train_indices:
             raise RuntimeError("No training samples available.")
@@ -1518,7 +1576,7 @@ class BaseTrainingPipeline:
             logger.info("Skipping training (loaded from checkpoint)")
             return
 
-        train_subset = Subset(self.train_dataset, list(self.train_indices))
+        train_subset = Subset(self.dataset, list(self.train_indices))
         train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
         epochs_total = self._get_training_epochs()
