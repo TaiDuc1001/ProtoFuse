@@ -683,6 +683,7 @@ class APTTrainingPipeline:
         self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
 
         self.dataset: Optional[ImageFolder] = None
+        self._val_dataset: Optional[ImageFolder] = None
         self.val_loader: Optional[DataLoader] = None
         self.classnames: List[str] = []
         self.train_indices: List[int] = []
@@ -739,6 +740,12 @@ class APTTrainingPipeline:
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
         self._init_checkpoint_cache()
+
+    @property
+    def val_dataset(self):
+        if hasattr(self, '_val_dataset') and self._val_dataset is not None:
+            return self._val_dataset
+        return self.dataset
 
     def _get_training_epochs(self):
         epochs_value = None

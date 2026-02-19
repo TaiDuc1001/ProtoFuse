@@ -1,13 +1,12 @@
 model:
   dropout: 0.2
   backbone: "ViT-B/16"
+  num_heads: 8
   moe:
-    num_experts: 8
-    top_k: 2
+    num_groups: 4
+    warmup_epochs: 10
     diversity_weight: 0.1
     load_balance_weight: 0.01
-    warmup_epochs: 10
-    intermediate_layers: [3, 6, 9, 12]
 
 checkpoint:
   enabled: true
@@ -30,7 +29,7 @@ training:
 data:
   dataset_name: "CUB-200-2011"
   val_size: 0.7
-  kshot: 4
+  kshot: 1
   seed: 1
   num_workers: 8
   run_eda: false

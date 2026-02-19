@@ -1,6 +1,8 @@
 import os
+import math
 import copy
 import torch
+import random
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -27,140 +29,96 @@ from utils import (
 )
 
 
-class SemanticRouter(nn.Module):
-    def __init__(self, feature_dim, num_experts, hidden_dim=None):
+class PatchGroupRouter(nn.Module):
+    def __init__(self, feature_dim, num_groups):
         super().__init__()
-        if hidden_dim is None:
-            hidden_dim = feature_dim // 4
-        self.temperature = nn.Parameter(torch.ones(1))
+        self.num_groups = num_groups
         self.net = nn.Sequential(
             nn.LayerNorm(feature_dim),
-            nn.Linear(feature_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, num_experts),
+            nn.Linear(feature_dim, num_groups),
         )
 
-    def forward(self, class_embeddings):
-        scores = self.net(class_embeddings)
-        weights = F.softmax(scores / self.temperature.clamp(min=0.1), dim=-1)
-        return weights
+    def forward(self, patches, tau, hard=True):
+        logits = self.net(patches)
+        if self.training:
+            soft = F.gumbel_softmax(logits, tau=tau, hard=hard)
+        else:
+            idx = logits.argmax(dim=-1)
+            soft = F.one_hot(idx, self.num_groups).float()
+        return soft, logits
 
 
-class SemanticExpert(nn.Module):
-    def __init__(self, feature_dim, expert_dim, dropout=0.1):
+class PartDiscoveryAttention(nn.Module):
+    def __init__(self, feature_dim, num_groups=4, num_heads=8,
+                 dropout=0.1, warmup_epochs=10):
         super().__init__()
-        self.expert_dim = expert_dim
-        self.scale = expert_dim ** -0.5
+        self.feature_dim = feature_dim
+        self.num_groups = num_groups
 
-        self.q_proj = nn.Linear(feature_dim, expert_dim)
-        self.k_proj = nn.Linear(feature_dim, expert_dim)
-        self.v_proj = nn.Linear(feature_dim, expert_dim)
+        self.router = PatchGroupRouter(feature_dim, num_groups)
 
-        self.norm1 = nn.LayerNorm(expert_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(expert_dim, expert_dim),
-            nn.GELU(),
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=feature_dim, num_heads=num_heads, dropout=dropout,
+            batch_first=False,
         )
-        self.norm2 = nn.LayerNorm(expert_dim)
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.norm2 = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
+        self.feed_forward = nn.Linear(feature_dim, feature_dim)
 
-    def forward(self, text_features, image_features):
-        q = self.q_proj(text_features)
-        k = self.k_proj(image_features)
-        v = self.v_proj(image_features)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, v)
-
-        out = self.norm1(out)
-        out = out + self.ffn(out)
-        out = self.norm2(out)
-
-        return out
-
-
-class MixtureOfExperts(nn.Module):
-    def __init__(self, feature_dim, num_experts=8, top_k=2, dropout=0.1):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.expert_dim = feature_dim // num_experts
-
-        self.router = SemanticRouter(feature_dim, num_experts)
-        self.experts = nn.ModuleList([
-            SemanticExpert(feature_dim, self.expert_dim, dropout)
-            for _ in range(num_experts)
-        ])
-        self.output_proj = nn.Linear(self.expert_dim, feature_dim)
-        self.output_norm = nn.LayerNorm(feature_dim)
-
+        self.warmup_epochs = warmup_epochs
+        self.use_hard = warmup_epochs == 0
+        self.current_tau = 1.0
         self.current_epoch = 0
-        self.warmup_epochs = 5
-
+        self.total_epochs = 1
         self._routing_history = []
 
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch, total_epochs=None):
         self.current_epoch = epoch
+        if total_epochs is not None:
+            self.total_epochs = total_epochs
+        self.use_hard = epoch >= self.warmup_epochs
 
-    def forward(self, text_features, image_features):
-        B = image_features.size(0)
-        C = text_features.size(0) if text_features.dim() == 2 else text_features.size(1)
+    def clear_routing_history(self):
+        self._routing_history = []
 
-        if text_features.dim() == 2:
-            text_3d = text_features.unsqueeze(0).expand(B, -1, -1)
-        elif text_features.size(0) == B:
-            text_3d = text_features
-        else:
-            text_3d = text_features.expand(B, -1, -1)
+    def forward(self, unpooled, text_features):
+        S, B, D = unpooled.shape
+        C = text_features.size(0)
+        G = self.num_groups
 
-        if text_features.dim() == 2:
-            routing_input = text_features
-        else:
-            routing_input = text_3d[0]
-
-        routing_weights = self.router(routing_input)
+        assignments, logits = self.router(
+            unpooled.reshape(S * B, D), self.current_tau, hard=self.use_hard
+        )
+        assignments = assignments.reshape(S, B, G)
 
         if self.training:
-            self._routing_history.append(routing_weights.detach())
+            self._routing_history.append(assignments.detach().mean(dim=0))
 
-        use_sparse = self.current_epoch >= self.warmup_epochs
+        parts = []
+        for g in range(G):
+            weights_g = assignments[:, :, g]
+            weight_sum = weights_g.sum(dim=0, keepdim=True).clamp(min=1e-6)
+            weighted_patches = (weights_g.unsqueeze(-1) * unpooled)
+            part_g = weighted_patches.sum(dim=0) / weight_sum.transpose(0, 1)
+            parts.append(part_g)
 
-        if use_sparse:
-            top_values, top_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-            top_values = top_values / top_values.sum(dim=-1, keepdim=True)
-            mask = torch.zeros_like(routing_weights)
-            mask.scatter_(-1, top_indices, top_values)
-            routing_weights = mask
+        part_tokens = torch.stack(parts, dim=0)
 
-        combined = torch.zeros(
-            B, C, self.expert_dim,
-            device=text_3d.device, dtype=text_3d.dtype,
-        )
+        out, attn_weights = self.cross_attn(text_features, part_tokens, part_tokens)
+        text_features = self.norm1(self.dropout(text_features + out))
+        ff = self.feed_forward(text_features)
+        text_features = self.norm2(self.dropout(text_features + ff))
 
-        for i, expert in enumerate(self.experts):
-            w = routing_weights[:, i]
-            if use_sparse and (w.abs().sum() < 1e-8):
-                continue
-            expert_out = expert(text_3d, image_features)
-            combined = combined + w.unsqueeze(0).unsqueeze(-1) * expert_out
-
-        output = self.output_proj(combined)
-        output = self.output_norm(output)
-
-        return output
+        return text_features, attn_weights
 
     def diversity_loss(self):
-        loss = 0.0
-        n = 0
-        for i in range(self.num_experts):
-            for j in range(i + 1, self.num_experts):
-                qi = self.experts[i].q_proj.weight
-                qj = self.experts[j].q_proj.weight
-                loss = loss + torch.norm(qi.T @ qj, p='fro') ** 2
-                n += 1
-        return loss / max(n, 1)
+        if not self._routing_history:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        recent = torch.cat(self._routing_history[-32:], dim=0)
+        avg = recent.mean(dim=0)
+        entropy = -(avg * (avg + 1e-8).log()).sum()
+        return -entropy
 
     def load_balance_loss(self):
         if not self._routing_history:
@@ -168,66 +126,10 @@ class MixtureOfExperts(nn.Module):
         recent = torch.cat(self._routing_history[-32:], dim=0)
         avg_prob = recent.mean(dim=0)
         fraction = (recent.argmax(dim=-1).unsqueeze(-1) == torch.arange(
-            self.num_experts, device=recent.device
+            self.num_groups, device=recent.device
         ).unsqueeze(0)).float().mean(dim=0)
-        loss = (fraction * avg_prob).sum() * self.num_experts
+        loss = (fraction * avg_prob).sum() * self.num_groups
         return loss
-
-    def clear_routing_history(self):
-        self._routing_history = []
-
-
-class MoEImageEncoder(ImageEncoder):
-    def __init__(self, clip_model, intermediate_layers=None):
-        super().__init__(clip_model)
-        if intermediate_layers is None:
-            intermediate_layers = [3, 6, 9, 12]
-        self.intermediate_layers = intermediate_layers
-
-    def forward(self, x):
-        x = x.type(self.conv1.weight.dtype)
-        x = self.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)
-
-        cls_tokens = self.class_embedding.to(x.dtype) + torch.zeros(
-            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
-        )
-        x = torch.cat([cls_tokens, x], dim=1)
-
-        num_patches = x.shape[1] - 1
-        pos_embed = self._interpolate_pos_embed(self.positional_embedding, num_patches)
-        x = x + pos_embed.to(x.dtype)
-
-        x = self.ln_pre(x)
-        x = x.permute(1, 0, 2)
-
-        intermediate_outputs = []
-        num_blocks = len(self.transformer.resblocks)
-        target_set = set()
-        for layer_idx in self.intermediate_layers:
-            if layer_idx <= num_blocks:
-                target_set.add(layer_idx - 1)
-
-        for idx, block in enumerate(self.transformer.resblocks):
-            x = block(x)
-            if idx in target_set:
-                feat = x.permute(1, 0, 2)
-                feat = self.ln_post(feat)
-                if self.proj is not None:
-                    feat = feat @ self.proj
-                intermediate_outputs.append(feat)
-
-        final_unpooled = x.permute(1, 0, 2)
-        final_unpooled = self.ln_post(final_unpooled)
-        if self.proj is not None:
-            final_unpooled = final_unpooled @ self.proj
-
-        if not intermediate_outputs:
-            intermediate_outputs = [final_unpooled]
-
-        global_feature = final_unpooled[:, 0, :]
-        return intermediate_outputs, global_feature
 
 
 class MoECustomCLIP(CustomCLIP):
@@ -239,58 +141,60 @@ class MoECustomCLIP(CustomCLIP):
             moe_cfg = ConfigNode(moe_cfg)
 
         prompt_dim = self.clip_model.text_projection.shape[1]
-        num_experts = moe_cfg.get('num_experts', 8)
-        top_k = moe_cfg.get('top_k', 2)
-        dropout = self.model_cfg.get('dropout', 0.1)
+        num_groups = coerce_to_int(moe_cfg.get('num_groups', 4), 4)
+        num_heads = coerce_to_int(self.model_cfg.get('num_heads', 8), 8)
+        dropout = coerce_to_float(self.model_cfg.get('dropout', 0.1), 0.1)
+        warmup_epochs = coerce_to_int(moe_cfg.get('warmup_epochs', 10), 10)
 
-        self.moe = MixtureOfExperts(
-            feature_dim=prompt_dim,
-            num_experts=num_experts,
-            top_k=top_k,
-            dropout=dropout,
-        )
-
-        warmup = moe_cfg.get('warmup_epochs', 5)
-        self.moe.warmup_epochs = warmup
+        self.prompt_learner = nn.ModuleList([
+            PartDiscoveryAttention(
+                feature_dim=prompt_dim,
+                num_groups=num_groups,
+                num_heads=num_heads,
+                dropout=dropout,
+                warmup_epochs=warmup_epochs,
+            )
+            for _ in range(self.model_cfg.get('num_layers', 1))
+        ])
 
         self.diversity_weight = coerce_to_float(moe_cfg.get('diversity_weight', 0.1), 0.1)
         self.load_balance_weight = coerce_to_float(moe_cfg.get('load_balance_weight', 0.01), 0.01)
 
-        intermediate_layers = moe_cfg.get('intermediate_layers', [3, 6, 9, 12])
-        self.vis_encoder = MoEImageEncoder(self.clip_model, intermediate_layers)
-
         if self.training_cfg.get('precision', 'fp32') == 'fp16':
-            self.moe = self.moe.half()
+            self.prompt_learner = self.prompt_learner.half()
 
     def forward(self, image, label=None):
+        with torch.no_grad():
+            pass
+
         visual_output = self.vis_encoder(image)
         unpooled_levels, image_features = visual_output
-
         if not isinstance(unpooled_levels, list):
             unpooled_levels = [unpooled_levels]
 
-        multi_scale = torch.cat(unpooled_levels, dim=1)
-
         base_text_features = self.text_features.clone()
 
-        adapted_text = self.moe(base_text_features, multi_scale)
+        unpooled_images = unpooled_levels[0].permute(1, 0, 2)
+        text_features = base_text_features.unsqueeze(1).expand(-1, unpooled_images.shape[1], -1)
 
-        adapted_text = F.normalize(adapted_text, dim=-1)
+        for layer in self.prompt_learner:
+            text_features, _ = layer(unpooled_images, text_features)
+
+        text_features = text_features.permute(1, 0, 2)
+        text_features = F.normalize(text_features, dim=-1)
 
         logit_scale = self.logit_scale.exp()
         image_features = F.normalize(image_features, dim=-1)
+        image_features = image_features.unsqueeze(1)
 
-        logits = logit_scale * torch.bmm(
-            image_features.unsqueeze(1),
-            adapted_text.transpose(1, 2),
-        ).squeeze(1)
+        logits = logit_scale * F.cosine_similarity(image_features, text_features, dim=-1)
 
         mode = self.cfg.get('mode', self.training_cfg.get('mode', 'logits'))
 
         if self.training and label is not None:
             ce_loss = F.cross_entropy(logits, label)
-            div_loss = self.moe.diversity_loss()
-            lb_loss = self.moe.load_balance_loss()
+            div_loss = sum(layer.diversity_loss() for layer in self.prompt_learner) / len(self.prompt_learner)
+            lb_loss = sum(layer.load_balance_loss() for layer in self.prompt_learner) / len(self.prompt_learner)
             total_loss = (
                 ce_loss
                 + self.diversity_weight * div_loss
@@ -300,15 +204,15 @@ class MoECustomCLIP(CustomCLIP):
         elif mode == "logits":
             return logits
         elif mode == "features":
-            return logits, adapted_text
+            return logits, text_features
 
         return logits
 
     def trainable_parameters(self):
-        return self.moe.parameters()
+        return self.prompt_learner.parameters()
 
     def get_trainable_parameter_names(self):
-        return [f"moe.{name}" for name, _ in self.moe.named_parameters()]
+        return [f"prompt_learner.{name}" for name, _ in self.prompt_learner.named_parameters()]
 
 
 class MoEAPT(APT):
@@ -375,21 +279,20 @@ class MoEAPT(APT):
         labels = labels.to(self.device)
 
         self.model.train()
-        self.model.moe.train()
 
         precision = self._cfg_str('fp32', 'training.precision', 'precision')
+
+        self.optimizer.zero_grad()
 
         if precision == 'amp':
             from torch.cuda.amp import autocast
             with autocast():
                 loss, logits = self.model(images, labels)
-            self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss, logits = self.model(images, labels)
-            self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
@@ -402,7 +305,7 @@ class MoEAPT(APT):
 
     def save_model(self, path):
         checkpoint = {
-            'moe_state_dict': self.model.moe.state_dict(),
+            'prompt_learner_state_dict': self.model.prompt_learner.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'cfg': self.cfg
@@ -412,8 +315,10 @@ class MoEAPT(APT):
 
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        if 'moe_state_dict' in checkpoint:
-            self.model.moe.load_state_dict(checkpoint['moe_state_dict'])
+        if 'prompt_learner_state_dict' in checkpoint:
+            self.model.prompt_learner.load_state_dict(checkpoint['prompt_learner_state_dict'])
+        elif 'moe_state_dict' in checkpoint:
+            self.model.prompt_learner.load_state_dict(checkpoint['moe_state_dict'], strict=False)
         elif 'model_state_dict' in checkpoint:
             self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -442,10 +347,13 @@ class MoETrainingPipeline(APTTrainingPipeline):
 
     def _run_epoch(self, epoch_idx, epochs_total, train_loader, run_dir):
         if self.trainer is not None and hasattr(self.trainer, 'model'):
-            if hasattr(self.trainer.model, 'moe'):
-                self.trainer.model.moe.set_epoch(epoch_idx)
+            for layer in self.trainer.model.prompt_learner:
+                layer.set_epoch(epoch_idx, epochs_total)
                 if epoch_idx == 0:
-                    self.trainer.model.moe.clear_routing_history()
+                    layer.clear_routing_history()
+            layer0 = self.trainer.model.prompt_learner[0]
+            phase = "soft" if not layer0.use_hard else "hard"
+            logger.info(f"Epoch {epoch_idx} tau={layer0.current_tau:.4f} routing={phase}")
         return super()._run_epoch(epoch_idx, epochs_total, train_loader, run_dir)
 
 
@@ -459,7 +367,7 @@ MOE_ARG_SCHEMA = {
 
 
 def parse_args():
-    parser = create_argument_parser("Train MoSE-APT model", MOE_ARG_SCHEMA)
+    parser = create_argument_parser("Train MoH-APT model", MOE_ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, MOE_ARG_SCHEMA, overrides)
