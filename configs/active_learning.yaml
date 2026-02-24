@@ -9,7 +9,7 @@ checkpoint:
   cache_dir: "checkpoints/active_learning"
 
 training:
-  epochs: 50
+  epochs: 20
   batch_size: 16
   mode: "logits"
   device: "cuda:0"
@@ -37,6 +37,7 @@ data:
     split_ratio: 0.5
 
 active_learning:
+  model_type: "APT"
   strategy: "entropy"
   kshot_budget: 4
   num_rounds: 5

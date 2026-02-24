@@ -11,7 +11,7 @@ from utils import ConfigNode, load_clip_to_cpu, load_config_file
 from coop import CoOPCLIP
 from maple import MaPLeCLIP
 from apt import CustomCLIP as APTCLIP
-from apt_ssl import TransformerAdapter, SSLHead, LinearClassifier, FusionWeightLearner
+from vife import TransformerAdapter, SSLHead, LinearClassifier, FusionWeightLearner
 
 
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")

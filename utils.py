@@ -1245,6 +1245,35 @@ class BaseTrainingPipeline:
     DEFAULT_OUTPUT_DIR = "outputs/base"
     DEFAULT_CHECKPOINT_DIR = "checkpoints/base"
     TRAINER_CLASS = None
+    _EXTRA_PIPELINE_CLASSES = []
+
+    @classmethod
+    def _all_subclasses(cls):
+        result = []
+        for sub in cls.__subclasses__():
+            result.append(sub)
+            result.extend(sub._all_subclasses())
+        return result
+
+    @classmethod
+    def register_extra_pipeline(cls, pipeline_cls):
+        if pipeline_cls not in cls._EXTRA_PIPELINE_CLASSES:
+            cls._EXTRA_PIPELINE_CLASSES.append(pipeline_cls)
+
+    @classmethod
+    def get_pipeline_by_name(cls, name):
+        name_lower = name.lower()
+        for sub in cls._all_subclasses():
+            if getattr(sub, 'METHOD_NAME', '').lower() == name_lower:
+                return sub
+        for sub in cls._EXTRA_PIPELINE_CLASSES:
+            if getattr(sub, 'METHOD_NAME', '').lower() == name_lower:
+                return sub
+            for child in sub.__subclasses__():
+                if getattr(child, 'METHOD_NAME', '').lower() == name_lower:
+                    return child
+        available = [getattr(s, 'METHOD_NAME', '?') for s in cls._all_subclasses() + cls._EXTRA_PIPELINE_CLASSES]
+        raise ValueError(f"No pipeline with METHOD_NAME='{name}'. Available: {available}")
 
     def __init__(self, config):
         if not isinstance(config, ConfigNode):
