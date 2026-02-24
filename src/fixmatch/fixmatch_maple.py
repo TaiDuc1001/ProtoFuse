@@ -31,8 +31,8 @@ from utils import (
     log_experiment_accuracy,
 )
 
-from cocoop import CoCoOP, CoCoOPTrainingPipeline
-from fixmatch_utils import FixMatchMixin
+from src.pipelines.maple import MaPLeTrainingPipeline
+from src.fixmatch.fixmatch_utils import FixMatchMixin
 
 ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
@@ -43,13 +43,13 @@ ARG_SCHEMA = {
 }
 
 
-class FixMatchCoCoOPTrainingPipeline(CoCoOPTrainingPipeline, FixMatchMixin):
+class FixMatchMaPLeTrainingPipeline(MaPLeTrainingPipeline, FixMatchMixin):
     def __init__(self, config):
         super().__init__(config)
         self._init_fixmatch_config()
         
-        base_output_value = self.logging_cfg.get("output_dir", "outputs/fixmatch_cocoop")
-        base_output = coerce_to_str(base_output_value, "outputs/fixmatch_cocoop", key="logging.output_dir")
+        base_output_value = self.logging_cfg.get("output_dir", "outputs/fixmatch_maple")
+        base_output = coerce_to_str(base_output_value, "outputs/fixmatch_maple", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
         self.config_path = os.path.join(self.run_dir, 'config.json')
@@ -68,11 +68,11 @@ class FixMatchCoCoOPTrainingPipeline(CoCoOPTrainingPipeline, FixMatchMixin):
         self._initialize_trainer()
 
         dataset_name = self.config.data.dataset_name
-        log_experiment_start("CoCoOP+FixMatch", dataset_name, self.kshot, self.seed)
+        log_experiment_start("MaPLe+FixMatch", dataset_name, self.kshot, self.seed)
         
         if len(self.unlabeled_indices) == 0:
-            logger.warning("No unlabeled samples available, falling back to standard CoCoOP training")
-            logger.section("CoCoOP Training (No Unlabeled Data)", "train")
+            logger.warning("No unlabeled samples available, falling back to standard MaPLe training")
+            logger.section("MaPLe Training (No Unlabeled Data)", "train")
             self._train_epochs()
         else:
             logger.section("FixMatch Training", "train")
@@ -175,7 +175,7 @@ class FixMatchCoCoOPTrainingPipeline(CoCoOPTrainingPipeline, FixMatchMixin):
 
 
 def parse_args():
-    parser = create_argument_parser("Train CoCoOP+FixMatch model", ARG_SCHEMA)
+    parser = create_argument_parser("Train MaPLe+FixMatch model", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
@@ -187,7 +187,7 @@ def main():
     setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', False))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
-    pipeline = FixMatchCoCoOPTrainingPipeline(merged)
+    pipeline = FixMatchMaPLeTrainingPipeline(merged)
     pipeline.run()
 
 

@@ -9,10 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
-datasets
+datasets/
+!src/datasets/
 run.sh
 *.txt
 models
+!src/models/
 outputs
 to_delete
 *.pt
