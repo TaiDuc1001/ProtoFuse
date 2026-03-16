@@ -1,22 +1,23 @@
 import sys
-import pandas as pd
 import argparse
+import math
+import random
+import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-import math
-import random
-import warnings
-import numpy as np
 from collections import defaultdict
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from rich.console import Console
+from rich.table import Table
+import warnings
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from clip import clip
 from torchvision.datasets import ImageFolder
+from utils import compute_metrics
 
 CLIP_MODEL_PATH = Path(__file__).parent.parent / "models" / "ViT-B-16.pt"
 DEFAULT_DATASET = Path(__file__).parent.parent / "datasets" / "cub-200-2011-renamed"
@@ -25,7 +26,6 @@ DEFAULT_DEVICE = "cuda:0"
 DEVICE = DEFAULT_DEVICE
 BATCH_SIZE = 128
 VAL_SIZE = 0.7
-KSHOT = 4
 SEED = 1
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -57,18 +57,15 @@ def extract_and_cache_features(clip_model, dataset, cache_name):
     cache_path = CACHE_DIR / f"{cache_name}.pt"
     if cache_path.exists():
         data = torch.load(cache_path, map_location="cpu", weights_only=True)
-        print(f"  Loaded cached features from {cache_path}")
         return data["features"], data["labels"]
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=4, pin_memory=True)
-
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     all_features = []
     all_labels = []
 
     with torch.no_grad():
-        for images, labels in tqdm(loader, desc=f"  Extracting {cache_name}", leave=False):
+        for images, labels in loader:
             images = images.to(DEVICE)
             features = clip_model.encode_image(images).float()
             all_features.append(features.cpu())
@@ -77,7 +74,6 @@ def extract_and_cache_features(clip_model, dataset, cache_name):
     features = torch.cat(all_features, dim=0)
     labels = torch.cat(all_labels, dim=0)
     torch.save({"features": features, "labels": labels}, cache_path)
-    print(f"  Cached features to {cache_path}")
     return features, labels
 
 
@@ -111,34 +107,6 @@ def split_by_class(dataset, val_size, kshot, seed):
     return train_indices, val_indices
 
 
-def compute_acc(labels_np, preds_np):
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning)
-        return {
-            "acc": accuracy_score(labels_np, preds_np) * 100,
-            "mca": balanced_accuracy_score(labels_np, preds_np) * 100,
-        }
-
-
-def zeroshot_eval(features, labels, clip_model, classnames, template="a photo of a {}, a type of bird."):
-    features = F.normalize(features.to(DEVICE), dim=-1)
-
-    with torch.no_grad():
-        prompts = [template.format(name.replace("_", " ")) for name in classnames]
-        tokens = clip.tokenize(prompts).to(DEVICE)
-        text_features = clip_model.encode_text(tokens).float()
-        text_features = F.normalize(text_features, dim=-1)
-
-    logits = features @ text_features.T
-    preds = logits.argmax(dim=-1).cpu().numpy()
-
-    label_set = sorted(set(labels.tolist()))
-    label_remap = {old: new for new, old in enumerate(label_set)}
-    remapped_labels = np.array([label_remap[l.item()] for l in labels])
-
-    return compute_acc(remapped_labels, preds)
-
-
 def get_task_text_features(clip_model, classnames, task_classes, template="a photo of a {}, a type of bird."):
     sorted_classes = sorted(task_classes)
     prompts = [template.format(classnames[c].replace("_", " ")) for c in sorted_classes]
@@ -150,16 +118,7 @@ def get_task_text_features(clip_model, classnames, task_classes, template="a pho
     return text_features, class_remap
 
 
-def eval_prototypes(prototypes, features, labels, class_remap):
-    features = F.normalize(features.to(DEVICE), dim=-1)
-    remapped_labels = np.array([class_remap[l.item()] for l in labels])
-    logits = features @ prototypes.T
-    preds = logits.argmax(dim=-1).cpu().numpy()
-    return compute_acc(remapped_labels, preds)
-
-
-
-def _build_visual_centroids(train_features, remapped_train_labels, num_classes, embed_dim):
+def build_visual_centroids(train_features, remapped_train_labels, num_classes, embed_dim):
     visual_centroids = torch.zeros(num_classes, embed_dim, device=DEVICE)
     for i in range(num_classes):
         mask = (remapped_train_labels == i)
@@ -168,79 +127,129 @@ def _build_visual_centroids(train_features, remapped_train_labels, num_classes, 
     return visual_centroids
 
 
-def oracle_alpha(T, V, val_features, val_labels_remapped, alphas):
+def opt_base_eval(T, V_all, alpha, val_features, val_labels, class_remap):
     val_norm = F.normalize(val_features.to(DEVICE), dim=-1)
-    refined = F.normalize(
-        (1 - alphas).view(-1, 1, 1) * T + alphas.view(-1, 1, 1) * V,
-        dim=-1
-    )
-    logits = torch.einsum("qd,apd->aqp", val_norm, refined)
-    preds = logits.argmax(dim=-1)
-    scores = (preds == val_labels_remapped).float().mean(dim=-1)
-    best_idx = scores.argmax()
-    best_alpha = alphas[best_idx].item()
-    best_proto = refined[best_idx]
-    return best_proto, best_alpha
+    refined = F.normalize((1 - alpha) * T + alpha * V_all, dim=-1)
+    logits = val_norm @ refined.T
+    preds = logits.argmax(dim=-1).cpu().numpy()
+    remapped_labels = np.array([class_remap[l.item()] for l in val_labels])
+    return compute_metrics(remapped_labels.tolist(), preds.tolist())
 
 
-def loo_cv_alpha(T, V_all, train_features, remapped_train_labels, num_classes, alphas):
+def opt_base_loo_cv_alpha(T, V_all, train_features, remapped_train_labels, num_classes, alphas):
     class_indices = [[] for _ in range(num_classes)]
     for idx, lbl in enumerate(remapped_train_labels.tolist()):
         class_indices[lbl].append(idx)
-
     shots_per_class = min(len(idxs) for idxs in class_indices)
-
+    
     if shots_per_class < 2:
         train_norm = F.normalize(train_features.to(DEVICE), dim=-1)
-        refined = F.normalize(
-            (1 - alphas).view(-1, 1, 1) * T + alphas.view(-1, 1, 1) * V_all,
-            dim=-1
-        )
+        refined = F.normalize((1 - alphas).view(-1, 1, 1) * T + alphas.view(-1, 1, 1) * V_all, dim=-1)
         logits = torch.einsum("qd,apd->aqp", train_norm, refined)
         preds = logits.argmax(dim=-1)
         scores = (preds == remapped_train_labels.to(DEVICE)).float().mean(dim=-1)
-        best_alpha = alphas[scores.argmax()].item()
-        best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
-    else:
-        k = shots_per_class
-        class_feat = torch.stack([
-            train_features[class_indices[c][:k]].to(DEVICE) for c in range(num_classes)
-        ])
-        class_sums = class_feat.sum(dim=1)
-        loo_scores = torch.zeros(len(alphas), device=DEVICE)
+        return alphas[scores.argmax()].item()
+        
+    k = shots_per_class
+    class_feat = torch.stack([train_features[class_indices[c][:k]].to(DEVICE) for c in range(num_classes)])
+    class_sums = class_feat.sum(dim=1)
+    loo_scores = torch.zeros(len(alphas), device=DEVICE)
+    
+    for fold in range(k):
+        held = F.normalize(class_feat[:, fold, :], dim=-1)
+        V_loo = F.normalize((class_sums - class_feat[:, fold, :]) / (k - 1), dim=-1)
+        refined = F.normalize((1 - alphas).view(-1, 1, 1) * T + alphas.view(-1, 1, 1) * V_loo, dim=-1)
+        logits = torch.einsum("qd,apd->aqp", held, refined)
+        preds = logits.argmax(dim=-1)
+        loo_scores += (preds == torch.arange(num_classes, device=DEVICE)).float().mean(dim=-1)
+        
+    return alphas[loo_scores.argmax()].item()
 
-        for fold in range(k):
-            held = F.normalize(class_feat[:, fold, :], dim=-1)
-            V_loo = F.normalize((class_sums - class_feat[:, fold, :]) / (k - 1), dim=-1)
-            refined = F.normalize(
-                (1 - alphas).view(-1, 1, 1) * T + alphas.view(-1, 1, 1) * V_loo,
-                dim=-1
-            )
-            logits = torch.einsum("qd,apd->aqp", held, refined)
-            preds = logits.argmax(dim=-1)
-            loo_scores += (preds == torch.arange(num_classes, device=DEVICE)).float().mean(dim=-1)
 
-        best_alpha = alphas[loo_scores.argmax()].item()
-        best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
+def opt_entropy_eval(T, V_all, alpha_base, val_features, val_labels, class_remap, num_classes, tau=0.05):
+    val_norm = F.normalize(val_features.to(DEVICE), dim=-1)
+    L_T = val_norm @ T.T
+    L_V = val_norm @ V_all.T
+    
+    p = F.softmax(L_V / tau, dim=-1)
+    H_x = -torch.sum(p * torch.log(p + 1e-8), dim=-1)
+    w_x = 1.0 - torch.clamp(H_x / math.log(num_classes), 0.0, 1.0)
+    alpha_x = alpha_base * (0.5 + 0.5 * w_x)
+    
+    L_final = (1 - alpha_x).unsqueeze(-1) * L_T + alpha_x.unsqueeze(-1) * L_V
+    preds = L_final.argmax(dim=-1).cpu().numpy()
+    remapped_labels = np.array([class_remap[l.item()] for l in val_labels])
+    return compute_metrics(remapped_labels.tolist(), preds.tolist())
 
-    return best_proto, best_alpha
+
+def opt_variance_eval(T, V_all, var_global, alpha, val_features, val_labels, class_remap):
+    W = 1.0 / (var_global + 1e-5)
+    W = W / W.mean()
+    T_w = F.normalize(T * W, dim=-1)
+    V_w = F.normalize(V_all * W, dim=-1)
+    val_norm = F.normalize(val_features.to(DEVICE) * W, dim=-1)
+    
+    refined = F.normalize((1 - alpha) * T_w + alpha * V_w, dim=-1)
+    logits = val_norm @ refined.T
+    preds = logits.argmax(dim=-1).cpu().numpy()
+    
+    remapped_labels = np.array([class_remap[l.item()] for l in val_labels])
+    return compute_metrics(remapped_labels.tolist(), preds.tolist())
+
+
+def opt_variance_loo_cv_alpha(T, V_all, var_global, train_features, remapped_train_labels, num_classes, alphas):
+    class_indices = [[] for _ in range(num_classes)]
+    for idx, lbl in enumerate(remapped_train_labels.tolist()):
+        class_indices[lbl].append(idx)
+    shots_per_class = min(len(idxs) for idxs in class_indices)
+    
+    W = 1.0 / (var_global + 1e-5)
+    W = W / W.mean()
+    T_w = F.normalize(T * W, dim=-1)
+    
+    if shots_per_class < 2:
+        train_norm = F.normalize(train_features.to(DEVICE) * W, dim=-1)
+        V_w = F.normalize(V_all * W, dim=-1)
+        refined = F.normalize((1 - alphas).view(-1, 1, 1) * T_w + alphas.view(-1, 1, 1) * V_w, dim=-1)
+        logits = torch.einsum("qd,apd->aqp", train_norm, refined)
+        preds = logits.argmax(dim=-1)
+        scores = (preds == remapped_train_labels.to(DEVICE)).float().mean(dim=-1)
+        return alphas[scores.argmax()].item()
+        
+    k = shots_per_class
+    train_feat_w = train_features.to(DEVICE) * W
+    class_feat = torch.stack([train_feat_w[class_indices[c][:k]] for c in range(num_classes)])
+    class_sums = class_feat.sum(dim=1)
+    loo_scores = torch.zeros(len(alphas), device=DEVICE)
+    
+    for fold in range(k):
+        held = F.normalize(class_feat[:, fold, :], dim=-1)
+        V_loo_w = F.normalize((class_sums - class_feat[:, fold, :]) / (k - 1), dim=-1)
+        refined = F.normalize((1 - alphas).view(-1, 1, 1) * T_w + alphas.view(-1, 1, 1) * V_loo_w, dim=-1)
+        logits = torch.einsum("qd,apd->aqp", held, refined)
+        preds = logits.argmax(dim=-1)
+        loo_scores += (preds == torch.arange(num_classes, device=DEVICE)).float().mean(dim=-1)
+        
+    return alphas[loo_scores.argmax()].item()
+
+
+def format_color(val):
+    if val > 0:
+        return f"[green]+{val:.2f}[/green]"
+    elif val < 0:
+        return f"[red]{val:.2f}[/red]"
+    return f"{val:.2f}"
 
 
 def run():
     global DEVICE
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET))
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     args = parser.parse_args()
-    seed = args.seed
     DEVICE = args.device
     kshots = [1, 2, 4, 8, 16]
-
-    print("DISCRIMINATIVE CLIP — CLOSED-FORM PROTOTYPE")
-    print(f"Device: {DEVICE} | val_size={VAL_SIZE} | seed={seed}")
-    print(f"kshots: {kshots}")
-    print()
+    seeds = [1, 10, 100]
 
     clip_model = load_clip()
     transform = get_transform()
@@ -249,10 +258,7 @@ def run():
     dataset = ImageFolder(args.dataset, transform=transform)
     num_classes = len(dataset.classes)
     classnames = list(dataset.classes)
-    print(f"Dataset: {Path(args.dataset).name}")
-    print(f"  Total: {len(dataset)} samples, {num_classes} classes")
 
-    print("\nExtracting CLIP features...")
     cache_name = f"disc_{Path(args.dataset).name}"
     all_features, all_labels = extract_and_cache_features(clip_model, dataset, cache_name)
 
@@ -261,54 +267,115 @@ def run():
     T = F.normalize(text_features, dim=-1)
     alphas = torch.linspace(0, 1, 101, device=DEVICE)
 
-    results = []
+    data_e = []
+    data_v = []
+    delta_e = []
+    delta_v = []
 
-    for kshot in kshots:
-        print(f"  Running kshot={kshot}...", end=" ", flush=True)
-        train_indices, val_indices = split_by_class(dataset, VAL_SIZE, kshot, seed)
-        train_features = all_features[train_indices]
-        train_labels = all_labels[train_indices]
-        val_features = all_features[val_indices]
-        val_labels = all_labels[val_indices]
+    console = Console()
+    console.print(f"[bold blue]DATASET:[/bold blue] {Path(args.dataset).name}")
+    console.print(f"[bold blue]SEEDS:[/bold blue] {seeds}")
+    console.print(f"[bold blue]DEVICE:[/bold blue] {DEVICE}")
+    console.print()
 
-        remapped_train = torch.tensor([class_remap[l.item()] for l in train_labels])
-        remapped_val = torch.tensor([class_remap[l.item()] for l in val_labels], device=DEVICE)
-        V = _build_visual_centroids(train_features, remapped_train, num_classes, embed_dim)
+    with console.status("[bold green]Evaluating new Uncertainty Options..."):
+        for kshot in kshots:
+            m_b = defaultdict(list)
+            m_e = defaultdict(list)
+            m_v = defaultdict(list)
+            
+            for seed in seeds:
+                train_indices, val_indices = split_by_class(dataset, VAL_SIZE, kshot, seed)
+                train_features = all_features[train_indices]
+                train_labels = all_labels[train_indices]
+                val_features = all_features[val_indices]
+                val_labels = all_labels[val_indices]
 
-        vanilla = zeroshot_eval(val_features, val_labels, clip_model, classnames)
+                remapped_train = torch.tensor([class_remap[l.item()] for l in train_labels])
+                V = build_visual_centroids(train_features, remapped_train, num_classes, embed_dim)
 
-        proto_oracle, oracle_a = oracle_alpha(T, V, val_features, remapped_val, alphas)
-        oracle_val = eval_prototypes(proto_oracle, val_features, val_labels, class_remap)
+                alpha_b = opt_base_loo_cv_alpha(T, V, train_features, remapped_train, num_classes, alphas)
+                for k_met, v_met in opt_base_eval(T, V, alpha_b, val_features, val_labels, class_remap).items():
+                    m_b[k_met].append(v_met)
+                    
+                for k_met, v_met in opt_entropy_eval(T, V, alpha_b, val_features, val_labels, class_remap, num_classes).items():
+                    m_e[k_met].append(v_met)
+                    
+                var_global = train_features.to(DEVICE).var(dim=0, unbiased=False)
+                alpha_v = opt_variance_loo_cv_alpha(T, V, var_global, train_features, remapped_train, num_classes, alphas)
+                for k_met, v_met in opt_variance_eval(T, V, var_global, alpha_v, val_features, val_labels, class_remap).items():
+                    m_v[k_met].append(v_met)
 
-        proto_loo, loo_a = loo_cv_alpha(T, V, train_features, remapped_train, num_classes, alphas)
-        loo_val = eval_prototypes(proto_loo, val_features, val_labels, class_remap)
-        print("done")
+            means_b = {}
+            means_e = {}
+            means_v = {}
+            
+            for met_name in ["accuracy", "mca", "f1_macro", "precision_macro", "recall_macro"]:
+                if met_name not in ["accuracy", "mca"]:
+                    m_b[met_name] = [x * 100.0 for x in m_b[met_name]]
+                    m_e[met_name] = [x * 100.0 for x in m_e[met_name]]
+                    m_v[met_name] = [x * 100.0 for x in m_v[met_name]]
+                    
+                means_b[met_name] = (np.mean(m_b[met_name]), np.mean(m_b[met_name]) if len(m_b[met_name]) == 1 else np.std(m_b[met_name]))
+                means_e[met_name] = (np.mean(m_e[met_name]), np.mean(m_e[met_name]) if len(m_e[met_name]) == 1 else np.std(m_e[met_name]))
+                means_v[met_name] = (np.mean(m_v[met_name]), np.mean(m_v[met_name]) if len(m_v[met_name]) == 1 else np.std(m_v[met_name]))
+                
+            data_e.append((kshot, means_e))
+            data_v.append((kshot, means_v))
+            
+            diff_e = {k: means_e[k][0] - means_b[k][0] for k in means_b}
+            diff_v = {k: means_v[k][0] - means_b[k][0] for k in means_b}
+            delta_e.append((kshot, diff_e))
+            delta_v.append((kshot, diff_v))
 
-        results.append({
-            "kshot": kshot,
-            "zs_acc": vanilla["acc"],
-            "zs_mca": vanilla["mca"],
-            "oracle_alpha": oracle_a,
-            "oracle_acc": oracle_val["acc"],
-            "oracle_mca": oracle_val["mca"],
-            "loo_alpha": loo_a,
-            "loo_acc": loo_val["acc"],
-            "loo_mca": loo_val["mca"],
-        })
+    def create_table(title, items):
+        table = Table(title=title)
+        table.add_column("K", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Acc", justify="right")
+        table.add_column("MCA", justify="right")
+        table.add_column("F1-Ma", justify="right")
+        table.add_column("P-Ma", justify="right")
+        table.add_column("R-Ma", justify="right")
+        
+        for k_val, means in items:
+            table.add_row(
+                str(k_val),
+                f"{means['accuracy'][0]:.2f} ± {means['accuracy'][1]:.2f}",
+                f"{means['mca'][0]:.2f} ± {means['mca'][1]:.2f}",
+                f"{means['f1_macro'][0]:.2f} ± {means['f1_macro'][1]:.2f}",
+                f"{means['precision_macro'][0]:.2f} ± {means['precision_macro'][1]:.2f}",
+                f"{means['recall_macro'][0]:.2f} ± {means['recall_macro'][1]:.2f}"
+            )
+        return table
 
-    df = pd.DataFrame(results)
-    df["gap"] = df["oracle_acc"] - df["loo_acc"]
-    df = df.rename(columns={
-        "kshot": "K", "zs_acc": "ZS Acc", "zs_mca": "ZS MCA",
-        "oracle_alpha": "Oracle alpha", "oracle_acc": "Oracle Acc",
-        "oracle_mca": "Oracle MCA", "loo_alpha": "LOO alpha",
-        "loo_acc": "LOO Acc", "loo_mca": "LOO MCA", "gap": "Gap",
-    })
-    print(f"\n{Path(args.dataset).name}  |  seed={seed}")
-    print(df.to_string(index=False, float_format="%.2f"))
+    def create_delta_table(title, diff_e_list, diff_v_list):
+        table = Table(title=title)
+        table.add_column("K", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Entropy Acc", justify="right")
+        table.add_column("Entropy MCA", justify="right")
+        table.add_column("Variance Acc", justify="right")
+        table.add_column("Variance MCA", justify="right")
+        
+        for (k_val, d_e), (_, d_v) in zip(diff_e_list, diff_v_list):
+            table.add_row(
+                str(k_val),
+                format_color(d_e['accuracy']),
+                format_color(d_e['mca']),
+                format_color(d_v['accuracy']),
+                format_color(d_v['mca'])
+            )
+        return table
+
+    table_opts = Table.grid(padding=(0, 4))
+    t_e = create_table("Instance Entropy Anchor", data_e)
+    t_v = create_table("Global Variance Re-weighting", data_v)
+    table_opts.add_row(t_e, t_v)
+
+    console.print(table_opts)
+    console.print()
+    console.print(create_delta_table("Improvement over Base (-/+) (%)", delta_e, delta_v))
 
 
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore")
     run()
-
-
