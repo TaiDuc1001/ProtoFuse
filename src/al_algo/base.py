@@ -18,10 +18,11 @@ class BaseStrategy(ABC):
         model: torch.nn.Module,
         dataloader: DataLoader,
         device: torch.device,
+        **kwargs,
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def select(self, scores: Dict[int, float], budget: int) -> List[int]:
+    def select(self, scores: Dict[int, float], budget: int, **kwargs) -> List[int]:
         sorted_indices = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
         return sorted_indices[:budget]
 

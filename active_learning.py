@@ -30,7 +30,7 @@ from utils import (
     coerce_to_int,
     get_config_value,
 )
-from active_learning_algorithms import get_strategy
+from src.al_algo import get_strategy
 
 
 ARG_SCHEMA = {
@@ -151,6 +151,8 @@ class ActiveLearningPipeline:
                      f"unlabeled={len(self.inner.unlabeled_indices)}")
 
         if round_idx > 1:
+            if hasattr(self.inner.trainer, 'reset_model'):
+                self.inner.trainer.reset_model()
             self.inner.trainer.reset_optimizer_scheduler()
 
         train_subset = Subset(self.inner.dataset, list(self.inner.labeled_indices))
@@ -162,9 +164,20 @@ class ActiveLearningPipeline:
         epochs_total = self.inner._get_training_epochs()
         self.inner.best_val_acc = -float('inf')
 
+        skip_training = False
+        if round_idx == 1 and hasattr(self.inner, '_try_load_checkpoint'):
+            if self.inner._try_load_checkpoint():
+                logger.info("Loaded Round 1 initial model from checkpoint. Skipping training.")
+                skip_training = True
+
         round_start_time = time.time()
-        for epoch_idx in range(1, epochs_total + 1):
-            self.inner._run_epoch(epoch_idx, epochs_total, train_loader, round_dir)
+        if not skip_training:
+            for epoch_idx in range(1, epochs_total + 1):
+                self.inner._run_epoch(epoch_idx, epochs_total, train_loader, round_dir)
+            
+            if round_idx == 1 and hasattr(self.inner, '_save_checkpoint'):
+                self.inner._save_checkpoint()
+
         round_train_time = time.time() - round_start_time
 
         val_metrics = {}
@@ -174,11 +187,14 @@ class ActiveLearningPipeline:
 
         selected_indices = []
         if len(self.inner.unlabeled_indices) > 0 and round_idx < self.num_rounds:
-            selected_indices = self._select_samples(budget)
+            selected_indices = self._select_samples(budget, round_idx)
             self._move_to_labeled(selected_indices)
             logger.info(f"Selected {len(selected_indices)} samples. "
                          f"New labeled={len(self.inner.labeled_indices)}, "
                          f"unlabeled={len(self.inner.unlabeled_indices)}")
+
+        if hasattr(self.strategy, 'update_schedule'):
+            self.strategy.update_schedule(round_idx)
 
         round_result = {
             'round': round_idx,
@@ -210,7 +226,7 @@ class ActiveLearningPipeline:
         with open(os.path.join(round_dir, 'selections.json'), 'w') as f:
             json.dump(selection_record, f, indent=2)
 
-    def _select_samples(self, budget):
+    def _select_samples(self, budget, round_idx=1):
         actual_budget = min(budget, len(self.inner.unlabeled_indices))
 
         unlabeled_ds = IndexTrackingDataset(self.inner.dataset, self.inner.unlabeled_indices)
@@ -222,17 +238,97 @@ class ActiveLearningPipeline:
         logger.info(f"Scoring {len(self.inner.unlabeled_indices)} unlabeled samples "
                      f"with {self.strategy.name} strategy...")
 
+        score_kwargs = {}
+        if self.strategy.name == "prism":
+            labeled_ds = Subset(self.inner.dataset, list(self.inner.labeled_indices))
+            labeled_loader = DataLoader(
+                labeled_ds, batch_size=self.inner.batch_size,
+                shuffle=False, num_workers=self.inner.num_workers,
+            )
+            score_kwargs = {
+                "labeled_loader": labeled_loader,
+                "labeled_indices": list(self.inner.labeled_indices),
+                "unlabeled_indices": list(self.inner.unlabeled_indices),
+                "dataset": self.inner.dataset,
+                "config": self.config,
+                "round_idx": round_idx,
+                "num_classes": len(self.inner.classnames),
+            }
+
         score_result = self.strategy.score(
             self.inner.trainer.model, unlabeled_loader, self.inner.device,
+            **score_kwargs,
         )
         local_scores = score_result['scores']
 
-        global_scores = {
-            self.inner.unlabeled_indices[local_idx]: score
-            for local_idx, score in local_scores.items()
-        }
+        if self.strategy.name == "prism":
+            global_scores = local_scores
+        else:
+            global_scores = {
+                self.inner.unlabeled_indices[local_idx]: score
+                for local_idx, score in local_scores.items()
+            }
 
-        selected_global = self.strategy.select(global_scores, actual_budget)
+        select_kwargs = {}
+        if self.strategy.name == "prism":
+            select_kwargs = {
+                "embeddings": score_result.get("embeddings", {}),
+                "novelty_scores": score_result.get("novelty_scores", {}),
+                "conflicted_indices": score_result.get("conflicted_indices", []),
+                "predicted_labels": score_result.get("predicted_labels", {}),
+                "config": self.config,
+            }
+
+        selected_global = self.strategy.select(global_scores, actual_budget, **select_kwargs)
+
+        # Analysis of selected samples
+        if self.strategy.name == "prism":
+            predicted_labels = score_result.get("predicted_labels", {})
+            if predicted_labels:
+                correct = 0
+                total = len(selected_global)
+
+                ulb_pool = set(self.inner.unlabeled_indices)
+                pred_keys = set(predicted_labels.keys())
+                sel_set = set(selected_global)
+                logger.info(f"[DEBUG] dataset type: {type(self.inner.dataset)}")
+                logger.info(f"[DEBUG] predicted_labels len: {len(predicted_labels)}, range: {min(pred_keys)}-{max(pred_keys)}")
+                logger.info(f"[DEBUG] selected_global len: {len(selected_global)}, range: {min(sel_set)}-{max(sel_set)}")
+                logger.info(f"[DEBUG] selected in unlabeled pool: {len(sel_set & ulb_pool)}/{len(sel_set)}")
+                logger.info(f"[DEBUG] selected in predicted_labels: {len(sel_set & pred_keys)}/{len(sel_set)}")
+
+                for idx in selected_global[:5]:
+                    pred = predicted_labels.get(idx, -1)
+                    try:
+                        if hasattr(self.inner.dataset, 'targets'):
+                            true_label = self.inner.dataset.targets[idx]
+                        elif hasattr(self.inner.dataset, 'samples'):
+                            true_label = self.inner.dataset.samples[idx][1]
+                        else:
+                            _, true_label = self.inner.dataset[idx]
+                        in_ulb = idx in ulb_pool
+                        in_pred = idx in pred_keys
+                        logger.info(f"[DEBUG] idx={idx}, pred={pred}, true_label={true_label}, in_ulb={in_ulb}, in_pred={in_pred}")
+                    except Exception as e:
+                        logger.info(f"[DEBUG] idx={idx}, pred={pred}, error: {e}")
+
+                for idx in selected_global:
+                    pred = predicted_labels.get(idx, -1)
+                    try:
+                        true_label = None
+                        if hasattr(self.inner.dataset, 'targets'):
+                            true_label = self.inner.dataset.targets[idx]
+                        elif hasattr(self.inner.dataset, 'samples'):
+                            true_label = self.inner.dataset.samples[idx][1]
+                        else:
+                            _, true_label = self.inner.dataset[idx]
+                            
+                        if pred == true_label:
+                            correct += 1
+                    except Exception as e:
+                        pass
+                acc = (correct / total * 100) if total > 0 else 0.0
+                logger.info(f"Selection Analysis: {correct}/{total} ({acc:.2f}%) selected samples have correct predicted pseudo-labels.")
 
         return selected_global
 

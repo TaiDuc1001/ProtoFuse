@@ -8,10 +8,10 @@ import torch.nn as nn
 from thop import profile
 
 from utils import ConfigNode, load_clip_to_cpu, load_config_file
-from coop import CoOPCLIP
-from maple import MaPLeCLIP
-from apt import CustomCLIP as APTCLIP
-from vife import TransformerAdapter, SSLHead, LinearClassifier, FusionWeightLearner
+from src.models.coop import CoOPCLIP
+from src.models.maple import MaPLeCLIP
+from src.models.apt import CustomCLIP as APTCLIP
+from src.models.vife import TransformerAdapter, SSLHead, LinearClassifier, FusionWeightLearner
 
 
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
@@ -19,6 +19,10 @@ NUM_CLASSES = 200
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WARMUP_ITERS = 10
 BENCHMARK_ITERS = 100
+
+
+def is_cuda_device():
+    return str(DEVICE).startswith("cuda")
 
 
 def load_config(config_name):
@@ -69,14 +73,14 @@ def benchmark_fps(model_builder, input_size=(1, 3, 224, 224), warmup=WARMUP_ITER
         for _ in range(warmup):
             _ = model(dummy_input)
         
-        if DEVICE == "cuda":
+        if is_cuda_device():
             torch.cuda.synchronize()
         
         start_time = time.perf_counter()
         for _ in range(iters):
             _ = model(dummy_input)
         
-        if DEVICE == "cuda":
+        if is_cuda_device():
             torch.cuda.synchronize()
         
         elapsed = time.perf_counter() - start_time

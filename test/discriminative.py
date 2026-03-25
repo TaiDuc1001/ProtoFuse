@@ -17,6 +17,7 @@ import warnings
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from clip import clip
 from torchvision.datasets import ImageFolder
+from src.models.apt import CUSTOM_TEMPLATES
 from utils import compute_metrics
 
 CLIP_MODEL_PATH = Path(__file__).parent.parent / "models" / "ViT-B-16.pt"
@@ -107,8 +108,26 @@ def split_by_class(dataset, val_size, kshot, seed):
     return train_indices, val_indices
 
 
-def get_task_text_features(clip_model, classnames, task_classes, template="a photo of a {}, a type of bird."):
+def infer_dataset_name(dataset_path):
+    path_name = Path(dataset_path).name.lower()
+    if "cub" in path_name:
+        return "CUB-200-2011"
+    if "flower" in path_name:
+        return "Flowers102"
+    if "aircraft" in path_name:
+        return "FGVCAircraft"
+    if "car" in path_name:
+        return "StanfordCars"
+    if "dog" in path_name:
+        return "OxfordPets"
+    if "food" in path_name:
+        return "Food101"
+    return Path(dataset_path).name
+
+
+def get_task_text_features(clip_model, classnames, task_classes, dataset_name):
     sorted_classes = sorted(task_classes)
+    template = CUSTOM_TEMPLATES.get(dataset_name, "a photo of a {}.")
     prompts = [template.format(classnames[c].replace("_", " ")) for c in sorted_classes]
     with torch.no_grad():
         tokens = clip.tokenize(prompts).to(DEVICE)
@@ -248,6 +267,7 @@ def run():
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     args = parser.parse_args()
     DEVICE = args.device
+    dataset_name = infer_dataset_name(args.dataset)
     kshots = [1, 2, 4, 8, 16]
     seeds = [1, 10, 100]
 
@@ -263,10 +283,11 @@ def run():
     all_features, all_labels = extract_and_cache_features(clip_model, dataset, cache_name)
 
     task_classes = sorted(set(c for _, c in dataset.samples))
-    text_features, class_remap = get_task_text_features(clip_model, classnames, task_classes)
+    text_features, class_remap = get_task_text_features(clip_model, classnames, task_classes, dataset_name)
     T = F.normalize(text_features, dim=-1)
-    alphas = torch.linspace(0, 1, 101, device=DEVICE)
+    alphas = torch.linspace(0, 1, 11, device=DEVICE)
 
+    data_b = []
     data_e = []
     data_v = []
     delta_e = []
@@ -295,7 +316,11 @@ def run():
                 V = build_visual_centroids(train_features, remapped_train, num_classes, embed_dim)
 
                 alpha_b = opt_base_loo_cv_alpha(T, V, train_features, remapped_train, num_classes, alphas)
-                for k_met, v_met in opt_base_eval(T, V, alpha_b, val_features, val_labels, class_remap).items():
+                if kshot < 2:
+                    base_metrics = opt_entropy_eval(T, V, alpha_b, val_features, val_labels, class_remap, num_classes)
+                else:
+                    base_metrics = opt_base_eval(T, V, alpha_b, val_features, val_labels, class_remap)
+                for k_met, v_met in base_metrics.items():
                     m_b[k_met].append(v_met)
                     
                 for k_met, v_met in opt_entropy_eval(T, V, alpha_b, val_features, val_labels, class_remap, num_classes).items():
@@ -320,6 +345,7 @@ def run():
                 means_e[met_name] = (np.mean(m_e[met_name]), np.mean(m_e[met_name]) if len(m_e[met_name]) == 1 else np.std(m_e[met_name]))
                 means_v[met_name] = (np.mean(m_v[met_name]), np.mean(m_v[met_name]) if len(m_v[met_name]) == 1 else np.std(m_v[met_name]))
                 
+            data_b.append((kshot, means_b))
             data_e.append((kshot, means_e))
             data_v.append((kshot, means_v))
             
@@ -365,6 +391,10 @@ def run():
                 format_color(d_v['mca'])
             )
         return table
+
+    t_b = create_table("Base (LOO-CV)", data_b)
+    console.print(t_b)
+    console.print()
 
     table_opts = Table.grid(padding=(0, 4))
     t_e = create_table("Instance Entropy Anchor", data_e)

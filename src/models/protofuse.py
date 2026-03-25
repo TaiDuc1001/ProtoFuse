@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from clip import clip
@@ -131,8 +132,26 @@ class ProtoFuse(BaseTrainer):
         self.best_alpha = alpha
 
         eval_norm = F.normalize(eval_features.to(self.device), dim=-1)
-        logits = eval_norm @ proto.T
-        preds = logits.argmax(dim=-1).cpu().tolist()
+
+        class_indices = {}
+        for idx, lbl in enumerate(train_labels.tolist()):
+            class_indices.setdefault(lbl, []).append(idx)
+        shots_per_class = min(len(v) for v in class_indices.values())
+
+        if shots_per_class < 2:
+            tau = 0.05
+            L_T = eval_norm @ T.T
+            L_V = eval_norm @ V.T
+            p = F.softmax(L_V / tau, dim=-1)
+            H_x = -(p * torch.log(p + 1e-8)).sum(dim=-1)
+            w_x = 1.0 - (H_x / math.log(num_classes)).clamp(0.0, 1.0)
+            alpha_x = alpha * (0.5 + 0.5 * w_x)
+            L_final = (1 - alpha_x).unsqueeze(-1) * L_T + alpha_x.unsqueeze(-1) * L_V
+            preds = L_final.argmax(dim=-1).cpu().tolist()
+        else:
+            logits = eval_norm @ proto.T
+            preds = logits.argmax(dim=-1).cpu().tolist()
+
         labels_list = eval_labels.tolist()
 
         metrics = compute_metrics(labels_list, preds)
