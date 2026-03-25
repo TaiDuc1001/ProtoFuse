@@ -9,7 +9,7 @@ checkpoint:
   cache_dir: "checkpoints/apt"
 
 training:
-  epochs: 50
+  epochs: 30
   batch_size: 16
   mode: "logits"
   device: "cuda:0"
