@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-datasets/
+datasets
 !src/datasets/
 run.sh
 *.txt
@@ -26,3 +26,5 @@ checkpoints
 *.sh
 *.log
 *.tex
+
+full_logs
