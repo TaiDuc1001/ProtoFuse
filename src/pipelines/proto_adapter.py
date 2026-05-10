@@ -62,18 +62,6 @@ class ProtoAdapterPipeline(BaseTrainingPipeline):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before Proto-Adapter run.")
 
-        if os.path.exists(self.best_model_path):
-            self.trainer.load_model(self.best_model_path)
-            if self.val_loader is not None:
-                test_features, test_labels = self._cached_val_features()
-            else:
-                test_features, test_labels = self._cached_train_features()
-            results = self.trainer.evaluate_features(test_features, test_labels)
-            results = self._add_base_novel_metrics(results)
-            self.best_val_acc = results.get('accuracy', 0.0)
-            self.metrics.append(results)
-            return
-
         train_features, train_labels = self._cached_train_features()
         self.trainer.build_prototypes(train_features, train_labels)
 
@@ -102,9 +90,6 @@ class ProtoAdapterPipeline(BaseTrainingPipeline):
         # logger.info(f"Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"MCA: {results.get('mca', 0.0):.2f}%")
 
-        os.makedirs(self.run_dir, exist_ok=True)
-        self.trainer.save_model(self.best_model_path)
-
     def _finalize(self):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before finalization.")
@@ -122,8 +107,6 @@ class ProtoAdapterPipeline(BaseTrainingPipeline):
         }
         with open(self.metrics_path, 'w') as f:
             json.dump(metrics_out, f, indent=2)
-
-        self.trainer.save_model(self.last_model_path)
         # logger.info(f"Proto-Adapter complete. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}

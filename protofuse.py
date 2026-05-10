@@ -4,9 +4,6 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.manifold import TSNE
 
 from utils import (
     setup_logging,
@@ -98,23 +95,6 @@ def patched_fuse_and_evaluate(self, train_features, train_labels, eval_features,
     
     iter_eval_acc = (eval_norm @ iter_protos.T).argmax(dim=-1).eq(eval_labels.to(self.device)).float().mean().item()
 
-    logger.info("=============================================================")
-    logger.info("PROOF 1: OVERFITTING TO FEW-SHOT NOISE")
-    logger.info(f"Global Alpha:    LOO Acc = {global_loo_acc:.4f} | Test Acc = {global_eval_acc:.4f} | Drop = {(global_loo_acc - global_eval_acc):.4f}")
-    logger.info(f"Iterative Alpha: LOO Acc = {best_loo_acc:.4f} | Test Acc = {iter_eval_acc:.4f} | Drop = {(best_loo_acc - iter_eval_acc):.4f}")
-    logger.info("Observation: Iterative algorithm artificially inflates training accuracy but fails completely on unseen test data.")
-    logger.info("-------------------------------------------------------------")
-    logger.info("PROOF 2: PROTOTYPE COLLISION (GEOMETRY DEGRADATION)")
-    logger.info(f"Global Alpha Nearest Neighbor Similarity:    {global_collision:.4f}")
-    logger.info(f"Iterative Alpha Nearest Neighbor Similarity: {iter_collision:.4f}")
-    logger.info("Observation: Independent alphas push prototypes closer to each other, destroying inter-class separability.")
-    logger.info("=============================================================")
-
-    self.proof_data = {
-        'g_loo': global_loo_acc, 'g_test': global_eval_acc, 'g_col': global_collision,
-        'i_loo': best_loo_acc, 'i_test': iter_eval_acc, 'i_col': iter_collision
-    }
-    
     self.fused_prototypes = iter_protos
     self.best_alphas = best_alphas_vec
     

@@ -64,9 +64,6 @@ class TIMOPipeline(BaseTrainingPipeline):
         # logger.info(f"{self.METHOD_NAME} MCA: {results.get('mca', 0.0):.2f}%")
         log_experiment_metrics(results, title=self._metrics_title(self.METHOD_NAME))
 
-        os.makedirs(self.run_dir, exist_ok=True)
-        self.trainer.save_model(self.best_model_path)
-
     def _finalize(self):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before finalization.")
@@ -84,8 +81,6 @@ class TIMOPipeline(BaseTrainingPipeline):
         }
         with open(self.metrics_path, 'w') as f:
             json.dump(metrics_out, f, indent=2)
-
-        self.trainer.save_model(self.last_model_path)
         # logger.info(f"{self.METHOD_NAME} complete. Results written to {self.run_dir}")
 
 

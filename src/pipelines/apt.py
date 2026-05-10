@@ -81,6 +81,12 @@ class APTTrainingPipeline:
 
         class_dist_value = get_config_value(self.training_cfg, "class_distribution", True)
         self.class_distribution_enabled = bool(True if class_dist_value is None else class_dist_value)
+        save_best_last_value = get_config_value(self.training_cfg, "save_best_last", False)
+        self.save_best_last = bool(False if save_best_last_value is None else save_best_last_value)
+        interval_value = get_config_value(self.training_cfg, "log_interval", None)
+        if interval_value is None:
+            interval_value = get_config_value(self.logging_cfg, "epoch_log_interval", None)
+        self.epoch_log_interval = max(1, coerce_to_int(interval_value, 10, key="training.log_interval"))
 
         base_output_value = self.logging_cfg.get("output_dir", "outputs")
         base_output = coerce_to_str(base_output_value, "outputs", key="logging.output_dir")
@@ -142,6 +148,9 @@ class APTTrainingPipeline:
         method = method_name or self.METHOD_NAME
         dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
         return f"{method} x {dataset} x {self.kshot}-shot x seed {self.seed}"
+
+    def _should_log_epoch(self, epoch_idx: int, epochs_total: int) -> bool:
+        return (epoch_idx % self.epoch_log_interval == 0) or (epoch_idx == epochs_total)
 
     @property
     def val_dataset(self):
@@ -591,15 +600,16 @@ class APTTrainingPipeline:
 
         self.metrics.append(epoch_result)
 
-        if self.val_loader is not None and val_acc > self.best_val_acc:
+        if self.save_best_last and self.val_loader is not None and val_acc > self.best_val_acc:
             self.best_val_acc = val_acc
             self.trainer.save_model(self.best_model_path)
 
-        val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        # if self.base_novel_enabled and harmonic_mean is not None:
-        #     logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
-        # else:
-        #     logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+        if self._should_log_epoch(epoch_idx, epochs_total):
+            val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
+            if self.base_novel_enabled and harmonic_mean is not None:
+                logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
+            else:
+                logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
@@ -687,7 +697,8 @@ class APTTrainingPipeline:
         with open(self.metrics_path, 'w') as f:
             json.dump(self.metrics, f, indent=4)
 
-        self.trainer.save_model(self.last_model_path)
+        if self.save_best_last:
+            self.trainer.save_model(self.last_model_path)
 
         # logger.info(f"Training completed. Results written to {self.run_dir}")
 

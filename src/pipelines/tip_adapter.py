@@ -92,9 +92,6 @@ class TipAdapterPipeline(BaseTrainingPipeline):
         # logger.info(f"Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"MCA: {results.get('mca', 0.0):.2f}%")
 
-        os.makedirs(self.run_dir, exist_ok=True)
-        self.trainer.save_model(self.best_model_path)
-
     def _finalize(self):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before finalization.")
@@ -112,8 +109,6 @@ class TipAdapterPipeline(BaseTrainingPipeline):
         }
         with open(self.metrics_path, 'w') as f:
             json.dump(metrics_out, f, indent=2)
-
-        self.trainer.save_model(self.last_model_path)
         # logger.info(f"Tip-Adapter complete. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}

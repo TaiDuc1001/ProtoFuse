@@ -345,6 +345,9 @@ logger = RichLogger()
 
 def setup_logging(debug: bool = False, no_color: bool = True) -> None:
     level = logging.DEBUG if debug else logging.INFO
+    root_logger = logging.getLogger()
+    root_logger.handlers = []
+    root_logger.setLevel(logging.WARNING)
     if no_color:
         plain_console = Console(no_color=True, force_terminal=False, width=300)
         logger._console = plain_console
