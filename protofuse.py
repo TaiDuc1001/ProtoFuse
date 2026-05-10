@@ -134,38 +134,38 @@ def main():
     pipeline = ProtoFusePipeline(merge_configs(load_config_file(args.config), overrides))
     pipeline.run()
     
-    t = pipeline.trainer
-    if hasattr(t, 'proof_data'):
-        d = t.proof_data
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        labels = ['Global \n(Regularized)', 'Iterative \n(Over-Optimized)']
-        loo_accs = [d['g_loo'], d['i_loo']]
-        test_accs = [d['g_test'], d['i_test']]
-        x = np.arange(len(labels))
-        w = 0.35
-        plt.bar(x - w/2, loo_accs, w, label='Training (LOO) Acc', color='skyblue')
-        plt.bar(x + w/2, test_accs, w, label='Test (Unseen) Acc', color='salmon')
-        plt.ylabel('Accuracy')
-        plt.title('Proof 1: The Overfitting Gap')
-        plt.xticks(x, labels)
-        plt.ylim(0.7, 0.8)
-        plt.legend()
-        for i, v in enumerate(loo_accs): plt.text(i - w/2, v + 0.002, f"{v:.4f}", ha='center')
-        for i, v in enumerate(test_accs): plt.text(i + w/2, v + 0.002, f"{v:.4f}", ha='center')
-
-        plt.subplot(1, 2, 2)
-        cols = [d['g_col'], d['i_col']]
-        plt.bar(labels, cols, width=0.5, color=['lightgreen', 'tomato'])
-        plt.ylabel('Cosine Similarity (Higher = More Collisions)')
-        plt.title('Proof 2: Prototype Collision')
-        plt.ylim(min(cols)-0.02, max(cols)+0.02)
-        for i, v in enumerate(cols): plt.text(i, v + 0.002, f"{v:.4f}", ha='center')
-
-        plt.tight_layout()
-        os.makedirs(pipeline.run_dir, exist_ok=True)
-        plt.savefig(os.path.join(pipeline.run_dir, 'proof_of_failure.png'), dpi=300)
-        plt.close()
+    # t = pipeline.trainer
+    # if hasattr(t, 'proof_data'):
+    #     d = t.proof_data
+    #     plt.figure(figsize=(12, 5))
+    #
+    #     plt.subplot(1, 2, 1)
+    #     labels = ['Global \n(Regularized)', 'Iterative \n(Over-Optimized)']
+    #     loo_accs = [d['g_loo'], d['i_loo']]
+    #     test_accs = [d['g_test'], d['i_test']]
+    #     x = np.arange(len(labels))
+    #     w = 0.35
+    #     plt.bar(x - w/2, loo_accs, w, label='Training (LOO) Acc', color='skyblue')
+    #     plt.bar(x + w/2, test_accs, w, label='Test (Unseen) Acc', color='salmon')
+    #     plt.ylabel('Accuracy')
+    #     plt.title('Proof 1: The Overfitting Gap')
+    #     plt.xticks(x, labels)
+    #     plt.ylim(0.7, 0.8)
+    #     plt.legend()
+    #     for i, v in enumerate(loo_accs): plt.text(i - w/2, v + 0.002, f"{v:.4f}", ha='center')
+    #     for i, v in enumerate(test_accs): plt.text(i + w/2, v + 0.002, f"{v:.4f}", ha='center')
+    #
+    #     plt.subplot(1, 2, 2)
+    #     cols = [d['g_col'], d['i_col']]
+    #     plt.bar(labels, cols, width=0.5, color=['lightgreen', 'tomato'])
+    #     plt.ylabel('Cosine Similarity (Higher = More Collisions)')
+    #     plt.title('Proof 2: Prototype Collision')
+    #     plt.ylim(min(cols)-0.02, max(cols)+0.02)
+    #     for i, v in enumerate(cols): plt.text(i, v + 0.002, f"{v:.4f}", ha='center')
+    #
+    #     plt.tight_layout()
+    #     os.makedirs(pipeline.run_dir, exist_ok=True)
+    #     plt.savefig(os.path.join(pipeline.run_dir, 'proof_of_failure.png'), dpi=300)
+    #     plt.close()
 
 if __name__ == "__main__": main()

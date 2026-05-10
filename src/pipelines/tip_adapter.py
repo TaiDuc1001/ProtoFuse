@@ -117,7 +117,7 @@ class TipAdapterPipeline(BaseTrainingPipeline):
         # logger.info(f"Tip-Adapter complete. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics)
+        log_experiment_metrics(final_metrics, title=self._metrics_title())
 
 
 BaseTrainingPipeline.register_extra_pipeline(TipAdapterPipeline)

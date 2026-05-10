@@ -122,8 +122,6 @@ class APTTrainingPipeline:
             raw_dn4_cfg = ConfigNode(raw_dn4_cfg)
         self.dn4_cfg = raw_dn4_cfg
 
-
-
         raw_base_novel_cfg = self.data_cfg.get('base_novel', ConfigNode())
         if not isinstance(raw_base_novel_cfg, ConfigNode):
             raw_base_novel_cfg = ConfigNode(raw_base_novel_cfg)
@@ -139,6 +137,11 @@ class APTTrainingPipeline:
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
         self._init_checkpoint_cache()
+
+    def _metrics_title(self, method_name=None):
+        method = method_name or self.METHOD_NAME
+        dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
+        return f"{method} x {dataset} x {self.kshot}-shot x seed {self.seed}"
 
     @property
     def val_dataset(self):
@@ -276,17 +279,15 @@ class APTTrainingPipeline:
                 run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
         else:
             train_path = os.path.join(self.dataset_root, 'train')
-            val_path = os.path.join(self.dataset_root, 'val')
-            if not os.path.isdir(val_path):
-                val_path = os.path.join(self.dataset_root, 'test')
+            test_path = os.path.join(self.dataset_root, 'test')
             try:
                 self.dataset = ImageFolder(train_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
             try:
-                self._val_dataset = ImageFolder(val_path, transform=transform)
+                self._val_dataset = ImageFolder(test_path, transform=transform)
             except Exception as exc:
-                raise RuntimeError(f"Failed to load val dataset from {val_path}: {exc}")
+                raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
             if self.run_eda:
                 run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
@@ -691,6 +692,6 @@ class APTTrainingPipeline:
         # logger.info(f"Training completed. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics)
+        log_experiment_metrics(final_metrics, title=self._metrics_title())
 
 BaseTrainingPipeline.register_extra_pipeline(APTTrainingPipeline)

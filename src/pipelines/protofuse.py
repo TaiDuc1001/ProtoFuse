@@ -46,7 +46,7 @@ class ProtoFusePipeline(BaseTrainingPipeline):
         # logger.info(f"MCA: {results['mca']:.2f}%")
 
         self.metrics.append(results)
-        log_experiment_metrics(results)
+        log_experiment_metrics(results, title=self._metrics_title())
 
     def _finalize(self):
         os.makedirs(self.run_dir, exist_ok=True)

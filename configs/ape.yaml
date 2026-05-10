@@ -24,7 +24,6 @@ training:
 
 data:
   dataset_name: "CUB-200-2011"
-  val_size: 0.7
   kshot: 1
   seed: 1
   num_workers: 4

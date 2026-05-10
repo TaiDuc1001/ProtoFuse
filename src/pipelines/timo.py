@@ -62,7 +62,7 @@ class TIMOPipeline(BaseTrainingPipeline):
 
         # logger.info(f"{self.METHOD_NAME} Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"{self.METHOD_NAME} MCA: {results.get('mca', 0.0):.2f}%")
-        log_experiment_metrics(results)
+        log_experiment_metrics(results, title=self._metrics_title(self.METHOD_NAME))
 
         os.makedirs(self.run_dir, exist_ok=True)
         self.trainer.save_model(self.best_model_path)

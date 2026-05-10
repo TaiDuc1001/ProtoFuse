@@ -1098,28 +1098,28 @@ def log_experiment_start(method_name: str, dataset_name: str, kshot: int, seed: 
 def compute_metrics(true_labels: Sequence[int], predictions: Sequence[int]) -> Dict[str, float]:
     if not true_labels or not predictions:
         return {}
-    
+
     y_true = np.array(true_labels)
     y_pred = np.array(predictions)
-    
+
     metrics = {}
-    
-    metrics['accuracy'] = accuracy_score(y_true, y_pred) * 100
-    
-    metrics['mca'] = balanced_accuracy_score(y_true, y_pred) * 100
-    
-    metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['f1_micro'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-    metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['precision_micro'] = precision_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    
-    metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    metrics['recall_micro'] = recall_score(y_true, y_pred, average='micro', zero_division=0)
-    metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+        metrics['accuracy'] = accuracy_score(y_true, y_pred) * 100
+        metrics['mca'] = balanced_accuracy_score(y_true, y_pred) * 100
+        metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        metrics['f1_micro'] = f1_score(y_true, y_pred, average='micro', zero_division=0)
+        metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        metrics['precision_macro'] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        metrics['precision_micro'] = precision_score(y_true, y_pred, average='micro', zero_division=0)
+        metrics['precision_weighted'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+        metrics['recall_macro'] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        metrics['recall_micro'] = recall_score(y_true, y_pred, average='micro', zero_division=0)
+        metrics['recall_weighted'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+
     return metrics
 
 
@@ -1641,17 +1641,15 @@ class BaseTrainingPipeline:
                 run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
         else:
             train_path = os.path.join(self.dataset_root, 'train')
-            val_path = os.path.join(self.dataset_root, 'val')
-            if not os.path.isdir(val_path):
-                val_path = os.path.join(self.dataset_root, 'test')
+            test_path = os.path.join(self.dataset_root, 'test')
             try:
                 self.dataset = ImageFolder(train_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
             try:
-                self._val_dataset = ImageFolder(val_path, transform=transform)
+                self._val_dataset = ImageFolder(test_path, transform=transform)
             except Exception as exc:
-                raise RuntimeError(f"Failed to load val dataset from {val_path}: {exc}")
+                raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
             if self.run_eda:
                 run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
@@ -1771,6 +1769,11 @@ class BaseTrainingPipeline:
         trainer_cfg = build_config_namespace(self.config, extra_values)
         self.trainer_cfg = trainer_cfg
         return trainer_cfg
+
+    def _metrics_title(self, method_name=None):
+        method = method_name or self.METHOD_NAME
+        dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
+        return f"{method} x {dataset} x {self.kshot}-shot x seed {self.seed}"
 
     def _initialize_trainer(self):
         if not self.classnames:
@@ -1919,4 +1922,4 @@ class BaseTrainingPipeline:
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics)
+        log_experiment_metrics(final_metrics, title=self._metrics_title())

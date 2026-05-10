@@ -62,11 +62,13 @@ class RichLogger:
         self._logger = logging.getLogger(name)
         self._logger.setLevel(logging.DEBUG)
         self._logger.handlers = []
+        self._logger.propagate = False
         self._console = console
         self._show_icons = True
 
     def _setup_handler(self, level: int) -> None:
         self._logger.handlers = []
+        self._logger.propagate = False
         handler = RichHandler(
             console=self._console,
             show_time=True,
