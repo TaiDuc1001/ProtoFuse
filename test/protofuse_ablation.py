@@ -1,4 +1,8 @@
 import sys
+import os
+os.environ["MPLBACKEND"] = "Agg"
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import argparse
 import math
 import random

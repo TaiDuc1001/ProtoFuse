@@ -321,7 +321,7 @@ class APT:
     
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/32', 'model.backbone', 'backbone')
-        logger.info(f"Loading CLIP (backbone: {backbone_name})")
+        # logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
         clip_model = load_clip_to_cpu(backbone_name)
         
@@ -367,7 +367,7 @@ class APT:
             del model_copy
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        logger.info(f"Learnable parameters: {format_params(learnable_params)} / Total: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)")
+        # logger.info(f"Learnable parameters: {format_params(learnable_params)} / Total: {format_params(total_params)} (FLOPs: {gflops_thop:.2f} GFLOPs)")
         
         trainable_names = set(self.model.get_trainable_parameter_names())
         for name, param in self.model.named_parameters():
@@ -480,7 +480,7 @@ class APT:
             'cfg': self.cfg
         }
         torch.save(checkpoint, path)
-        logger.info(f"Model saved to {path}")
+        # logger.info(f"Model saved to {path}")
     
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
@@ -490,7 +490,7 @@ class APT:
             self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        logger.info(f"Model loaded from {path}")
+        # logger.info(f"Model loaded from {path}")
 
     def generate_gradcam(self, images, target_classes):
         original_mode = self.model.training

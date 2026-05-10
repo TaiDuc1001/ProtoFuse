@@ -1,9 +1,8 @@
 from .apt import CrossAttention, ImageEncoder, TextEncoder, CustomCLIP, APT, CUSTOM_TEMPLATES
 from .coop import PromptLearner as CoOPPromptLearner, CoOPCLIP, CoOP
-from .cocoop import CoCoOPPromptLearner, CoCoOPCLIP, CoCoOP
 from .maple import MaPLeTextEncoder, MultiModalPromptLearner, VisionEncoder, MaPLeCLIP, MaPLe
 from .protofuse import ProtoFuse
-from .vife import (
-    SSLHead, LinearClassifier, FusionWeightLearner, TransformerAdapter,
-    ImageSSLModel, DINOMultiCropTransform,
-)
+from .tip_adapter import TipAdapter
+from .ape import APE, APETrainingModule, SmoothCrossEntropy
+from .timo import TIMO
+from .proto_adapter import ProtoAdapter

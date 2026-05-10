@@ -23,7 +23,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
-    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', False))
+    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
     pipeline = MaPLeTrainingPipeline(merged)

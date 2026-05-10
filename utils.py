@@ -1,9 +1,12 @@
+import os
+
+os.environ["MPLBACKEND"] = "Agg"
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import matplotlib
 
-if matplotlib.get_backend().lower() != 'agg':
-    matplotlib.use('Agg')
+matplotlib.use("Agg", force=True)
 
-import os
 import sys
 import cv2
 import csv
@@ -131,6 +134,105 @@ class CheckpointCache:
         if not os.path.exists(path):
             return None
         return torch.load(path, map_location='cpu')
+
+
+class CLIPFeatureCache:
+    VERSION = 1
+    DEFAULT_CACHE_DIR = "checkpoints/clip_features"
+
+    def __init__(self, cache_dir: str = DEFAULT_CACHE_DIR, enabled: bool = True):
+        self.cache_dir = cache_dir
+        self.enabled = enabled
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _dataset_signature(self, dataset, dataset_id, classnames, template, backbone,
+                           precision, clip_mean, clip_std, transform_spec):
+        paths = [path for path, _ in dataset.samples]
+        labels = [int(label) for _, label in dataset.samples]
+        prompts = [template.format(c.replace("_", " ")) for c in classnames]
+        return {
+            "version": self.VERSION,
+            "dataset_id": dataset_id,
+            "dataset_root": getattr(dataset, "root", ""),
+            "backbone": backbone,
+            "precision": precision,
+            "classnames": list(classnames),
+            "template": template,
+            "prompts": prompts,
+            "paths": paths,
+            "labels": labels,
+            "clip_mean": list(clip_mean),
+            "clip_std": list(clip_std),
+            "transform_spec": transform_spec,
+        }
+
+    def compute_cache_key(self, dataset, dataset_id, classnames, template, backbone,
+                          precision, clip_mean, clip_std, transform_spec):
+        signature = self._dataset_signature(
+            dataset, dataset_id, classnames, template, backbone,
+            precision, clip_mean, clip_std, transform_spec
+        )
+        key_str = json.dumps(signature, sort_keys=True)
+        return hashlib.md5(key_str.encode()).hexdigest()[:16], signature
+
+    def _cache_path(self, cache_key):
+        return os.path.join(self.cache_dir, f"{cache_key}.pt")
+
+    def load_or_compute(self, dataset, dataset_id, clip_model, classnames, template,
+                        backbone, precision, batch_size, num_workers, device,
+                        clip_mean, clip_std, transform_spec):
+        cache_key, signature = self.compute_cache_key(
+            dataset, dataset_id, classnames, template, backbone,
+            precision, clip_mean, clip_std, transform_spec
+        )
+        path = self._cache_path(cache_key)
+        if self.enabled and os.path.exists(path):
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            logger.info(f"Loaded CLIP feature cache [{dataset_id}] from {path}")
+            return payload
+
+        logger.info(f"Computing CLIP feature cache [{dataset_id}]")
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        image_features = []
+        labels = []
+        clip_model.eval()
+        with torch.no_grad():
+            for images, batch_labels in loader:
+                images = images.to(device)
+                feats = clip_model.encode_image(images).float()
+                feats = F.normalize(feats, dim=-1)
+                image_features.append(feats.cpu())
+                labels.append(batch_labels.cpu().long())
+
+            prompts = signature["prompts"]
+            tokens = clip.tokenize(prompts).to(device)
+            text_features = clip_model.encode_text(tokens).float()
+            text_features = F.normalize(text_features, dim=-1).cpu()
+
+        payload = {
+            "image_features": torch.cat(image_features, dim=0).float(),
+            "labels": torch.cat(labels, dim=0).long(),
+            "paths": signature["paths"],
+            "text_features": text_features.float(),
+            "prompts": signature["prompts"],
+            "classnames": signature["classnames"],
+            "metadata": signature,
+            "cache_key": cache_key,
+        }
+
+        if self.enabled:
+            tmp_path = f"{path}.tmp"
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+            # logger.info(f"Saved CLIP feature cache [{dataset_id}] to {path}")
+        return payload
 
 
 class ConfigNode(dict):
@@ -288,7 +390,7 @@ def create_argument_parser(description, arg_schema):
         if spec.get('required'):
             kwargs['required'] = True
         else:
-            kwargs['default'] = None
+            kwargs['default'] = spec.get('default')
         parser.add_argument(f'--{arg_name}', **kwargs)
     return parser
 
@@ -1021,24 +1123,28 @@ def compute_metrics(true_labels: Sequence[int], predictions: Sequence[int]) -> D
     return metrics
 
 
-def log_experiment_metrics(metrics: Dict[str, float]) -> None:
-    logger.info(f"{'='*60}")
-    logger.info("Evaluation Metrics:")
-    logger.info(f"  Accuracy:          {metrics.get('accuracy', 0.0):.2f}%")
-    logger.info(f"  MCA:               {metrics.get('mca', 0.0):.2f}%")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  F1 (Macro):        {metrics.get('f1_macro', 0.0):.4f}")
-    logger.info(f"  F1 (Micro):        {metrics.get('f1_micro', 0.0):.4f}")
-    logger.info(f"  F1 (Weighted):     {metrics.get('f1_weighted', 0.0):.4f}")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  Precision (Macro): {metrics.get('precision_macro', 0.0):.4f}")
-    logger.info(f"  Precision (Micro): {metrics.get('precision_micro', 0.0):.4f}")
-    logger.info(f"  Precision (Weighted): {metrics.get('precision_weighted', 0.0):.4f}")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  Recall (Macro):    {metrics.get('recall_macro', 0.0):.4f}")
-    logger.info(f"  Recall (Micro):    {metrics.get('recall_micro', 0.0):.4f}")
-    logger.info(f"  Recall (Weighted): {metrics.get('recall_weighted', 0.0):.4f}")
-    logger.info(f"{'='*60}")
+def log_experiment_metrics(metrics: Dict[str, float], title: str = "Evaluation Metrics") -> None:
+    _metric_order = [
+        ("accuracy",           "Acc",    "{:.2f}%"),
+        ("mca",                "MCA",    "{:.2f}%"),
+        ("f1_macro",           "F1-Mac", "{:.4f}"),
+        ("f1_micro",           "F1-Mic", "{:.4f}"),
+        ("f1_weighted",        "F1-Wei", "{:.4f}"),
+        ("precision_macro",    "P-Mac",  "{:.4f}"),
+        ("precision_micro",    "P-Mic",  "{:.4f}"),
+        ("precision_weighted", "P-Wei",  "{:.4f}"),
+        ("recall_macro",       "R-Mac",  "{:.4f}"),
+        ("recall_micro",       "R-Mic",  "{:.4f}"),
+        ("recall_weighted",    "R-Wei",  "{:.4f}"),
+    ]
+    row = {}
+    columns = []
+    for key, label, fmt in _metric_order:
+        if key in metrics and metrics[key] is not None:
+            row[label] = fmt.format(float(metrics[key]))
+            columns.append(label)
+    if row:
+        logger.comparison_table(rows=[row], columns=columns, title=title)
 
 
 def log_experiment_accuracy(accuracy: float) -> None:
@@ -1049,7 +1155,7 @@ DEFAULT_ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
     'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
     'debug': {'type': bool, 'help': 'Enable debug logging', 'default': True},
-    'disable_coloring': {'type': bool, 'help': 'Disable colored output for log files', 'default': False},
+    'disable_coloring': {'type': bool, 'help': 'Disable colored output for log files', 'default': True},
 }
 
 
@@ -1225,7 +1331,7 @@ class BaseTrainer:
             'cfg': self.cfg
         }
         torch.save(checkpoint, path)
-        logger.info(f"Model saved to {path}")
+        # logger.info(f"Model saved to {path}")
 
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device)
@@ -1237,7 +1343,7 @@ class BaseTrainer:
         self.model.prompt_learner.load_state_dict(state_dict, strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        logger.info(f"Model loaded from {path}")
+        # logger.info(f"Model loaded from {path}")
 
 
 class BaseTrainingPipeline:
@@ -1283,6 +1389,7 @@ class BaseTrainingPipeline:
         self.training_cfg = self.config.get('training', ConfigNode())
         self.data_cfg = self.config.get('data', ConfigNode())
         self.logging_cfg = self.config.get('logging', ConfigNode())
+        self.feature_cache_cfg = self.config.get('feature_cache', ConfigNode())
 
         device_value = self.training_cfg.get("device", None)
         device_name = coerce_to_str(device_value, "cuda:0", key="training.device")
@@ -1349,6 +1456,9 @@ class BaseTrainingPipeline:
 
         self.checkpoint_cache: Optional[CheckpointCache] = None
         self.checkpoint_id: Optional[str] = None
+        feature_cache_enabled = bool(self.feature_cache_cfg.get('enabled', True))
+        feature_cache_dir = self.feature_cache_cfg.get('cache_dir', CLIPFeatureCache.DEFAULT_CACHE_DIR)
+        self.clip_feature_cache = CLIPFeatureCache(feature_cache_dir, enabled=feature_cache_enabled)
         self._init_checkpoint_cache()
 
         base_novel_cfg = self.data_cfg.get('base_novel', ConfigNode())
@@ -1445,6 +1555,80 @@ class BaseTrainingPipeline:
             transforms.Normalize(mean=self.clip_mean, std=self.clip_std),
         ]
         return transforms.Compose(base_transforms)
+
+    def _clip_feature_transform_spec(self):
+        return {
+            "resize": 256,
+            "center_crop": 224,
+            "normalize_mean": list(self.clip_mean),
+            "normalize_std": list(self.clip_std),
+        }
+
+    def _apply_cached_text_features(self, payload):
+        if self.trainer is None:
+            return
+        text_features = payload["text_features"].to(self.device).float()
+        if hasattr(self.trainer, "text_features"):
+            self.trainer.text_features = text_features
+        if hasattr(self.trainer, "clip_weights"):
+            self.trainer.clip_weights = text_features.t().contiguous()
+        if hasattr(self.trainer, "text_prototypes"):
+            self.trainer.text_prototypes = text_features
+
+    def _load_clip_feature_payload(self, dataset, dataset_id):
+        if self.trainer is None:
+            raise RuntimeError("Trainer must be initialized before loading CLIP feature cache.")
+        if dataset is None:
+            raise RuntimeError(f"Cannot build CLIP feature cache for missing dataset: {dataset_id}")
+
+        backbone = coerce_to_str(self.model_cfg.get("backbone", "ViT-B/16"), "ViT-B/16", key="model.backbone")
+        precision = coerce_to_str(self.training_cfg.get("precision", "fp32"), "fp32", key="training.precision")
+        template = getattr(self.trainer, "template", "a photo of a {}.")
+        payload = self.clip_feature_cache.load_or_compute(
+            dataset=dataset,
+            dataset_id=dataset_id,
+            clip_model=self.trainer.clip_model,
+            classnames=self.classnames,
+            template=template,
+            backbone=backbone,
+            precision=precision,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            device=self.device,
+            clip_mean=self.clip_mean,
+            clip_std=self.clip_std,
+            transform_spec=self._clip_feature_transform_spec(),
+        )
+        self._apply_cached_text_features(payload)
+        return payload
+
+    def _full_dataset_clip_features(self):
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be loaded before loading CLIP feature cache.")
+        if not hasattr(self, '_clip_feature_payload') or self._clip_feature_payload is None:
+            self._clip_feature_payload = self._load_clip_feature_payload(self.dataset, "train_or_full")
+        return self._clip_feature_payload
+
+    def _cached_train_features(self):
+        payload = self._full_dataset_clip_features()
+        indices = torch.tensor(self.train_indices, dtype=torch.long)
+        return payload["image_features"][indices], payload["labels"][indices]
+
+    def _cached_val_features(self):
+        if self.val_fraction is not None:
+            payload = self._full_dataset_clip_features()
+            indices = torch.tensor(self.val_indices, dtype=torch.long)
+            return payload["image_features"][indices], payload["labels"][indices]
+        if not hasattr(self, '_clip_val_payload') or self._clip_val_payload is None:
+            self._clip_val_payload = self._load_clip_feature_payload(self._val_dataset, "val_or_test")
+        return self._clip_val_payload["image_features"], self._clip_val_payload["labels"]
+
+    def _cached_test_features(self):
+        if hasattr(self, '_val_dataset') and self._val_dataset is not None:
+            if not hasattr(self, '_clip_val_payload') or self._clip_val_payload is None:
+                self._clip_val_payload = self._load_clip_feature_payload(self._val_dataset, "val_or_test")
+            return self._clip_val_payload["image_features"], self._clip_val_payload["labels"]
+        return self._cached_val_features()
 
     def _load_dataset(self):
         transform = self._build_transforms()

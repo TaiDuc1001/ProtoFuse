@@ -19,7 +19,6 @@ outputs
 to_delete
 *.pt
 *.json
-uv.lock
 
 checkpoints
 
@@ -29,3 +28,4 @@ checkpoints
 
 full_logs
 scripts
+kaggle_upload/

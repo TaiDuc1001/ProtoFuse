@@ -32,7 +32,7 @@ custom_theme = Theme({
     "header": "bold blue on white",
 })
 
-console = Console(theme=custom_theme, force_terminal=True)
+console = Console(theme=custom_theme, force_terminal=True, width=300)
 
 ICONS = {
     "debug": "🔍",
@@ -306,24 +306,34 @@ class RichLogger:
         self._console.print()
 
     def comparison_table(self, rows: List[Dict[str, Any]], columns: List[str], title: str = "Results Comparison") -> None:
+        col_widths = {}
+        formatted_rows = []
+        for col in columns:
+            col_widths[col] = len(col)
+        for row in rows:
+            formatted = {}
+            for col in columns:
+                val = row.get(col, "-")
+                if isinstance(val, float):
+                    val = f"{val:.4f}"
+                val = str(val)
+                formatted[col] = val
+                col_widths[col] = max(col_widths[col], len(val))
+            formatted_rows.append(formatted)
+
         table = Table(
             title=f"[bold]{title}[/bold]",
             box=ROUNDED,
             show_header=True,
             header_style="bold blue",
+            expand=False,
         )
 
         for col in columns:
-            table.add_column(col, justify="center")
+            table.add_column(col, justify="center", no_wrap=True, min_width=col_widths[col] + 2)
 
-        for row in rows:
-            values = []
-            for col in columns:
-                val = row.get(col, "-")
-                if isinstance(val, float):
-                    val = f"{val:.4f}"
-                values.append(str(val))
-            table.add_row(*values)
+        for formatted in formatted_rows:
+            table.add_row(*[formatted[col] for col in columns])
 
         self._console.print(table)
 
@@ -331,9 +341,9 @@ class RichLogger:
 logger = RichLogger()
 
 
-def setup_logging(debug: bool = False, no_color: bool = False) -> None:
+def setup_logging(debug: bool = False, no_color: bool = True) -> None:
     level = logging.DEBUG if debug else logging.INFO
     if no_color:
-        plain_console = Console(no_color=True, force_terminal=False)
+        plain_console = Console(no_color=True, force_terminal=False, width=300)
         logger._console = plain_console
     logger._setup_handler(level)

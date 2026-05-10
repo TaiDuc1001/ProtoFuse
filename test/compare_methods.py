@@ -11,7 +11,6 @@ from utils import ConfigNode, load_clip_to_cpu, load_config_file
 from src.models.coop import CoOPCLIP
 from src.models.maple import MaPLeCLIP
 from src.models.apt import CustomCLIP as APTCLIP
-from src.models.vife import TransformerAdapter, SSLHead, LinearClassifier, FusionWeightLearner
 
 
 CONFIGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
@@ -159,72 +158,6 @@ def get_module_gflops(module, input_shape):
         return 0.0
 
 
-def analyze_vife(clip_model, classnames):
-    cfg = load_config("vife")
-    ssl_cfg = cfg.get("ssl", ConfigNode())
-    
-    feature_dim = 768
-    proj_dim = ssl_cfg.get("proj_dim", 256)
-    num_prototypes = ssl_cfg.get("num_prototypes", 4096)
-    num_trans_layers = ssl_cfg.get("num_trans_layers", 1)
-    num_heads = ssl_cfg.get("num_heads", 8)
-    
-    print(f"  Config: proj_dim={proj_dim}, num_prototypes={num_prototypes}, trans_layers={num_trans_layers}")
-
-    apt_model, apt_params, apt_details, _ = analyze_apt.__wrapped__(clip_model, classnames) if hasattr(analyze_apt, '__wrapped__') else _analyze_apt_for_vife(clip_model, classnames, cfg)
-
-    adapter = TransformerAdapter(feature_dim, num_trans_layers, num_heads)
-    ssl_head = SSLHead(feature_dim, proj_dim, num_prototypes)
-    classifier = LinearClassifier(feature_dim, NUM_CLASSES)
-    fusion = FusionWeightLearner()
-
-    adapter_params = count_params(adapter, only_trainable=True)
-    ssl_head_params = count_params(ssl_head, only_trainable=True)
-    classifier_params = count_params(classifier, only_trainable=True)
-    fusion_params = count_params(fusion, only_trainable=True)
-
-    total = apt_params + adapter_params + ssl_head_params + classifier_params + fusion_params
-
-    adapter_gflops = get_module_gflops(adapter, (1, 197, feature_dim))
-    ssl_head_gflops = get_module_gflops(ssl_head, (1, feature_dim))
-    classifier_gflops = get_module_gflops(classifier, (1, feature_dim))
-
-    ssl_total_gflops = adapter_gflops + ssl_head_gflops + classifier_gflops
-
-    details = {
-        'APT (CrossAttention)': apt_params,
-        'TransformerAdapter': adapter_params,
-        'SSLHead': ssl_head_params,
-        'LinearClassifier': classifier_params,
-        'FusionWeightLearner': fusion_params
-    }
-
-    gflops_details = {
-        'TransformerAdapter': adapter_gflops,
-        'SSLHead': ssl_head_gflops,
-        'LinearClassifier': classifier_gflops,
-        'SSL Total': ssl_total_gflops
-    }
-
-    return apt_model, total, details, cfg, gflops_details
-
-
-def _analyze_apt_for_vife(clip_model, classnames, vife_cfg):
-    model = APTCLIP(vife_cfg, classnames, clip_model, DEVICE)
-    for name, param in model.named_parameters():
-        if "prompt_learner" not in name:
-            param.requires_grad_(False)
-    
-    learnable = count_params(model, only_trainable=True)
-    
-    details = {}
-    for name, param in model.prompt_learner.named_parameters():
-        if param.requires_grad:
-            details[name] = param.numel()
-    
-    return model, learnable, details, vife_cfg
-
-
 def main():
     print("=" * 70)
     print("LEARNABLE PARAMETERS vs GFLOPs COMPARISON")
@@ -246,7 +179,7 @@ def main():
     print("ANALYZING EACH METHOD...")
     print("-" * 70)
 
-    print("\n[1/4] CoOp (Context Optimization)")
+    print("\n[1/3] CoOp (Context Optimization)")
     coop_model, coop_params, coop_details, coop_cfg = analyze_coop(clip_model, classnames)
     coop_gflops = get_gflops(coop_model)
     print(f"  Learnable components:")
@@ -254,7 +187,7 @@ def main():
         print(f"    - {name}: {format_params(num)} ({num:,})")
     print(f"  TOTAL: {format_params(coop_params)}")
 
-    print("\n[2/4] MaPLe (Multi-modal Prompt Learning)")
+    print("\n[2/3] MaPLe (Multi-modal Prompt Learning)")
     maple_model, maple_params, maple_details, maple_cfg = analyze_maple(clip_model, classnames)
     maple_gflops = get_gflops(maple_model)
     print(f"  Learnable components:")
@@ -262,27 +195,13 @@ def main():
         print(f"    - {name}: {format_params(num)} ({num:,})")
     print(f"  TOTAL: {format_params(maple_params)}")
 
-    print("\n[3/4] APT (Adapted Prompt Tuning)")
+    print("\n[3/3] APT (Adapted Prompt Tuning)")
     apt_model, apt_params, apt_details, apt_cfg = analyze_apt(clip_model, classnames)
     apt_gflops = get_gflops(apt_model)
     print(f"  Learnable components:")
     for name, num in apt_details.items():
         print(f"    - {name}: {format_params(num)} ({num:,})")
     print(f"  TOTAL: {format_params(apt_params)}")
-
-    print("\n[4/4] ViFE (Visual Finegrained Extractor = APT + SSL)")
-    vife_model, vife_params, vife_details, vife_cfg, vife_gflops_details = analyze_vife(clip_model, classnames)
-    vife_gflops = apt_gflops + vife_gflops_details['SSL Total']
-    print(f"  Learnable components:")
-    for name, num in vife_details.items():
-        print(f"    - {name}: {format_params(num)} ({num:,})")
-    print(f"  TOTAL: {format_params(vife_params)}")
-    print(f"  SSL GFLOPs breakdown:")
-    print(f"    - APT (base): {apt_gflops:.4f}")
-    for name, gf in vife_gflops_details.items():
-        if name != 'SSL Total':
-            print(f"    - {name}: {gf:.4f}")
-    print(f"    - TOTAL: {vife_gflops:.4f}")
 
     print("\n" + "=" * 70)
     print("BENCHMARKING FPS...")
@@ -305,10 +224,6 @@ def main():
     apt_fps, apt_latency = benchmark_fps(lambda: APTCLIP(apt_cfg, classnames, clip_model_fps, DEVICE))
     print(f"  FPS: {apt_fps:.2f}, Latency: {apt_latency:.2f}ms")
     
-    print("Measuring ViFE (APT inference)...")
-    vife_fps, vife_latency = benchmark_fps(lambda: APTCLIP(vife_cfg, classnames, clip_model_fps, DEVICE))
-    print(f"  FPS: {vife_fps:.2f}, Latency: {vife_latency:.2f}ms")
-
     print("\n" + "=" * 70)
     print("SUMMARY TABLE")
     print("=" * 70)
@@ -319,7 +234,6 @@ def main():
         ("CoOp", coop_params, coop_gflops, coop_fps, coop_latency),
         ("MaPLe", maple_params, maple_gflops, maple_fps, maple_latency),
         ("APT", apt_params, apt_gflops, apt_fps, apt_latency),
-        ("ViFE", vife_params, vife_gflops, vife_fps, vife_latency),
     ]
     
     for method, params, gflops, fps, latency in results:
@@ -333,7 +247,6 @@ def main():
     print(f"- CoOp: n_ctx={coop_cfg.model.n_ctx}")
     print(f"- MaPLe: n_ctx={maple_cfg.model.n_ctx}, prompt_depth={maple_cfg.model.prompt_depth}")
     print(f"- APT: num_heads={apt_cfg.model.num_heads}, num_layers={apt_cfg.model.num_layers}")
-    print(f"- ViFE: proj_dim={vife_cfg.ssl.proj_dim}, num_prototypes={vife_cfg.ssl.num_prototypes}")
     
     print(f"\nNOTE: FPS measured on {DEVICE.upper()} with batch_size=1")
 

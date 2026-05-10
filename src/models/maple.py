@@ -81,9 +81,9 @@ class MultiModalPromptLearner(nn.Module):
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
         
-        logger.info('MaPLe design: Multi-modal Prompt Learning')
-        logger.info(f'Initial context: "{prompt_prefix}"')
-        logger.info(f"Number of MaPLe context words (tokens): {n_ctx}")
+        # logger.info('MaPLe design: Multi-modal Prompt Learning')
+        # logger.info(f'Initial context: "{prompt_prefix}"')
+        # logger.info(f"Number of MaPLe context words (tokens): {n_ctx}")
         
         self.proj = nn.Linear(ctx_dim, 768)
         self.ctx = nn.Parameter(ctx_vectors)
@@ -224,7 +224,7 @@ class MaPLe(BaseTrainer):
         n_ctx = self._cfg_int(2, 'model.n_ctx')
         prompt_depth = self._cfg_int(9, 'model.prompt_depth')
         
-        logger.info(f"Loading CLIP (backbone: {backbone_name})")
+        # logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
         clip_model = load_clip_to_cpu(backbone_name)
         
@@ -243,8 +243,8 @@ class MaPLe(BaseTrainer):
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
-        logger.info(f"MaPLe: n_ctx={n_ctx}, prompt_depth={prompt_depth}")
-        logger.info(f"Learnable parameters: {format_params(trainable_params)} / Total: {format_params(total_params)}")
+        # logger.info(f"MaPLe: n_ctx={n_ctx}, prompt_depth={prompt_depth}")
+        # logger.info(f"Learnable parameters: {format_params(trainable_params)} / Total: {format_params(total_params)}")
         
         self.model.to(self.device)
         self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}

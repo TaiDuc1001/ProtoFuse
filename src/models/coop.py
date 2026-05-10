@@ -143,7 +143,7 @@ class CoOP(BaseTrainer):
 
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
-        logger.info(f"Loading CLIP (backbone: {backbone_name})")
+        # logger.info(f"Loading CLIP (backbone: {backbone_name})")
         
         clip_model = load_clip_to_cpu(backbone_name)
         
@@ -161,8 +161,8 @@ class CoOP(BaseTrainer):
         
         n_ctx = self._cfg_int(16, 'model.n_ctx')
         csc = bool(self.model_cfg.get('csc', False))
-        logger.info(f"CoOP: n_ctx={n_ctx}, csc={csc}")
-        logger.info(f"Learnable parameters: {format_params(trainable_params)} / Total: {format_params(total_params)}")
+        # logger.info(f"CoOP: n_ctx={n_ctx}, csc={csc}")
+        # logger.info(f"Learnable parameters: {format_params(trainable_params)} / Total: {format_params(total_params)}")
         
         self.model.to(self.device)
         self.initial_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}

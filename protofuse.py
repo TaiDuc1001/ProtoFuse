@@ -1,4 +1,7 @@
 import os
+os.environ["MPLBACKEND"] = "Agg"
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -127,7 +130,7 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
-    setup_logging(True, False)
+    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
     pipeline = ProtoFusePipeline(merge_configs(load_config_file(args.config), overrides))
     pipeline.run()
     

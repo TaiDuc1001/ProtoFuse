@@ -1,0 +1,26 @@
+model:
+  backbone: "ViT-B/16"
+  augment_epoch: 10
+  timos_quick_search: 10
+
+training:
+  device: "cuda:0"
+  precision: "fp32"
+  batch_size: 128
+
+data:
+  dataset_name: "CUB-200-2011"
+  val_size: 0.7
+  kshot: 1
+  seed: 1
+  num_workers: 4
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+  root: "datasets/cub-200-2011-renamed"
+
+checkpoint:
+  enabled: true
+  cache_dir: "checkpoints/timos"
+
+logging:
+  output_dir: "outputs/timos"

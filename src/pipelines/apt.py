@@ -86,7 +86,7 @@ class APTTrainingPipeline:
         base_output = coerce_to_str(base_output_value, "outputs", key="logging.output_dir")
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir = os.path.join(base_output, timestamp)
-        logger.info(f"Run directory: {self.run_dir}")
+        # logger.info(f"Run directory: {self.run_dir}")
         self.selection_log_path = os.path.join(self.run_dir, 'al_selected_paths.log')
         self.config_path = os.path.join(self.run_dir, 'config.json')
         self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
@@ -158,7 +158,7 @@ class APTTrainingPipeline:
             cache_dir = checkpoint_cfg.get('cache_dir', DEFAULT_CHECKPOINT_DIR)
             self.checkpoint_cache = CheckpointCache(cache_dir)
             self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
-            logger.info(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+            # logger.info(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
 
     def _try_load_checkpoint(self) -> bool:
         if self.checkpoint_cache is None or self.checkpoint_id is None:
@@ -187,7 +187,7 @@ class APTTrainingPipeline:
         self.metrics = ckpt['metrics']
         self.global_epoch = len(self.metrics)
         self.cached_apt_predictions = ckpt.get('apt_predictions', None)
-        logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        # logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
         return True
 
     def _compute_apt_predictions(self):
@@ -302,7 +302,7 @@ class APTTrainingPipeline:
 
         if self.base_novel_enabled:
             self._compute_base_novel_classes(all_class_indices)
-            logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base classes, {len(self.novel_class_indices)} novel classes")
+            # logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base classes, {len(self.novel_class_indices)} novel classes")
 
         rng = random.Random(self.seed)
         val_indices = []
@@ -404,11 +404,11 @@ class APTTrainingPipeline:
             if len(base_val_indices) > 0:
                 base_val_ds = Subset(base_val_src, base_val_indices)
                 self.base_val_loader = DataLoader(base_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-                logger.info(f"Base validation: {len(base_val_indices)} samples")
+                # logger.info(f"Base validation: {len(base_val_indices)} samples")
             if len(novel_val_indices) > 0:
                 novel_val_ds = Subset(novel_val_src, novel_val_indices)
                 self.novel_val_loader = DataLoader(novel_val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-                logger.info(f"Novel validation: {len(novel_val_indices)} samples")
+                # logger.info(f"Novel validation: {len(novel_val_indices)} samples")
 
         if self.val_fraction is not None:
             total_images = len(self.dataset)
@@ -425,9 +425,9 @@ class APTTrainingPipeline:
             'unlabeled_count': len(self.unlabeled_indices),
             'train_pool_size': len(self.train_indices) + len(self.unlabeled_indices)
         }
-        logger.info(f"Dataset loaded: {stats['total_images']} total images")
+        # logger.info(f"Dataset loaded: {stats['total_images']} total images")
         val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
-        logger.info(f"Validation: {stats['val_count']} ({val_percentage:.2f}%), Train: {stats['train_count']}, Unlabeled: {stats['unlabeled_count']}")
+        # logger.info(f"Validation: {stats['val_count']} ({val_percentage:.2f}%), Train: {stats['train_count']}, Unlabeled: {stats['unlabeled_count']}")
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
         with open(self.config_path, 'w') as f:
@@ -476,7 +476,7 @@ class APTTrainingPipeline:
             raise RuntimeError("No training samples available.")
 
         if self._try_load_checkpoint():
-            logger.info("Skipping training (loaded from checkpoint)")
+            # logger.info("Skipping training (loaded from checkpoint)")
             return
 
         train_subset = Subset(self.dataset, list(self.train_indices))
@@ -595,10 +595,10 @@ class APTTrainingPipeline:
             self.trainer.save_model(self.best_model_path)
 
         val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
-        if self.base_novel_enabled and harmonic_mean is not None:
-            logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
-        else:
-            logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+        # if self.base_novel_enabled and harmonic_mean is not None:
+        #     logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
+        # else:
+        #     logger.info(f"APT Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
 
         if self.trainer.scheduler is not None:
             self.trainer.scheduler.step()
@@ -688,7 +688,7 @@ class APTTrainingPipeline:
 
         self.trainer.save_model(self.last_model_path)
 
-        logger.info(f"Training completed. Results written to {self.run_dir}")
+        # logger.info(f"Training completed. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
         log_experiment_metrics(final_metrics)

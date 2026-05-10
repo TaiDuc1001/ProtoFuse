@@ -1,20 +1,17 @@
-# ViFE: Learning Fine-Grained Features via Self-Supervised Distillation for Few-Shot Image Classification
+# ProtoFuse
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg)](https://pytorch.org/)
 [![CLIP](https://img.shields.io/badge/CLIP-ViT--B%2F16-green.svg)](https://github.com/openai/CLIP)
 [![uv](https://img.shields.io/badge/uv-package%20manager-blueviolet.svg)](https://docs.astral.sh/uv/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Official implementation** of *"Learning Fine-Grained Features via Self-Supervised Distillation for Few-Shot Image Classification"*
-
-ViFE (Visual Fine-grained Extractor) extends APT (Adapted Prompt Tuning) by introducing a self-supervised distillation pipeline that learns fine-grained visual features from unlabeled data. The method combines CLIP-based cross-attention prompt tuning with DINO-style self-supervised learning and a learned fusion mechanism, achieving state-of-the-art performance on fine-grained few-shot classification tasks.
+Few-shot CLIP adaptation experiments for fine-grained image classification. The repository includes training and evaluation pipelines for ProtoFuse, APT, CoOp, MaPLe, APE, TIMO, TIMOS, and Tip-Adapter.
 
 ## Installation
 
 ```bash
-git clone https://github.com/TaiDuc1001/Visual-Finegrained-Extractor.git
-cd Visual-Finegrained-Extractor
+git clone https://github.com/TaiDuc1001/protofuse.git
+cd protofuse
 uv sync
 ```
 
@@ -22,11 +19,11 @@ uv sync
 
 ### CUB-200-2011
 
-1. Download the [CUB-200-2011](https://www.vision.caltech.edu/datasets/cub_200_2011/) dataset
-2. Extract and place it under `datasets/cub-200-2011/`
+1. Download the [CUB-200-2011](https://www.vision.caltech.edu/datasets/cub_200_2011/) dataset.
+2. Extract and place it under `datasets/cub-200-2011/`.
 3. The directory should follow this structure:
 
-```
+```text
 datasets/cub-200-2011/
 ├── class_001/
 │   ├── image_001.jpg
@@ -42,10 +39,10 @@ datasets/cub-200-2011/
 ### Training
 
 ```bash
-# ViFE (proposed method)
-uv run apt.py --config configs/vife.yaml
+# ProtoFuse
+uv run protofuse.py --config configs/protofuse.yaml
 
-# APT (baseline)
+# APT
 uv run apt.py --config configs/apt.yaml
 
 # CoOp
@@ -53,6 +50,15 @@ uv run coop.py --config configs/coop.yaml
 
 # MaPLe
 uv run maple.py --config configs/maple.yaml
+
+# Tip-Adapter / Tip-Adapter-F
+uv run tip_adapter.py --config configs/tip_adapter.yaml
+
+# TIMO
+uv run timo.py --config configs/timo.yaml
+
+# TIMOS
+uv run timos.py --config configs/timos.yaml
 ```
 
 ### Configuration Overrides
@@ -60,9 +66,8 @@ uv run maple.py --config configs/maple.yaml
 All config values can be overridden from the command line:
 
 ```bash
-uv run apt.py --config configs/vife.yaml \
+uv run protofuse.py --config configs/protofuse.yaml \
     --data.kshot 8 \
-    --training.epochs 20 \
     --training.batch_size 16 \
     --training.device cuda:1
 ```
@@ -75,7 +80,7 @@ uv run test/zeroshot_clip.py
 
 ### Computational Analysis
 
-Compare learnable parameters, GFLOPs, FPS, and latency across all methods:
+Compare learnable parameters, GFLOPs, FPS, and latency across the supported baseline methods:
 
 ```bash
 uv run test/compare_methods.py
@@ -83,51 +88,45 @@ uv run test/compare_methods.py
 
 ## Project Structure
 
-```
-Visual-Finegrained-Extractor/
-├── apt.py              # APT & ViFE training pipeline
-├── apt_ssl.py          # SSL modules (DINO, TransformerAdapter, FusionWeightLearner)
-├── coop.py             # CoOp implementation
-├── cocoop.py           # CoCoOp implementation
-├── maple.py            # MaPLe implementation
-├── utils.py            # Config, checkpointing, metrics, visualization
+```text
+protofuse/
+├── protofuse.py        # ProtoFuse pipeline entry point
+├── apt.py              # APT training entry point
+├── coop.py             # CoOp training entry point
+├── maple.py            # MaPLe training entry point
+├── tip_adapter.py      # Tip-Adapter training entry point
+├── timo.py             # TIMO training-free entry point
+├── timos.py            # TIMOS training-free entry point
+├── utils.py            # Config, checkpointing, metrics, and visualization helpers
 ├── logger.py           # Logging utilities
 ├── configs/
+│   ├── protofuse.yaml  # ProtoFuse configuration
 │   ├── apt.yaml        # APT configuration
-│   ├── vife.yaml       # ViFE configuration
 │   ├── coop.yaml       # CoOp configuration
-│   ├── cocoop.yaml     # CoCoOp configuration
-│   └── maple.yaml      # MaPLe configuration
-├── fixmatch/
-│   ├── fixmatch_apt.py             # FixMatch + APT
-│   ├── fixmatch_coop.py            # FixMatch + CoOp
-│   ├── fixmatch_cocoop.py          # FixMatch + CoCoOp
-│   ├── fixmatch_maple.py           # FixMatch + MaPLe
-│   ├── fixmatch_utils.py           # FixMatch utilities
-│   └── configs/
-│       ├── _fixmatch_apt_config.yaml
-│       ├── _fixmatch_coop_config.yaml
-│       ├── _fixmatch_cocoop_config.yaml
-│       └── _fixmatch_maple_config.yaml
+│   ├── maple.yaml      # MaPLe configuration
+│   ├── tip_adapter.yaml
+│   ├── timo.yaml       # TIMO configuration
+│   └── timos.yaml      # TIMOS configuration
+├── src/
+│   ├── models/         # Model implementations
+│   └── pipelines/      # Training and evaluation pipelines
 ├── test/
-│   ├── compare_methods.py          # Computational analysis (params, GFLOPs, FPS)
-│   └── zeroshot_clip.py            # Zero-shot CLIP evaluation
-├── checkpoints/                    # Cached training checkpoints
-├── outputs/                        # Training logs and results
-├── models/                         # Pre-trained CLIP weights
-├── datasets/                       # Dataset root
-└── pyproject.toml                  # Project dependencies
+│   ├── compare_methods.py
+│   └── zeroshot_clip.py
+├── checkpoints/
+├── outputs/
+├── datasets/
+└── pyproject.toml
 ```
 
 ## Supported Methods
 
 | Method | Script | Description |
 |--------|--------|-------------|
-| **ViFE** | `apt.py` | APT + self-supervised distillation with learned fusion (proposed) |
+| **ProtoFuse** | `protofuse.py` | Prototype fusion for few-shot CLIP adaptation |
 | **APT** | `apt.py` | Cross-attention prompt tuning on CLIP |
 | **CoOp** | `coop.py` | Context Optimization for CLIP |
 | **MaPLe** | `maple.py` | Multi-modal Prompt Learning for CLIP |
-
-## License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+| **Tip-Adapter** | `tip_adapter.py` | Cache-based CLIP adaptation with optional Tip-Adapter-F fine-tuning |
+| **TIMO** | `timo.py` | Text-image mutual guidance optimization |
+| **TIMOS** | `timos.py` | TIMO search variant |

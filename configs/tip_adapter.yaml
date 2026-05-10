@@ -1,23 +1,26 @@
 model:
   backbone: "ViT-B/16"
-  n_ctx: 4
-  ctx_init: ""
+  alpha: 1.0
+  beta: 5.5
+  search:
+    enabled: true
+    alpha_values: [0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
+    beta_values: [1.0, 2.0, 5.5, 10.0, 20.0]
+  finetune:
+    enabled: true
+    epochs: 20
+    lr: 0.001
+    weight_decay: 0.0
 
 training:
-  epochs: 10
-  batch_size: 16
-  learning_rate: 0.002
-  weight_decay: 0.0005
-  optimizer: "SGD"
   device: "cuda:0"
   precision: "fp32"
-  confusion_matrix: false
-  class_distribution: false
+  batch_size: 128
 
 data:
   dataset_name: "CUB-200-2011"
   val_size: 0.7
-  kshot: 1
+  kshot: 16
   seed: 1
   num_workers: 4
   run_eda: false
@@ -30,7 +33,7 @@ data:
 
 checkpoint:
   enabled: true
-  cache_dir: "checkpoints/cocoop"
+  cache_dir: "checkpoints/tip_adapter"
 
 logging:
-  output_dir: "outputs/cocoop"
+  output_dir: "outputs/tip_adapter"

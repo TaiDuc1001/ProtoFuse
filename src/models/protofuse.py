@@ -28,7 +28,7 @@ class ProtoFuse(BaseTrainer):
         dataset_name = data_cfg.get('dataset_name', 'ImageNet')
         self.template = CUSTOM_TEMPLATES.get(dataset_name, "a photo of a {}.")
 
-        logger.info(f"Loading CLIP (backbone: {backbone_name})")
+        # logger.info(f"Loading CLIP (backbone: {backbone_name})")
         clip_model = load_clip_to_cpu(backbone_name)
 
         precision = self._cfg_str('fp32', 'training.precision', 'precision')
@@ -51,9 +51,9 @@ class ProtoFuse(BaseTrainer):
         self.fused_prototypes = None
         self.best_alpha = None
 
-        logger.info(f"ProtoFuse: {len(self.classnames)} classes, α steps={self.alpha_steps}")
-        logger.info(f"Template: \"{self.template}\"")
-        logger.info(f"Embed dim: {self.embed_dim}")
+        # logger.info(f"ProtoFuse: {len(self.classnames)} classes, α steps={self.alpha_steps}")
+        # logger.info(f"Template: \"{self.template}\"")
+        # logger.info(f"Embed dim: {self.embed_dim}")
 
         self.model = None
         self.initial_model_state = {}
@@ -190,11 +190,11 @@ class ProtoFuse(BaseTrainer):
             'alpha_steps': self.alpha_steps,
             'classnames': self.classnames,
         }, path)
-        logger.info(f"ProtoFuse prototypes saved to {path}")
+        # logger.info(f"ProtoFuse prototypes saved to {path}")
 
     def load_model(self, path):
         data = torch.load(path, map_location=self.device)
         self.fused_prototypes = data['fused_prototypes']
         self.text_prototypes = data['text_prototypes']
         self.best_alpha = data['best_alpha']
-        logger.info(f"ProtoFuse prototypes loaded from {path}")
+        # logger.info(f"ProtoFuse prototypes loaded from {path}")

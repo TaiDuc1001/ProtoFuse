@@ -8,13 +8,13 @@ from utils import (
     load_config_file,
 )
 
-from src.pipelines.cocoop import CoCoOPTrainingPipeline
+from src.pipelines.timo import TIMOSPipeline
 
 ARG_SCHEMA = DEFAULT_ARG_SCHEMA
 
 
 def parse_args():
-    parser = create_argument_parser("Train CoCoOP model", ARG_SCHEMA)
+    parser = create_argument_parser("Run TIMOS", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
@@ -23,10 +23,10 @@ def parse_args():
 
 def main():
     args, overrides = parse_args()
-    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', False))
+    setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
-    pipeline = CoCoOPTrainingPipeline(merged)
+    pipeline = TIMOSPipeline(merged)
     pipeline.run()
 
 
