@@ -6,7 +6,7 @@ model:
   class_token_position: "end"
 
 training:
-  epochs: 100
+  epochs: 20
   batch_size: 16
   learning_rate: 0.002
   weight_decay: 0.0005
