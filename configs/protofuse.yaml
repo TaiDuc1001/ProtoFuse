@@ -1,6 +1,9 @@
 model:
   backbone: "ViT-B/16"
   alpha_steps: 101
+  hopc_repeats: 16
+  hopc_var_lambda: 0.0
+  hopc_logit_scale: 1.0
 
 training:
   device: "cuda:0"

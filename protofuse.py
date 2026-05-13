@@ -102,7 +102,7 @@ def patched_fuse_and_evaluate(self, train_features, train_labels, eval_features,
     metrics['alpha'] = best_alphas_vec.mean().item()
     return metrics
 
-ProtoFuse.fuse_and_evaluate = patched_fuse_and_evaluate
+# Keep the model's native implementation (HOPC alpha selection in src/models/protofuse.py).
 
 def parse_args():
     p, u = create_argument_parser("Run", ARG_SCHEMA).parse_known_args()

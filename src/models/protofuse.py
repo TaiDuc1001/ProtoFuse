@@ -23,6 +23,9 @@ class ProtoFuse(BaseTrainer):
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
+        self.hopc_repeats = self._cfg_int(16, 'model.hopc_repeats')
+        self.hopc_var_lambda = self._cfg_float(0.0, 'model.hopc_var_lambda')
+        self.hopc_logit_scale = self._cfg_float(1.0, 'model.hopc_logit_scale')
 
         data_cfg = self.cfg.get('data', ConfigNode())
         dataset_name = data_cfg.get('dataset_name', 'ImageNet')
@@ -73,15 +76,30 @@ class ProtoFuse(BaseTrainer):
                 all_labels.append(labels)
         return torch.cat(all_features, dim=0), torch.cat(all_labels, dim=0)
 
+    def _weighted_visual_centroid(self, class_features, text_prototype):
+        class_features = class_features.to(self.device)
+        text_prototype = text_prototype.to(self.device)
+        similarities = F.cosine_similarity(
+            F.normalize(class_features, dim=-1),
+            F.normalize(text_prototype, dim=-1).unsqueeze(0),
+            dim=-1,
+        ).clamp_min(0.0)
+        sim_sum = similarities.sum()
+        if sim_sum <= 1e-12:
+            weights = torch.full_like(similarities, 1.0 / similarities.numel())
+        else:
+            weights = similarities / sim_sum
+        return F.normalize((weights.unsqueeze(-1) * class_features).sum(dim=0), dim=-1)
+
     def build_visual_centroids(self, features, labels, num_classes):
         centroids = torch.zeros(num_classes, self.embed_dim, device=self.device)
         for i in range(num_classes):
             mask = (labels == i)
             if mask.any():
-                centroids[i] = F.normalize(features[mask].to(self.device).mean(0), dim=-1)
+                centroids[i] = self._weighted_visual_centroid(features[mask], self.text_prototypes[i])
         return centroids
 
-    def loo_cv_alpha(self, T, V_all, train_features, train_labels, num_classes):
+    def hopc_alpha(self, T, V_all, train_features, train_labels, num_classes):
         class_indices = [[] for _ in range(num_classes)]
         for idx, lbl in enumerate(train_labels.tolist()):
             class_indices[lbl].append(idx)
@@ -94,31 +112,52 @@ class ProtoFuse(BaseTrainer):
                 (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_all,
                 dim=-1
             )
-            logits = torch.einsum("qd,apd->aqp", train_norm, refined)
-            preds = logits.argmax(dim=-1)
-            scores = (preds == train_labels.to(self.device)).float().mean(dim=-1)
-            best_alpha = self.alphas[scores.argmax()].item()
+            logits = self.hopc_logit_scale * torch.einsum("qd,apd->aqp", train_norm, refined)
+            targets = train_labels.to(self.device).view(1, -1).expand(len(self.alphas), -1)
+            losses = F.cross_entropy(
+                logits.reshape(-1, num_classes),
+                targets.reshape(-1),
+                reduction='none',
+            ).view(len(self.alphas), -1).mean(dim=-1)
+            best_alpha = self.alphas[losses.argmin()].item()
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
         else:
             k = shots_per_class
             class_feat = torch.stack([
                 train_features[class_indices[c][:k]].to(self.device) for c in range(num_classes)
             ])
-            class_sums = class_feat.sum(dim=1)
-            loo_scores = torch.zeros(len(self.alphas), device=self.device)
+            repeat_losses = []
+            repeats = max(1, self.hopc_repeats)
 
-            for fold in range(k):
-                held = F.normalize(class_feat[:, fold, :], dim=-1)
-                V_loo = F.normalize((class_sums - class_feat[:, fold, :]) / (k - 1), dim=-1)
+            for _ in range(repeats):
+                hold_idx = torch.randint(0, k, (num_classes,), device=self.device)
+                held_raw = class_feat[torch.arange(num_classes, device=self.device), hold_idx]
+                held = F.normalize(held_raw, dim=-1)
+                V_minus = torch.stack([
+                    self._weighted_visual_centroid(
+                        class_feat[c, torch.arange(k, device=self.device) != hold_idx[c]],
+                        T[c],
+                    )
+                    for c in range(num_classes)
+                ])
                 refined = F.normalize(
-                    (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_loo,
+                    (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_minus,
                     dim=-1
                 )
-                logits = torch.einsum("qd,apd->aqp", held, refined)
-                preds = logits.argmax(dim=-1)
-                loo_scores += (preds == torch.arange(num_classes, device=self.device)).float().mean(dim=-1)
+                logits = self.hopc_logit_scale * torch.einsum("cd,akd->ack", held, refined)
+                targets = torch.arange(num_classes, device=self.device).view(1, -1).expand(len(self.alphas), -1)
+                losses = F.cross_entropy(
+                    logits.reshape(-1, num_classes),
+                    targets.reshape(-1),
+                    reduction='none',
+                ).view(len(self.alphas), num_classes).mean(dim=-1)
+                repeat_losses.append(losses)
 
-            best_alpha = self.alphas[loo_scores.argmax()].item()
+            loss_matrix = torch.stack(repeat_losses, dim=0)
+            mean_loss = loss_matrix.mean(dim=0)
+            std_loss = loss_matrix.std(dim=0, unbiased=False)
+            risk = mean_loss + self.hopc_var_lambda * std_loss
+            best_alpha = self.alphas[risk.argmin()].item()
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
 
         return best_proto, best_alpha
@@ -127,7 +166,7 @@ class ProtoFuse(BaseTrainer):
         V = self.build_visual_centroids(train_features, train_labels, num_classes)
         T = self.text_prototypes
 
-        proto, alpha = self.loo_cv_alpha(T, V, train_features, train_labels, num_classes)
+        proto, alpha = self.hopc_alpha(T, V, train_features, train_labels, num_classes)
         self.fused_prototypes = proto
         self.best_alpha = alpha
 
