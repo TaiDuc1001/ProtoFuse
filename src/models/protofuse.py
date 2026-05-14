@@ -1,15 +1,11 @@
-import math
 import torch
 import torch.nn.functional as F
 from clip import clip
 
 from utils import (
-    logger,
     ConfigNode,
     BaseTrainer,
-    format_params,
-    coerce_to_str,
-    coerce_to_int,
+    coerce_to_float,
     load_clip_to_cpu,
     compute_metrics,
 )
@@ -23,9 +19,10 @@ class ProtoFuse(BaseTrainer):
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
-        self.hopc_repeats = self._cfg_int(16, 'model.hopc_repeats')
-        self.hopc_var_lambda = self._cfg_float(0.0, 'model.hopc_var_lambda')
-        self.hopc_logit_scale = self._cfg_float(1.0, 'model.hopc_logit_scale')
+        self.centroid_mix_beta_values = self._cfg_float_list(
+            [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+            'model.centroid_mix.beta_values',
+        )
 
         data_cfg = self.cfg.get('data', ConfigNode())
         dataset_name = data_cfg.get('dataset_name', 'ImageNet')
@@ -65,6 +62,16 @@ class ProtoFuse(BaseTrainer):
         self.optimizer = None
         self.scheduler = None
 
+    def _cfg_float_list(self, default, *paths):
+        raw = self._cfg_value(*paths, default=default)
+        if isinstance(raw, str):
+            values = [v.strip() for v in raw.split(',') if v.strip()]
+        elif isinstance(raw, (list, tuple)):
+            values = raw
+        else:
+            values = [raw]
+        return [coerce_to_float(v, 0.0) for v in values]
+
     def extract_features(self, dataloader):
         all_features = []
         all_labels = []
@@ -99,6 +106,70 @@ class ProtoFuse(BaseTrainer):
                 centroids[i] = self._weighted_visual_centroid(features[mask], self.text_prototypes[i])
         return centroids
 
+    def _curve_knee(self, values):
+        values = values.float()
+        span = values.max() - values.min()
+        if span <= 1e-12:
+            return None, 0.0, 0.0
+        y = (values - values.min()) / (span + 1e-12)
+        x = torch.linspace(0.0, 1.0, len(values), device=self.device)
+        knee_scores = y - x
+        knee_idx = int(knee_scores.argmax().item())
+        return knee_idx, knee_scores[knee_idx].item(), span.item()
+
+    def _centroid_mix_neighbors(self, T, V_all, mode):
+        if mode == 'vv':
+            similarity = V_all @ V_all.T
+        elif mode == 'tt':
+            similarity = T @ T.T
+        elif mode == 'hybrid':
+            similarity = 0.5 * (V_all @ V_all.T) + 0.5 * (T @ T.T)
+        else:
+            raise ValueError(f"Unknown centroid-mix neighbor mode: {mode}")
+        similarity = similarity.clone()
+        similarity.fill_diagonal_(-float('inf'))
+        return similarity.argmax(dim=1)
+
+    def _centroid_mix_net_curve(self, T, V_all, neighbors, beta, num_classes):
+        labels = torch.arange(num_classes, device=self.device)
+        pseudo_features = F.normalize((1.0 - beta) * V_all + beta * V_all[neighbors], dim=-1)
+        text_preds = (pseudo_features @ T.T).argmax(dim=-1)
+        text_correct = text_preds.eq(labels)
+
+        net_scores = []
+        for alpha in self.alphas:
+            proto = F.normalize((1.0 - alpha) * T + alpha * V_all, dim=-1)
+            fused_preds = (pseudo_features @ proto.T).argmax(dim=-1)
+            fused_correct = fused_preds.eq(labels)
+            rescue = (~text_correct) & fused_correct
+            damage = text_correct & ~fused_correct
+            net_scores.append(rescue.sum().float() - damage.sum().float())
+        return torch.stack(net_scores)
+
+    def _centroid_mix_alpha(self, T, V_all, num_classes):
+        beta_values = sorted({round(float(b), 6) for b in self.centroid_mix_beta_values if 0.0 < float(b) < 0.5})
+        if 0.45 not in beta_values:
+            beta_values.append(0.45)
+            beta_values.sort()
+        if num_classes < 2 or not beta_values:
+            return 0.0
+
+        best = {'score': -float('inf'), 'alpha': 0.0}
+        for mode in ('vv', 'tt', 'hybrid'):
+            neighbors = self._centroid_mix_neighbors(T, V_all, mode)
+            for beta in beta_values:
+                net_curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
+                knee_idx, knee_strength, signal_span = self._curve_knee(net_curve)
+                if knee_idx is None:
+                    continue
+                amplitude = signal_span / max(1, num_classes)
+                quality = knee_strength * amplitude
+                alpha = self.alphas[knee_idx].item()
+                if quality > best['score'] or (quality == best['score'] and alpha < best['alpha']):
+                    best = {'score': quality, 'alpha': alpha}
+
+        return best['alpha'] if best['score'] > 0.0 else 0.0
+
     def hopc_alpha(self, T, V_all, train_features, train_labels, num_classes):
         class_indices = [[] for _ in range(num_classes)]
         for idx, lbl in enumerate(train_labels.tolist()):
@@ -107,57 +178,41 @@ class ProtoFuse(BaseTrainer):
         shots_per_class = min(len(idxs) for idxs in class_indices)
 
         if shots_per_class < 2:
-            train_norm = F.normalize(train_features.to(self.device), dim=-1)
-            refined = F.normalize(
-                (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_all,
-                dim=-1
-            )
-            logits = self.hopc_logit_scale * torch.einsum("qd,apd->aqp", train_norm, refined)
-            targets = train_labels.to(self.device).view(1, -1).expand(len(self.alphas), -1)
-            losses = F.cross_entropy(
-                logits.reshape(-1, num_classes),
-                targets.reshape(-1),
-                reduction='none',
-            ).view(len(self.alphas), -1).mean(dim=-1)
-            best_alpha = self.alphas[losses.argmin()].item()
+            best_alpha = self._centroid_mix_alpha(T, V_all, num_classes)
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
         else:
             k = shots_per_class
             class_feat = torch.stack([
                 train_features[class_indices[c][:k]].to(self.device) for c in range(num_classes)
             ])
-            repeat_losses = []
-            repeats = max(1, self.hopc_repeats)
+            net_scores = torch.zeros(len(self.alphas), device=self.device)
+            targets = torch.arange(num_classes, device=self.device)
 
-            for _ in range(repeats):
-                hold_idx = torch.randint(0, k, (num_classes,), device=self.device)
-                held_raw = class_feat[torch.arange(num_classes, device=self.device), hold_idx]
-                held = F.normalize(held_raw, dim=-1)
+            for hold_idx in range(k):
+                held = F.normalize(class_feat[:, hold_idx, :], dim=-1)
                 V_minus = torch.stack([
                     self._weighted_visual_centroid(
-                        class_feat[c, torch.arange(k, device=self.device) != hold_idx[c]],
+                        class_feat[c, torch.arange(k, device=self.device) != hold_idx],
                         T[c],
                     )
                     for c in range(num_classes)
                 ])
+
+                text_preds = (held @ T.T).argmax(dim=-1)
+                text_correct = text_preds.eq(targets)
+
                 refined = F.normalize(
                     (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_minus,
                     dim=-1
                 )
-                logits = self.hopc_logit_scale * torch.einsum("cd,akd->ack", held, refined)
-                targets = torch.arange(num_classes, device=self.device).view(1, -1).expand(len(self.alphas), -1)
-                losses = F.cross_entropy(
-                    logits.reshape(-1, num_classes),
-                    targets.reshape(-1),
-                    reduction='none',
-                ).view(len(self.alphas), num_classes).mean(dim=-1)
-                repeat_losses.append(losses)
+                fused_preds = torch.einsum("cd,akd->ack", held, refined).argmax(dim=-1)
+                fused_correct = fused_preds.eq(targets.view(1, -1))
 
-            loss_matrix = torch.stack(repeat_losses, dim=0)
-            mean_loss = loss_matrix.mean(dim=0)
-            std_loss = loss_matrix.std(dim=0, unbiased=False)
-            risk = mean_loss + self.hopc_var_lambda * std_loss
-            best_alpha = self.alphas[risk.argmin()].item()
+                rescue = (~text_correct).view(1, -1) & fused_correct
+                damage = text_correct.view(1, -1) & ~fused_correct
+                net_scores += rescue.sum(dim=1).float() - damage.sum(dim=1).float()
+
+            best_alpha = self.alphas[net_scores.argmax()].item()
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
 
         return best_proto, best_alpha
@@ -171,25 +226,8 @@ class ProtoFuse(BaseTrainer):
         self.best_alpha = alpha
 
         eval_norm = F.normalize(eval_features.to(self.device), dim=-1)
-
-        class_indices = {}
-        for idx, lbl in enumerate(train_labels.tolist()):
-            class_indices.setdefault(lbl, []).append(idx)
-        shots_per_class = min(len(v) for v in class_indices.values())
-
-        if shots_per_class < 2:
-            tau = 0.05
-            L_T = eval_norm @ T.T
-            L_V = eval_norm @ V.T
-            p = F.softmax(L_V / tau, dim=-1)
-            H_x = -(p * torch.log(p + 1e-8)).sum(dim=-1)
-            w_x = 1.0 - (H_x / math.log(num_classes)).clamp(0.0, 1.0)
-            alpha_x = alpha * (0.5 + 0.5 * w_x)
-            L_final = (1 - alpha_x).unsqueeze(-1) * L_T + alpha_x.unsqueeze(-1) * L_V
-            preds = L_final.argmax(dim=-1).cpu().tolist()
-        else:
-            logits = eval_norm @ proto.T
-            preds = logits.argmax(dim=-1).cpu().tolist()
+        logits = eval_norm @ proto.T
+        preds = logits.argmax(dim=-1).cpu().tolist()
 
         labels_list = eval_labels.tolist()
 
@@ -216,7 +254,6 @@ class ProtoFuse(BaseTrainer):
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.numpy())
 
-        from utils import compute_metrics
         metrics = compute_metrics(all_labels, all_preds)
         metrics['alpha'] = self.best_alpha
         return metrics
