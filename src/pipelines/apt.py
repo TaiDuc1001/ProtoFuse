@@ -23,6 +23,7 @@ from utils import (
     set_global_seed,
     build_config_namespace,
     get_config_value,
+    load_config_file,
     coerce_to_str,
     coerce_to_int,
     coerce_to_float,
@@ -33,6 +34,7 @@ from utils import (
 )
 
 from src.models.apt import APT, DEFAULT_TRAINING_EPOCHS, DEFAULT_CHECKPOINT_DIR
+from src.models.protofuse import ProtoFuse
 
 
 class APTTrainingPipeline:
@@ -151,6 +153,32 @@ class APTTrainingPipeline:
 
     def _should_log_epoch(self, epoch_idx: int, epochs_total: int) -> bool:
         return (epoch_idx % self.epoch_log_interval == 0) or (epoch_idx == epochs_total)
+
+    def _posthoc_protofuse_cfg(self):
+        return self.config.get('posthoc_protofuse', ConfigNode())
+
+    def _posthoc_protofuse_enabled(self):
+        return bool(self._posthoc_protofuse_cfg().get('enabled', False))
+
+    def _posthoc_protofuse_selector_settings(self):
+        cfg = self._posthoc_protofuse_cfg()
+        proto_cfg = {}
+        config_path = cfg.get('config_path', 'configs/protofuse.yaml')
+        if config_path:
+            try:
+                proto_cfg = load_config_file(config_path)
+            except FileNotFoundError:
+                logger.warning(f"ProtoFuse config not found at {config_path}; using post-hoc defaults.")
+
+        alpha_steps = coerce_to_int(
+            cfg.get('alpha_steps', get_config_value(proto_cfg, 'model.alpha_steps', 101)),
+            101,
+            key='posthoc_protofuse.alpha_steps',
+        )
+        proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
+        centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
+        beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
+        return alpha_steps, beta_values
 
     @property
     def val_dataset(self):
@@ -487,6 +515,8 @@ class APTTrainingPipeline:
 
         if self._try_load_checkpoint():
             # logger.info("Skipping training (loaded from checkpoint)")
+            if self._posthoc_protofuse_enabled():
+                self._run_posthoc_protofuse()
             return
 
         train_subset = Subset(self.dataset, list(self.train_indices))
@@ -499,6 +529,105 @@ class APTTrainingPipeline:
 
         self.trainer_cfg.meta.completed_rounds = 1
         self._save_checkpoint()
+
+        if self._posthoc_protofuse_enabled():
+            self._run_posthoc_protofuse()
+
+    def _run_posthoc_protofuse(self):
+        if self.dataset is None or self.trainer is None:
+            raise RuntimeError("Pipeline not initialized before post-hoc ProtoFuse.")
+        if self.val_loader is None:
+            logger.warning("Skipping post-hoc ProtoFuse because no validation/test loader is available.")
+            return
+
+        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+
+        cfg = self._posthoc_protofuse_cfg()
+        alpha_steps, beta_values = self._posthoc_protofuse_selector_settings()
+
+        logger.info("Applying post-hoc ProtoFuse to frozen APT")
+        self.trainer.clear_posthoc_protofuse()
+        self.trainer.freeze()
+
+        apt_metrics = self.trainer.evaluate(self.val_loader)
+        log_experiment_metrics(apt_metrics, title=self._metrics_title("APT w/o ProtoFuse"))
+        train_features, train_text_features, train_labels = self.trainer.extract_posthoc_features(train_loader)
+
+        text_prototypes = self.trainer.support_text_prototypes(train_text_features, train_labels)
+        selection = ProtoFuse.posthoc_fuse(
+            text_prototypes,
+            train_features,
+            train_labels,
+            device=self.device,
+            alpha_steps=alpha_steps,
+            beta_values=beta_values,
+        )
+        apt_alpha = self.trainer.select_posthoc_alpha(
+            train_features,
+            train_text_features,
+            train_labels,
+            alpha_steps=alpha_steps,
+        )
+        alpha = selection['alpha'] if apt_alpha is None else apt_alpha
+
+        self.trainer.apply_posthoc_protofuse(
+            alpha=alpha,
+            visual_centroids=selection['visual_centroids'],
+            centroid_mask=selection['centroid_mask'],
+            missing_classes=selection['missing_classes'],
+        )
+        metrics = self.trainer.evaluate(self.val_loader)
+        gap_to_apt = metrics.get('accuracy', 0.0) - apt_metrics.get('accuracy', 0.0)
+        logger.info(
+            f"APT ProtoFuse alpha={alpha:.4f} - "
+            f"selector_alpha={selection['alpha']:.4f} - "
+            f"w/o={apt_metrics.get('accuracy', 0.0):.2f}% - "
+            f"w/={metrics.get('accuracy', 0.0):.2f}% - "
+            f"gap={gap_to_apt:+.2f}%"
+        )
+
+        result = dict(metrics)
+        result.update({
+            'epoch': self.global_epoch,
+            'phase': 'posthoc_protofuse',
+            'method': 'APT+ProtoFuse',
+            'alpha': alpha,
+            'train_loss': None,
+            'train_acc': None,
+            'val_loss': metrics.get('loss'),
+            'val_acc': metrics.get('accuracy'),
+            'apt_accuracy': apt_metrics.get('accuracy'),
+            'gap_to_apt': gap_to_apt,
+            'protofuse_alpha': selection['alpha'],
+            'missing_centroid_classes': selection['missing_classes'],
+        })
+
+        if self.base_novel_enabled:
+            base_val_acc = None
+            novel_val_acc = None
+            if self.base_val_loader is not None:
+                base_results = self.trainer.evaluate(self.base_val_loader)
+                base_val_acc = base_results.get('accuracy')
+                result['base_val_acc'] = base_val_acc
+            if self.novel_val_loader is not None:
+                novel_results = self.trainer.evaluate(self.novel_val_loader)
+                novel_val_acc = novel_results.get('accuracy')
+                result['novel_val_acc'] = novel_val_acc
+            if base_val_acc is not None and novel_val_acc is not None and (base_val_acc + novel_val_acc) > 0:
+                result['harmonic_mean'] = 2 * base_val_acc * novel_val_acc / (base_val_acc + novel_val_acc)
+
+        self.metrics.append(result)
+        self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
+
+        if bool(cfg.get('save_prototypes', True)):
+            proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')
+            self.trainer.save_posthoc_protofuse(proto_path)
 
     def _run_epoch(self, epoch_idx, epochs_total, train_loader, run_dir):
         if self.trainer is None:
@@ -703,6 +832,7 @@ class APTTrainingPipeline:
         # logger.info(f"Training completed. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics, title=self._metrics_title())
+        final_method = final_metrics.get('method') if isinstance(final_metrics, dict) else None
+        log_experiment_metrics(final_metrics, title=self._metrics_title(final_method))
 
 BaseTrainingPipeline.register_extra_pipeline(APTTrainingPipeline)

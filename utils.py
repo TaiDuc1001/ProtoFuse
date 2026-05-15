@@ -188,10 +188,13 @@ class CLIPFeatureCache:
         path = self._cache_path(cache_key)
         if self.enabled and os.path.exists(path):
             payload = torch.load(path, map_location="cpu", weights_only=False)
-            logger.info(f"Loaded CLIP feature cache [{dataset_id}] from {path}")
+            logger.info(f"Loaded CLIP feature cache ({dataset_id}) from {path}")
             return payload
 
-        logger.info(f"Computing CLIP feature cache [{dataset_id}]")
+        if self.enabled:
+            logger.info(f"Computing CLIP feature cache ({dataset_id}); cache miss at {path}")
+        else:
+            logger.info(f"Computing CLIP feature cache ({dataset_id}); cache disabled")
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -231,7 +234,7 @@ class CLIPFeatureCache:
             tmp_path = f"{path}.tmp"
             torch.save(payload, tmp_path)
             os.replace(tmp_path, path)
-            # logger.info(f"Saved CLIP feature cache [{dataset_id}] to {path}")
+            logger.info(f"Saved CLIP feature cache ({dataset_id}) to {path}")
         return payload
 
 
@@ -1934,4 +1937,5 @@ class BaseTrainingPipeline:
         logger.info(f"Training completed. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics, title=self._metrics_title())
+        final_method = final_metrics.get('method') if isinstance(final_metrics, dict) else None
+        log_experiment_metrics(final_metrics, title=self._metrics_title(final_method))

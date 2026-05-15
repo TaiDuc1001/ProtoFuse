@@ -64,6 +64,12 @@ class ProtoFuse(BaseTrainer):
 
     def _cfg_float_list(self, default, *paths):
         raw = self._cfg_value(*paths, default=default)
+        return self._coerce_float_list(raw, default)
+
+    @staticmethod
+    def _coerce_float_list(raw, default):
+        if raw is None:
+            return [coerce_to_float(v, 0.0) for v in default]
         if isinstance(raw, str):
             values = [v.strip() for v in raw.split(',') if v.strip()]
         elif isinstance(raw, (list, tuple)):
@@ -71,6 +77,49 @@ class ProtoFuse(BaseTrainer):
         else:
             values = [raw]
         return [coerce_to_float(v, 0.0) for v in values]
+
+    @classmethod
+    def posthoc_fuse(cls, text_prototypes, train_features, train_labels, device, alpha_steps=101, beta_values=None):
+        selector = cls.__new__(cls)
+        selector.device = torch.device(device)
+        selector.alpha_steps = max(2, int(alpha_steps))
+        selector.centroid_mix_beta_values = cls._coerce_float_list(
+            beta_values,
+            [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+        )
+        selector.alphas = torch.linspace(0, 1, selector.alpha_steps, device=selector.device)
+        selector.text_prototypes = F.normalize(text_prototypes.to(selector.device).float(), dim=-1)
+        selector.embed_dim = selector.text_prototypes.shape[-1]
+
+        train_features = F.normalize(train_features.to(selector.device).float(), dim=-1)
+        train_labels = train_labels.to(selector.device).long()
+        num_classes = selector.text_prototypes.shape[0]
+
+        visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
+        fused_prototypes, alpha = selector.hopc_alpha(
+            selector.text_prototypes,
+            visual_centroids,
+            train_features,
+            train_labels,
+            num_classes,
+        )
+
+        centroid_mask = torch.zeros(num_classes, device=selector.device, dtype=torch.bool)
+        valid_labels = train_labels[(train_labels >= 0) & (train_labels < num_classes)]
+        if valid_labels.numel() > 0:
+            centroid_mask[valid_labels.unique()] = True
+        fused_for_inference = fused_prototypes.clone()
+        fused_for_inference[~centroid_mask] = selector.text_prototypes[~centroid_mask]
+
+        return {
+            'fused_prototypes': fused_for_inference,
+            'raw_fused_prototypes': fused_prototypes,
+            'visual_centroids': visual_centroids,
+            'text_prototypes': selector.text_prototypes,
+            'centroid_mask': centroid_mask,
+            'missing_classes': torch.nonzero(~centroid_mask, as_tuple=False).flatten().cpu().tolist(),
+            'alpha': alpha,
+        }
 
     def extract_features(self, dataloader):
         all_features = []
