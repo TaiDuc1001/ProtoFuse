@@ -22,14 +22,14 @@ training:
   class_distribution: false
 
 data:
-  dataset_name: "CUB-200-2011"
+  dataset_name: "DTD"
   kshot: 4
   seed: 1
   num_workers: 4
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]
   clip_std: [0.26862954, 0.26130258, 0.27577711]
-  root: "datasets/cub-200-2011-renamed"
+  root: "datasets/DTD"
   base_novel:
     enabled: false
     split_ratio: 0.5
