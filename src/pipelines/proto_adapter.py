@@ -8,10 +8,12 @@ from utils import (
     log_experiment_metrics,
 )
 
+from src.models.protofuse import ProtoFuse
 from src.models.proto_adapter import ProtoAdapter
+from src.pipelines.posthoc_protofuse import PosthocProtoFuseMixin
 
 
-class ProtoAdapterPipeline(BaseTrainingPipeline):
+class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
     METHOD_NAME = "ProtoAdapter"
     DEFAULT_OUTPUT_DIR = "outputs/proto_adapter"
     DEFAULT_CHECKPOINT_DIR = "checkpoints/proto_adapter"
@@ -86,9 +88,74 @@ class ProtoAdapterPipeline(BaseTrainingPipeline):
         self.best_val_acc = results.get('accuracy', 0.0)
         self.metrics.append(results)
 
+        if self._posthoc_protofuse_enabled():
+            self._run_posthoc_protofuse(
+                train_features,
+                train_labels,
+                val_features if self.val_loader is not None else train_features,
+                val_labels if self.val_loader is not None else train_labels,
+                results,
+            )
+
         # logger.info(f"Proto-Adapter alpha={alpha:.4f}")
         # logger.info(f"Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"MCA: {results.get('mca', 0.0):.2f}%")
+
+    def _run_posthoc_protofuse(self, train_features, train_labels, eval_features, eval_labels, baseline_metrics):
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
+
+        cfg = self._posthoc_protofuse_cfg()
+        alpha_steps, beta_values = self._posthoc_protofuse_selector_settings()
+
+        logger.info("Applying post-hoc ProtoFuse to Proto-Adapter")
+        self.trainer.clear_posthoc_protofuse()
+        selection = ProtoFuse.posthoc_fuse(
+            self.trainer.get_text_prototypes(),
+            train_features,
+            train_labels,
+            device=self.device,
+            alpha_steps=alpha_steps,
+            beta_values=beta_values,
+        )
+        fused_prototypes = self.trainer.apply_posthoc_protofuse(
+            alpha=selection['alpha'],
+            fused_prototypes=selection['fused_prototypes'],
+            visual_centroids=selection['visual_centroids'],
+            centroid_mask=selection['centroid_mask'],
+            missing_classes=selection['missing_classes'],
+        )
+        metrics = self.trainer.evaluate_features(
+            eval_features,
+            eval_labels,
+            text_features=fused_prototypes,
+        )
+        gap_to_proto = metrics.get('accuracy', 0.0) - baseline_metrics.get('accuracy', 0.0)
+        logger.info(
+            f"Proto-Adapter ProtoFuse alpha={selection['alpha']:.4f} - "
+            f"w/o={baseline_metrics.get('accuracy', 0.0):.2f}% - "
+            f"w/={metrics.get('accuracy', 0.0):.2f}% - "
+            f"gap={gap_to_proto:+.2f}%"
+        )
+
+        result = dict(metrics)
+        result.update({
+            'phase': 'posthoc_protofuse',
+            'method': 'ProtoAdapter+ProtoFuse',
+            'alpha': selection['alpha'],
+            'protofuse_alpha': selection['alpha'],
+            'proto_adapter_accuracy': baseline_metrics.get('accuracy'),
+            'gap_to_proto_adapter': gap_to_proto,
+            'missing_centroid_classes': selection['missing_classes'],
+        })
+        result = self._add_base_novel_metrics(result)
+        self.metrics.append(result)
+        self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
+        log_experiment_metrics(result, title=self._metrics_title("ProtoAdapter+ProtoFuse"))
+
+        if bool(cfg.get('save_prototypes', True)):
+            proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')
+            self.trainer.save_posthoc_protofuse(proto_path)
 
     def _finalize(self):
         if self.trainer is None:

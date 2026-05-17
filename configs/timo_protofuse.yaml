@@ -1,0 +1,29 @@
+model:
+  backbone: "ViT-B/16"
+  augment_epoch: 10
+
+posthoc_protofuse:
+  enabled: true
+  config_path: "configs/protofuse.yaml"
+  save_prototypes: true
+
+training:
+  device: "cuda:0"
+  precision: "fp32"
+  batch_size: 128
+
+data:
+  dataset_name: "DTD"
+  kshot: 1
+  seed: 1
+  num_workers: 4
+  clip_mean: [0.48145466, 0.4578275, 0.40821073]
+  clip_std: [0.26862954, 0.26130258, 0.27577711]
+  root: "datasets/DTD"
+
+checkpoint:
+  enabled: true
+  cache_dir: "checkpoints/timo"
+
+logging:
+  output_dir: "outputs/timo"

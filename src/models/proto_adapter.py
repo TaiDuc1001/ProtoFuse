@@ -48,6 +48,11 @@ class ProtoAdapter(BaseTrainer):
 
         self.proto_weights = None
         self.adapter = None
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
         self.model = nn.Module()
         self.initial_model_state = {}
 
@@ -102,9 +107,31 @@ class ProtoAdapter(BaseTrainer):
 
         # logger.info(f'Built Proto-Adapter prototypes: shape={tuple(self.proto_weights.shape)}')
 
-    def _clip_logits(self, image_features):
+    def clear_posthoc_protofuse(self):
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
+
+    def get_text_prototypes(self):
+        return self.text_features.detach().clone()
+
+    def apply_posthoc_protofuse(self, alpha, fused_prototypes, visual_centroids=None, centroid_mask=None, missing_classes=None):
+        self.posthoc_fused_prototypes = F.normalize(fused_prototypes.to(self.device).float(), dim=-1)
+        self.posthoc_visual_centroids = (
+            F.normalize(visual_centroids.to(self.device).float(), dim=-1)
+            if visual_centroids is not None else None
+        )
+        self.posthoc_centroid_mask = centroid_mask.to(self.device).bool() if centroid_mask is not None else None
+        self.posthoc_alpha = alpha
+        self.posthoc_missing_classes = list(missing_classes or [])
+        return self.posthoc_fused_prototypes
+
+    def _clip_logits(self, image_features, text_features=None):
+        text_features = self.text_features if text_features is None else text_features.to(self.device).float()
         logit_scale = self.clip_model.logit_scale.exp()
-        return logit_scale * image_features @ self.text_features.t()
+        return logit_scale * image_features @ text_features.t()
 
     def _proto_logits(self, image_features):
         if self.proto_weights is None:
@@ -113,17 +140,17 @@ class ProtoAdapter(BaseTrainer):
             return self.adapter(image_features)
         return image_features @ self.proto_weights
 
-    def logits_from_features(self, features, alpha=None):
+    def logits_from_features(self, features, alpha=None, text_features=None):
         alpha = self.alpha if alpha is None else alpha
         image_features = F.normalize(features.to(self.device).float(), dim=-1)
-        clip_logits = self._clip_logits(image_features)
+        clip_logits = self._clip_logits(image_features, text_features=text_features)
         proto_logits = self._proto_logits(image_features)
         return clip_logits + alpha * proto_logits
 
-    def evaluate_features(self, features, labels, alpha=None):
+    def evaluate_features(self, features, labels, alpha=None, text_features=None):
         labels_device = labels.to(self.device).long()
         with torch.no_grad():
-            logits = self.logits_from_features(features, alpha=alpha)
+            logits = self.logits_from_features(features, alpha=alpha, text_features=text_features)
             loss = F.cross_entropy(logits, labels_device)
             preds = logits.argmax(dim=-1)
 
@@ -267,6 +294,22 @@ class ProtoAdapter(BaseTrainer):
         }
         torch.save(checkpoint, path)
         # logger.info(f'Proto-Adapter state saved to {path}')
+
+    def save_posthoc_protofuse(self, path):
+        torch.save({
+            'fused_prototypes': self.posthoc_fused_prototypes.detach().cpu()
+            if self.posthoc_fused_prototypes is not None else None,
+            'visual_centroids': self.posthoc_visual_centroids.detach().cpu()
+            if self.posthoc_visual_centroids is not None else None,
+            'centroid_mask': self.posthoc_centroid_mask.detach().cpu()
+            if self.posthoc_centroid_mask is not None else None,
+            'text_prototypes': self.text_features.detach().cpu(),
+            'alpha': self.posthoc_alpha,
+            'missing_classes': self.posthoc_missing_classes,
+            'proto_adapter_alpha': self.alpha,
+            'classnames': self.classnames,
+            'template': self.template,
+        }, path)
 
     def load_model(self, path):
         data = torch.load(path, map_location=self.device)

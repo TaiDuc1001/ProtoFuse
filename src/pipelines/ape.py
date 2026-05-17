@@ -10,9 +10,11 @@ from utils import (
 )
 
 from src.models.ape import APE
+from src.models.protofuse import ProtoFuse
+from src.pipelines.posthoc_protofuse import PosthocProtoFuseMixin
 
 
-class APEPipeline(BaseTrainingPipeline):
+class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
     METHOD_NAME = "APE"
     DEFAULT_OUTPUT_DIR = "outputs/ape"
     DEFAULT_CHECKPOINT_DIR = "checkpoints/ape"
@@ -92,6 +94,9 @@ class APEPipeline(BaseTrainingPipeline):
         # logger.info(f"APE MCA: {results.get('mca', 0.0):.2f}%")
         log_experiment_metrics(results, title=self._metrics_title("APE"))
 
+        if self._posthoc_protofuse_enabled():
+            self._run_posthoc_protofuse(train_features, train_labels, tune_features, tune_labels, test_features, test_labels, results)
+
         finetune_cfg = self.config.get('model', {}).get('finetune', {})
         if bool(finetune_cfg.get('enabled', False)):
             # logger.info("Running APE-T (trainable variant)...")
@@ -104,6 +109,62 @@ class APEPipeline(BaseTrainingPipeline):
             self.metrics.append({'method': 'APE-T', **ape_t_results})
             # logger.info(f"APE-T Accuracy: {ape_t_results.get('accuracy', 0.0):.2f}%")
             log_experiment_metrics(ape_t_results, title=self._metrics_title("APE-T"))
+
+    def _run_posthoc_protofuse(self, train_features, train_labels, tune_features, tune_labels, test_features, test_labels, baseline_metrics):
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
+
+        cfg = self._posthoc_protofuse_cfg()
+        alpha_steps, beta_values = self._posthoc_protofuse_selector_settings()
+
+        logger.info("Applying post-hoc ProtoFuse to APE")
+        self.trainer.clear_posthoc_protofuse()
+        selection = ProtoFuse.posthoc_fuse(
+            self.trainer.get_text_prototypes(),
+            train_features,
+            train_labels,
+            device=self.device,
+            alpha_steps=alpha_steps,
+            beta_values=beta_values,
+        )
+        fused_clip_weights = self.trainer.apply_posthoc_protofuse(
+            alpha=selection['alpha'],
+            fused_prototypes=selection['fused_prototypes'],
+            visual_centroids=selection['visual_centroids'],
+            centroid_mask=selection['centroid_mask'],
+            missing_classes=selection['missing_classes'],
+        )
+        metrics = self.trainer.evaluate_ape(
+            tune_features,
+            tune_labels,
+            test_features,
+            test_labels,
+            clip_weights=fused_clip_weights,
+            criterion_cache_path=None,
+        )
+        gap_to_ape = metrics.get('accuracy', 0.0) - baseline_metrics.get('accuracy', 0.0)
+        logger.info(
+            f"APE ProtoFuse alpha={selection['alpha']:.4f} - "
+            f"w/o={baseline_metrics.get('accuracy', 0.0):.2f}% - "
+            f"w/={metrics.get('accuracy', 0.0):.2f}% - "
+            f"gap={gap_to_ape:+.2f}%"
+        )
+
+        result = {'method': 'APE+ProtoFuse', **metrics}
+        result.update({
+            'phase': 'posthoc_protofuse',
+            'protofuse_alpha': selection['alpha'],
+            'ape_accuracy': baseline_metrics.get('accuracy'),
+            'gap_to_ape': gap_to_ape,
+            'missing_centroid_classes': selection['missing_classes'],
+        })
+        self.metrics.append(result)
+        self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
+        log_experiment_metrics(result, title=self._metrics_title("APE+ProtoFuse"))
+
+        if bool(cfg.get('save_prototypes', True)):
+            proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')
+            self.trainer.save_posthoc_protofuse(proto_path)
 
     def _finalize(self):
         if self.trainer is None:

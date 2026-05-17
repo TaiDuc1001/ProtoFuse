@@ -58,7 +58,7 @@ def _cal_criterion_vectorized(cfg, clip_weights, cache_keys, only_use_txt, train
     feat_dim, cate_num = clip_weights.shape
     text_feat = clip_weights.t().unsqueeze(1)
 
-    if os.path.exists(cache_path):
+    if cache_path is not None and os.path.exists(cache_path):
         # logger.info("Loading APE criterion from cache...")
         sim = torch.load(cache_path, weights_only=False)
         if sim.device != clip_weights.device:
@@ -70,7 +70,8 @@ def _cal_criterion_vectorized(cfg, clip_weights, cache_keys, only_use_txt, train
         sim = S * S - (feats * feats).sum(dim=0)
         count = cate_num * (cate_num - 1)
         sim = sim / count
-        torch.save(sim.cpu(), cache_path)
+        if cache_path is not None:
+            torch.save(sim.cpu(), cache_path)
     else:
         # logger.info("Computing APE criterion (text+image, vectorized)...")
         shots = cfg.get('shots', 1)
@@ -82,7 +83,8 @@ def _cal_criterion_vectorized(cfg, clip_weights, cache_keys, only_use_txt, train
         sim = S * S - (S_i * S_i).sum(dim=0)
         count = cate_num * (cate_num - 1) * samp_num * samp_num
         sim = sim / count
-        torch.save(sim.cpu(), cache_path)
+        if cache_path is not None:
+            torch.save(sim.cpu(), cache_path)
 
     w = cfg.get('w', cfg.get('w_training_free', [0.5, 0.5]))
     criterion = (-1) * w[0] * sim + w[1] * torch.var(clip_weights, dim=1)
@@ -150,6 +152,12 @@ class APE(BaseTrainer):
         self.cache_keys = None
         self.cache_values = None
         self.ape_adapter = None
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
+        self.last_ape_params = None
         self.model = nn.Module()
         self.initial_model_state = {}
 
@@ -200,6 +208,27 @@ class APE(BaseTrainer):
         self.cache_keys = cache_keys.to(self.device)
         self.cache_values = cache_values.to(self.device)
 
+    def clear_posthoc_protofuse(self):
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
+
+    def get_text_prototypes(self):
+        return self.clip_weights.t().detach().clone()
+
+    def apply_posthoc_protofuse(self, alpha, fused_prototypes, visual_centroids=None, centroid_mask=None, missing_classes=None):
+        self.posthoc_fused_prototypes = F.normalize(fused_prototypes.to(self.device).float(), dim=-1)
+        self.posthoc_visual_centroids = (
+            F.normalize(visual_centroids.to(self.device).float(), dim=-1)
+            if visual_centroids is not None else None
+        )
+        self.posthoc_centroid_mask = centroid_mask.to(self.device).bool() if centroid_mask is not None else None
+        self.posthoc_alpha = alpha
+        self.posthoc_missing_classes = list(missing_classes or [])
+        return self.posthoc_fused_prototypes.t().contiguous()
+
     def _get_criterion_cache_path(self, only_use_txt):
         suffix = 'txt' if only_use_txt else 'txtimg'
         backbone_safe = self._cfg_str('ViT-B/16', 'model.backbone').replace('/', '')
@@ -215,8 +244,8 @@ class APE(BaseTrainer):
             'training_feat_num': self.training_feat_num,
         }
 
-    def evaluate_ape(self, val_features, val_labels, test_features, test_labels):
-        clip_weights = self.clip_weights
+    def evaluate_ape(self, val_features, val_labels, test_features, test_labels, clip_weights=None, criterion_cache_path="default"):
+        clip_weights = self.clip_weights if clip_weights is None else clip_weights.to(self.device).float()
         cache_keys = self.cache_keys
         cache_values = self.cache_values
         feat_dim, cate_num = clip_weights.shape
@@ -227,7 +256,10 @@ class APE(BaseTrainer):
         flat_values = reshaped_values.reshape(-1, cate_num)
 
         cfg_dict = self._build_cfg_dict('training_free')
-        cache_path = self._get_criterion_cache_path(only_use_txt=False)
+        cache_path = (
+            self._get_criterion_cache_path(only_use_txt=False)
+            if criterion_cache_path == "default" else criterion_cache_path
+        )
         indices = _cal_criterion_vectorized(cfg_dict, clip_weights, flat_keys, only_use_txt=False,
                                             training_free=True, cache_path=cache_path)
 
@@ -285,6 +317,12 @@ class APE(BaseTrainer):
         metrics['alpha'] = best_alpha
         metrics['beta'] = best_beta
         metrics['gamma'] = best_gamma
+        self.last_ape_params = {
+            'alpha': best_alpha,
+            'beta': best_beta,
+            'gamma': best_gamma,
+            'val_acc': best_acc,
+        }
         # logger.info(f"APE test accuracy: {metrics.get('accuracy', 0.0):.2f}%")
         return metrics
 
@@ -440,6 +478,22 @@ class APE(BaseTrainer):
             'cfg': self.cfg,
         }, path)
         # logger.info(f"APE state saved to {path}")
+
+    def save_posthoc_protofuse(self, path):
+        torch.save({
+            'fused_prototypes': self.posthoc_fused_prototypes.detach().cpu()
+            if self.posthoc_fused_prototypes is not None else None,
+            'visual_centroids': self.posthoc_visual_centroids.detach().cpu()
+            if self.posthoc_visual_centroids is not None else None,
+            'centroid_mask': self.posthoc_centroid_mask.detach().cpu()
+            if self.posthoc_centroid_mask is not None else None,
+            'text_prototypes': self.clip_weights.t().detach().cpu(),
+            'alpha': self.posthoc_alpha,
+            'missing_classes': self.posthoc_missing_classes,
+            'ape_params': self.last_ape_params,
+            'classnames': self.classnames,
+            'shots': self.shots,
+        }, path)
 
     def load_model(self, path):
         data = torch.load(path, map_location=self.device, weights_only=False)

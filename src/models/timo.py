@@ -143,6 +143,12 @@ class TIMO(BaseTrainer):
 
         self.train_vecs = None
         self.train_labels = None
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
+        self.last_timo_params = None
         self.model = nn.Module()
         self.initial_model_state = {}
 
@@ -180,13 +186,43 @@ class TIMO(BaseTrainer):
                 all_labels.append(labels)
         return torch.cat(all_feats, dim=0), torch.cat(all_labels, dim=0)
 
+    def clear_posthoc_protofuse(self):
+        self.posthoc_fused_prototypes = None
+        self.posthoc_visual_centroids = None
+        self.posthoc_centroid_mask = None
+        self.posthoc_alpha = None
+        self.posthoc_missing_classes = []
+
+    def get_text_prototypes(self):
+        return self.clip_weights.t().detach().clone()
+
+    def apply_posthoc_protofuse(self, alpha, fused_prototypes, visual_centroids=None, centroid_mask=None, missing_classes=None):
+        self.posthoc_fused_prototypes = F.normalize(fused_prototypes.to(self.device).float(), dim=-1)
+        self.posthoc_visual_centroids = (
+            F.normalize(visual_centroids.to(self.device).float(), dim=-1)
+            if visual_centroids is not None else None
+        )
+        self.posthoc_centroid_mask = centroid_mask.to(self.device).bool() if centroid_mask is not None else None
+        self.posthoc_alpha = alpha
+        self.posthoc_missing_classes = list(missing_classes or [])
+        return self.posthoc_fused_prototypes.t().contiguous(), self.posthoc_fused_prototypes.unsqueeze(1)
+
     def evaluate_timo(self, val_features, val_labels, test_features, test_labels):
         return self.evaluate_timo_variant(val_features, val_labels, test_features, test_labels, variant="TIMO")
 
     def evaluate_timos(self, val_features, val_labels, test_features, test_labels):
         return self.evaluate_timo_variant(val_features, val_labels, test_features, test_labels, variant="TIMOS")
 
-    def evaluate_timo_variant(self, val_features, val_labels, test_features, test_labels, variant="TIMO"):
+    def evaluate_timo_variant(
+        self,
+        val_features,
+        val_labels,
+        test_features,
+        test_labels,
+        variant="TIMO",
+        clip_weights=None,
+        text_features_all=None,
+    ):
         if self.train_vecs is None:
             raise RuntimeError("Call extract_train_features before evaluate_timo.")
 
@@ -195,6 +231,7 @@ class TIMO(BaseTrainer):
         val_features_dev = val_features.float().to(self.device)
         val_labels_dev = val_labels.long().to(self.device)
         test_features_dev = test_features.float().to(self.device)
+        clip_weights_base = self.clip_weights if clip_weights is None else clip_weights.to(self.device).float()
 
         image_weights = torch.stack([
             train_vecs[train_labels == class_idx].mean(dim=0)
@@ -203,7 +240,9 @@ class TIMO(BaseTrainer):
         image_weights = F.normalize(image_weights, dim=-1)
 
         dataset_name = self.cfg.get('data', ConfigNode()).get('dataset_name', 'ImageNet')
-        text_features_all = self.text_features_all.float().to(self.device)
+        if text_features_all is None:
+            text_features_all = self.text_features_all if clip_weights is None else clip_weights_base.t().unsqueeze(1)
+        text_features_all = text_features_all.float().to(self.device)
         if variant.upper() == "TIMOS":
             clip_weights_igt, matching_score = _image_guide_text_search(
                 dataset_name, text_features_all, val_features_dev, val_labels_dev, image_weights
@@ -266,6 +305,11 @@ class TIMO(BaseTrainer):
         metrics['alpha'] = best_alpha
         metrics['beta'] = best_beta
         metrics['val_acc'] = best_val_acc
+        self.last_timo_params = {
+            'alpha': best_alpha,
+            'beta': best_beta,
+            'val_acc': best_val_acc,
+        }
         # logger.info(f"{method_name} test accuracy: {metrics.get('accuracy', 0.0):.2f}%")
         return metrics
 
@@ -285,6 +329,22 @@ class TIMO(BaseTrainer):
             'shots': self.shots,
         }, path)
         # logger.info(f"TIMO state saved to {path}")
+
+    def save_posthoc_protofuse(self, path):
+        torch.save({
+            'fused_prototypes': self.posthoc_fused_prototypes.detach().cpu()
+            if self.posthoc_fused_prototypes is not None else None,
+            'visual_centroids': self.posthoc_visual_centroids.detach().cpu()
+            if self.posthoc_visual_centroids is not None else None,
+            'centroid_mask': self.posthoc_centroid_mask.detach().cpu()
+            if self.posthoc_centroid_mask is not None else None,
+            'text_prototypes': self.clip_weights.t().detach().cpu(),
+            'alpha': self.posthoc_alpha,
+            'missing_classes': self.posthoc_missing_classes,
+            'timo_params': self.last_timo_params,
+            'classnames': self.classnames,
+            'shots': self.shots,
+        }, path)
 
     def load_model(self, path):
         data = torch.load(path, map_location=self.device, weights_only=False)

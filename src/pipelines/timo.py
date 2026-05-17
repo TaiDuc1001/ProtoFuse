@@ -8,10 +8,12 @@ from utils import (
     log_experiment_metrics,
 )
 
+from src.models.protofuse import ProtoFuse
 from src.models.timo import TIMO
+from src.pipelines.posthoc_protofuse import PosthocProtoFuseMixin
 
 
-class TIMOPipeline(BaseTrainingPipeline):
+class TIMOPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
     METHOD_NAME = "TIMO"
     DEFAULT_OUTPUT_DIR = "outputs/timo"
     DEFAULT_CHECKPOINT_DIR = "checkpoints/timo"
@@ -63,6 +65,67 @@ class TIMOPipeline(BaseTrainingPipeline):
         # logger.info(f"{self.METHOD_NAME} Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"{self.METHOD_NAME} MCA: {results.get('mca', 0.0):.2f}%")
         log_experiment_metrics(results, title=self._metrics_title(self.METHOD_NAME))
+
+        if self._posthoc_protofuse_enabled():
+            self._run_posthoc_protofuse(train_features, train_labels, tune_features, tune_labels, test_features, test_labels, results)
+
+    def _run_posthoc_protofuse(self, train_features, train_labels, tune_features, tune_labels, test_features, test_labels, baseline_metrics):
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
+
+        cfg = self._posthoc_protofuse_cfg()
+        alpha_steps, beta_values = self._posthoc_protofuse_selector_settings()
+
+        logger.info(f"Applying post-hoc ProtoFuse to {self.METHOD_NAME}")
+        self.trainer.clear_posthoc_protofuse()
+        selection = ProtoFuse.posthoc_fuse(
+            self.trainer.get_text_prototypes(),
+            train_features,
+            train_labels,
+            device=self.device,
+            alpha_steps=alpha_steps,
+            beta_values=beta_values,
+        )
+        fused_clip_weights, fused_text_features_all = self.trainer.apply_posthoc_protofuse(
+            alpha=selection['alpha'],
+            fused_prototypes=selection['fused_prototypes'],
+            visual_centroids=selection['visual_centroids'],
+            centroid_mask=selection['centroid_mask'],
+            missing_classes=selection['missing_classes'],
+        )
+        metrics = self.trainer.evaluate_timo_variant(
+            tune_features,
+            tune_labels,
+            test_features,
+            test_labels,
+            variant=self.VARIANT,
+            clip_weights=fused_clip_weights,
+            text_features_all=fused_text_features_all,
+        )
+        gap_to_timo = metrics.get('accuracy', 0.0) - baseline_metrics.get('accuracy', 0.0)
+        logger.info(
+            f"{self.METHOD_NAME} ProtoFuse alpha={selection['alpha']:.4f} - "
+            f"w/o={baseline_metrics.get('accuracy', 0.0):.2f}% - "
+            f"w/={metrics.get('accuracy', 0.0):.2f}% - "
+            f"gap={gap_to_timo:+.2f}%"
+        )
+
+        result = dict(metrics)
+        result.update({
+            'phase': 'posthoc_protofuse',
+            'method': f'{self.METHOD_NAME}+ProtoFuse',
+            'protofuse_alpha': selection['alpha'],
+            'timo_accuracy': baseline_metrics.get('accuracy'),
+            'gap_to_timo': gap_to_timo,
+            'missing_centroid_classes': selection['missing_classes'],
+        })
+        self.metrics.append(result)
+        self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
+        log_experiment_metrics(result, title=self._metrics_title(f"{self.METHOD_NAME}+ProtoFuse"))
+
+        if bool(cfg.get('save_prototypes', True)):
+            proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')
+            self.trainer.save_posthoc_protofuse(proto_path)
 
     def _finalize(self):
         if self.trainer is None:
