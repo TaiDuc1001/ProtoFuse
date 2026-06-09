@@ -7,6 +7,30 @@ from utils import (
 )
 
 
+def coerce_protofuse_bool(raw, default=False):
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if value in {'0', 'false', 'no', 'n', 'off'}:
+            return False
+        return bool(default)
+    return bool(raw)
+
+
+def resolve_force_loo_accuracy(cfg, proto_cfg):
+    proto_default = get_config_value(
+        proto_cfg,
+        'model.force_loo_accuracy',
+        get_config_value(proto_cfg, 'force_loo_accuracy', False),
+    )
+    return coerce_protofuse_bool(cfg.get('force_loo_accuracy', proto_default), False)
+
+
 class PosthocProtoFuseMixin:
     def _posthoc_protofuse_cfg(self):
         return self.config.get('posthoc_protofuse', ConfigNode())
@@ -32,4 +56,5 @@ class PosthocProtoFuseMixin:
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        return alpha_steps, beta_values
+        force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
+        return alpha_steps, beta_values, force_loo_accuracy

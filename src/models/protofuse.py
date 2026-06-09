@@ -19,6 +19,7 @@ class ProtoFuse(BaseTrainer):
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
+        self.force_loo_accuracy = self._cfg_bool(False, 'model.force_loo_accuracy', 'force_loo_accuracy')
         self.centroid_mix_beta_values = self._cfg_float_list(
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
             'model.centroid_mix.beta_values',
@@ -66,6 +67,25 @@ class ProtoFuse(BaseTrainer):
         raw = self._cfg_value(*paths, default=default)
         return self._coerce_float_list(raw, default)
 
+    def _cfg_bool(self, default, *paths):
+        raw = self._cfg_value(*paths, default=default)
+        return self._coerce_bool(raw, default)
+
+    @staticmethod
+    def _coerce_bool(raw, default=False):
+        if raw is None:
+            return bool(default)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            value = raw.strip().lower()
+            if value in {'1', 'true', 'yes', 'y', 'on'}:
+                return True
+            if value in {'0', 'false', 'no', 'n', 'off'}:
+                return False
+            return bool(default)
+        return bool(raw)
+
     @staticmethod
     def _coerce_float_list(raw, default):
         if raw is None:
@@ -79,10 +99,20 @@ class ProtoFuse(BaseTrainer):
         return [coerce_to_float(v, 0.0) for v in values]
 
     @classmethod
-    def posthoc_fuse(cls, text_prototypes, train_features, train_labels, device, alpha_steps=101, beta_values=None):
+    def posthoc_fuse(
+        cls,
+        text_prototypes,
+        train_features,
+        train_labels,
+        device,
+        alpha_steps=101,
+        beta_values=None,
+        force_loo_accuracy=False,
+    ):
         selector = cls.__new__(cls)
         selector.device = torch.device(device)
         selector.alpha_steps = max(2, int(alpha_steps))
+        selector.force_loo_accuracy = cls._coerce_bool(force_loo_accuracy, False)
         selector.centroid_mix_beta_values = cls._coerce_float_list(
             beta_values,
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
@@ -182,17 +212,23 @@ class ProtoFuse(BaseTrainer):
     def _centroid_mix_net_curve(self, T, V_all, neighbors, beta, num_classes):
         labels = torch.arange(num_classes, device=self.device)
         pseudo_features = F.normalize((1.0 - beta) * V_all + beta * V_all[neighbors], dim=-1)
-        text_preds = (pseudo_features @ T.T).argmax(dim=-1)
-        text_correct = text_preds.eq(labels)
+        if getattr(self, 'force_loo_accuracy', False):
+            text_correct = None
+        else:
+            text_preds = (pseudo_features @ T.T).argmax(dim=-1)
+            text_correct = text_preds.eq(labels)
 
         net_scores = []
         for alpha in self.alphas:
             proto = F.normalize((1.0 - alpha) * T + alpha * V_all, dim=-1)
             fused_preds = (pseudo_features @ proto.T).argmax(dim=-1)
             fused_correct = fused_preds.eq(labels)
-            rescue = (~text_correct) & fused_correct
-            damage = text_correct & ~fused_correct
-            net_scores.append(rescue.sum().float() - damage.sum().float())
+            if getattr(self, 'force_loo_accuracy', False):
+                net_scores.append(fused_correct.sum().float())
+            else:
+                rescue = (~text_correct) & fused_correct
+                damage = text_correct & ~fused_correct
+                net_scores.append(rescue.sum().float() - damage.sum().float())
         return torch.stack(net_scores)
 
     def _centroid_mix_alpha(self, T, V_all, num_classes):
@@ -247,9 +283,6 @@ class ProtoFuse(BaseTrainer):
                     for c in range(num_classes)
                 ])
 
-                text_preds = (held @ T.T).argmax(dim=-1)
-                text_correct = text_preds.eq(targets)
-
                 refined = F.normalize(
                     (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_minus,
                     dim=-1
@@ -257,9 +290,14 @@ class ProtoFuse(BaseTrainer):
                 fused_preds = torch.einsum("cd,akd->ack", held, refined).argmax(dim=-1)
                 fused_correct = fused_preds.eq(targets.view(1, -1))
 
-                rescue = (~text_correct).view(1, -1) & fused_correct
-                damage = text_correct.view(1, -1) & ~fused_correct
-                net_scores += rescue.sum(dim=1).float() - damage.sum(dim=1).float()
+                if getattr(self, 'force_loo_accuracy', False):
+                    net_scores += fused_correct.sum(dim=1).float()
+                else:
+                    text_preds = (held @ T.T).argmax(dim=-1)
+                    text_correct = text_preds.eq(targets)
+                    rescue = (~text_correct).view(1, -1) & fused_correct
+                    damage = text_correct.view(1, -1) & ~fused_correct
+                    net_scores += rescue.sum(dim=1).float() - damage.sum(dim=1).float()
 
             best_alpha = self.alphas[net_scores.argmax()].item()
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)

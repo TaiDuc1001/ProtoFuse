@@ -63,10 +63,11 @@ def alpha_grid(steps, device):
     return torch.linspace(0.0, 1.0, max(2, int(steps)), device=device)
 
 
-def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values):
+def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy=True):
     selector = ProtoFuse.__new__(ProtoFuse)
     selector.device = torch.device(device)
     selector.alpha_steps = max(2, int(alpha_steps))
+    selector.force_loo_accuracy = ProtoFuse._coerce_bool(force_loo_accuracy, True)
     selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, DEFAULT_BETAS)
     selector.alphas = alpha_grid(alpha_steps, selector.device)
     selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
@@ -94,9 +95,19 @@ def calibrated_alpha(selector, text, visual, support_features, support_labels, n
     return float(alpha)
 
 
-def evaluate_run(text_features, support_features, support_labels, eval_features, eval_labels, device, alpha_steps, beta_values):
+def evaluate_run(
+    text_features,
+    support_features,
+    support_labels,
+    eval_features,
+    eval_labels,
+    device,
+    alpha_steps,
+    beta_values,
+    force_loo_accuracy=True,
+):
     selector, text, visual, support_features, support_labels = build_selector(
-        text_features, support_features, support_labels, device, alpha_steps, beta_values
+        text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy
     )
     num_classes = text.shape[0]
     alpha = calibrated_alpha(selector, text, visual, support_features, support_labels, num_classes)
@@ -105,7 +116,7 @@ def evaluate_run(text_features, support_features, support_labels, eval_features,
         ("Visual centroid only", visual),
         ("Unnormalized text-visual fusion", fused_proto(text, visual, 0.5, normalize=False)),
         ("Normalized text-visual fusion, fixed alpha=0.5", fused_proto(text, visual, 0.5, normalize=True)),
-        ("Normalized text-visual fusion, calibrated alpha (ours)", fused_proto(text, visual, alpha, normalize=True)),
+        ("Normalized text-visual fusion, force LOO accuracy alpha (ours)", fused_proto(text, visual, alpha, normalize=True)),
     ]
     text_acc = accuracy_for_proto(text, eval_features, eval_labels, device)
     rows = []
@@ -169,6 +180,7 @@ def main():
     seeds = parse_int_list(args.seeds)
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = parse_float_list(args.betas, get_config_value(config, "model.centroid_mix.beta_values", DEFAULT_BETAS))
+    force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", True), True)
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
@@ -180,7 +192,7 @@ def main():
     classnames = list(train_dataset.classes)
     console.print(
         f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
-        f"kshots={kshots}, seeds={seeds}, device={device}"
+        f"kshots={kshots}, seeds={seeds}, force_loo_accuracy={force_loo_accuracy}, device={device}"
     )
 
     model = load_model(config, device)
@@ -224,6 +236,7 @@ def main():
                     device,
                     alpha_steps,
                     beta_values,
+                    force_loo_accuracy,
                 )
                 for row in rows:
                     raw.append({"dataset": dataset_name, "kshot": int(kshot), "seed": int(seed), **row})
@@ -274,6 +287,7 @@ def main():
                     "kshots": kshots,
                     "seeds": seeds,
                     "beta_values": beta_values,
+                    "force_loo_accuracy": force_loo_accuracy,
                     "raw": raw,
                     "aggregate": aggregate,
                 },

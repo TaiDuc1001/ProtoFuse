@@ -127,6 +127,8 @@ CUSTOM_TEMPLATES = {
     "StanfordDogs": "a photo of a {}, a type of dog.",
     "Flowers102": "a photo of a {}, a type of flower.",
     "FGVCAircraft": "a photo of a {}, a type of aircraft.",
+    "FGVC-Aircraft": "a photo of a {}, a type of aircraft.",
+    "FGVC Aircraft": "a photo of a {}, a type of aircraft.",
     "DTD": "{} texture.",
     "DescribableTextures": "{} texture.",
     "EuroSAT": "a centered satellite photo of {}.",
@@ -573,7 +575,14 @@ class APT:
             weights = similarities / sim_sum
         return F.normalize((weights.unsqueeze(-1) * class_features).sum(dim=0), dim=-1)
 
-    def select_posthoc_alpha(self, train_features, train_text_features, train_labels, alpha_steps=101):
+    def select_posthoc_alpha(
+        self,
+        train_features,
+        train_text_features,
+        train_labels,
+        alpha_steps=101,
+        force_loo_accuracy=False,
+    ):
         if self.text_prototypes is None:
             raise RuntimeError("Call support_text_prototypes before selecting APT post-hoc alpha.")
 
@@ -615,8 +624,11 @@ class APT:
                 visual_minus.append(self._weighted_centroid_from_features(class_features, self.text_prototypes[class_idx]))
             visual_minus = torch.stack(visual_minus, dim=0)
 
-            baseline_logits = torch.einsum("cd,ckd->ck", held_images, held_text)
-            baseline_correct = baseline_logits.argmax(dim=-1).eq(targets)
+            if force_loo_accuracy:
+                baseline_correct = None
+            else:
+                baseline_logits = torch.einsum("cd,ckd->ck", held_images, held_text)
+                baseline_correct = baseline_logits.argmax(dim=-1).eq(targets)
 
             for alpha_idx, alpha in enumerate(alphas):
                 fused_text = F.normalize(
@@ -624,9 +636,12 @@ class APT:
                     dim=-1,
                 )
                 fused_correct = torch.einsum("cd,ckd->ck", held_images, fused_text).argmax(dim=-1).eq(targets)
-                rescue = (~baseline_correct) & fused_correct
-                damage = baseline_correct & ~fused_correct
-                net_scores[alpha_idx] += rescue.sum().float() - damage.sum().float()
+                if force_loo_accuracy:
+                    net_scores[alpha_idx] += fused_correct.sum().float()
+                else:
+                    rescue = (~baseline_correct) & fused_correct
+                    damage = baseline_correct & ~fused_correct
+                    net_scores[alpha_idx] += rescue.sum().float() - damage.sum().float()
 
         return alphas[int(net_scores.argmax().item())].item()
 

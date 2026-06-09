@@ -163,6 +163,7 @@ def main():
     kshot = args.kshot if args.kshot is not None else config_get(config, "data", "kshot", -1)
     seed = args.seed if args.seed is not None else config_get(config, "data", "seed", 42)
     alpha_steps = config_get(config, "model", "alpha_steps", 101)
+    force_loo_accuracy = ProtoFuse._coerce_bool(config_get(config, "model", "force_loo_accuracy", False), False)
     centroid_mix = config_get(config, "model", "centroid_mix", {})
     beta_values = centroid_mix.get("beta_values") if isinstance(centroid_mix, dict) else None
 
@@ -207,6 +208,7 @@ def main():
         device,
         alpha_steps=alpha_steps,
         beta_values=beta_values,
+        force_loo_accuracy=force_loo_accuracy,
     )
     fused_prototypes = fused["fused_prototypes"].to(device)
     protofuse_cosine = (image_feature @ fused_prototypes[label].unsqueeze(0).T).item()

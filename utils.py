@@ -1786,7 +1786,7 @@ class BaseTrainingPipeline:
     def _metrics_title(self, method_name=None):
         method = method_name or self.METHOD_NAME
         dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
-        return f"{method} x {dataset} x {self.kshot}-shot x seed {self.seed}"
+        return f"{method} x {dataset}"
 
     def _initialize_trainer(self):
         if not self.classnames:

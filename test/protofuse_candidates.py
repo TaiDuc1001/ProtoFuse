@@ -238,6 +238,7 @@ def evaluate_protofuse(
     device,
     alpha_steps,
     beta_values,
+    force_loo_accuracy,
     infer_warmup,
     infer_iters,
 ):
@@ -248,6 +249,7 @@ def evaluate_protofuse(
         device,
         alpha_steps=alpha_steps,
         beta_values=beta_values,
+        force_loo_accuracy=force_loo_accuracy,
     )
     fused = selection["fused_prototypes"]
     logits = eval_features.to(device).float() @ fused.t()
@@ -312,6 +314,7 @@ def main():
         get_config_value(config, "model.centroid_mix.beta_values", None),
         [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
     )
+    force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", False), False)
 
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
@@ -387,6 +390,7 @@ def main():
                         device,
                         alpha_steps,
                         beta_values,
+                        force_loo_accuracy,
                         args.infer_warmup,
                         args.infer_iters,
                     )

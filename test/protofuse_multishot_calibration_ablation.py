@@ -62,10 +62,11 @@ def alpha_grid(steps, device):
     return torch.linspace(0.0, 1.0, max(2, int(steps)), device=device)
 
 
-def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values):
+def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy=True):
     selector = ProtoFuse.__new__(ProtoFuse)
     selector.device = torch.device(device)
     selector.alpha_steps = max(2, int(alpha_steps))
+    selector.force_loo_accuracy = ProtoFuse._coerce_bool(force_loo_accuracy, True)
     selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, [])
     selector.alphas = alpha_grid(alpha_steps, selector.device)
     selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
@@ -144,9 +145,20 @@ def select_from_curve(alphas, curve):
     return float(alphas[idx].item())
 
 
-def evaluate_run(text_features, support_features, support_labels, eval_features, eval_labels, device, alpha_steps, beta_values, kshot):
+def evaluate_run(
+    text_features,
+    support_features,
+    support_labels,
+    eval_features,
+    eval_labels,
+    device,
+    alpha_steps,
+    beta_values,
+    kshot,
+    force_loo_accuracy=True,
+):
     selector, text, visual, support_features, support_labels = build_selector(
-        text_features, support_features, support_labels, device, alpha_steps, beta_values
+        text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy
     )
     alphas = selector.alphas
     curves = loo_curves(selector, text, support_features, support_labels, kshot)
@@ -156,9 +168,7 @@ def evaluate_run(text_features, support_features, support_labels, eval_features,
         ("Text only (alpha=0)", 0.0),
         ("Visual only (alpha=1)", 1.0),
         *[(f"Fixed alpha={alpha:.2f}", alpha) for alpha in FIXED_ALPHAS],
-        ("LOO accuracy selection", select_from_curve(alphas, curves["accuracy_count"])),
-        ("LOO correction only", select_from_curve(alphas, curves["rescue"])),
-        ("LOO correction-regression (ours)", select_from_curve(alphas, curves["net"])),
+        ("LOO force accuracy (ours)", select_from_curve(alphas, curves["accuracy_count"])),
         ("Oracle alpha on test", oracle["alpha"]),
     ]
 
@@ -233,6 +243,7 @@ def main():
     seeds = parse_int_list(args.seeds)
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = get_config_value(config, "model.centroid_mix.beta_values", None)
+    force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", True), True)
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
@@ -244,7 +255,7 @@ def main():
     classnames = list(train_dataset.classes)
     console.print(
         f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
-        f"kshots={kshots}, seeds={seeds}, device={device}"
+        f"kshots={kshots}, seeds={seeds}, force_loo_accuracy={force_loo_accuracy}, device={device}"
     )
 
     model = load_model(config, device)
@@ -290,6 +301,7 @@ def main():
                     alpha_steps,
                     beta_values,
                     kshot,
+                    force_loo_accuracy,
                 )
                 for row in rows:
                     raw.append({"dataset": dataset_name, "kshot": int(kshot), "seed": int(seed), **row})
@@ -338,6 +350,7 @@ def main():
                     "dataset_root": str(dataset_root),
                     "kshots": kshots,
                     "seeds": seeds,
+                    "force_loo_accuracy": force_loo_accuracy,
                     "raw": raw,
                     "aggregate": aggregate,
                 },

@@ -68,10 +68,11 @@ def alpha_grid(steps, device):
     return torch.linspace(0.0, 1.0, max(2, int(steps)), device=device)
 
 
-def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values):
+def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy=True):
     selector = ProtoFuse.__new__(ProtoFuse)
     selector.device = torch.device(device)
     selector.alpha_steps = max(2, int(alpha_steps))
+    selector.force_loo_accuracy = ProtoFuse._coerce_bool(force_loo_accuracy, True)
     selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, DEFAULT_BETAS)
     selector.alphas = alpha_grid(alpha_steps, selector.device)
     selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
@@ -126,18 +127,21 @@ def centroid_mix_neighbors(text, visual, mode):
     return similarity.argmax(dim=1)
 
 
-def centroid_mix_net_curve(alphas, text, visual, neighbors, beta, device):
+def centroid_mix_net_curve(alphas, text, visual, neighbors, beta, device, force_loo_accuracy=True):
     num_classes = text.shape[0]
     labels = torch.arange(num_classes, device=device)
     pseudo = F.normalize((1.0 - beta) * visual + beta * visual[neighbors], dim=-1)
-    text_correct = (pseudo @ text.T).argmax(dim=-1).eq(labels)
+    text_correct = None if force_loo_accuracy else (pseudo @ text.T).argmax(dim=-1).eq(labels)
     scores = []
     for alpha in alphas:
         proto = F.normalize((1.0 - alpha) * text + alpha * visual, dim=-1)
         fused_correct = (pseudo @ proto.T).argmax(dim=-1).eq(labels)
-        rescue = ((~text_correct) & fused_correct).sum().float()
-        damage = (text_correct & ~fused_correct).sum().float()
-        scores.append(rescue - damage)
+        if force_loo_accuracy:
+            scores.append(fused_correct.sum().float())
+        else:
+            rescue = ((~text_correct) & fused_correct).sum().float()
+            damage = (text_correct & ~fused_correct).sum().float()
+            scores.append(rescue - damage)
     return torch.stack(scores)
 
 
@@ -152,7 +156,15 @@ def candidate_curves(selector, text, visual, modes, beta_values):
     for mode in modes:
         neighbors = centroid_mix_neighbors(text, visual, mode)
         for beta in beta_values:
-            curve = centroid_mix_net_curve(selector.alphas, text, visual, neighbors, beta, selector.device)
+            curve = centroid_mix_net_curve(
+                selector.alphas,
+                text,
+                visual,
+                neighbors,
+                beta,
+                selector.device,
+                force_loo_accuracy=getattr(selector, "force_loo_accuracy", True),
+            )
             knee_idx, knee_strength, signal_span = curve_knee(curve, selector.device)
             max_idx = int(curve.argmax().item())
             rows.append(
@@ -188,8 +200,20 @@ def select_all_argmax(selector, curves):
     return float(selector.alphas[best["max_idx"]].item())
 
 
-def evaluate_run(text_features, support_features, support_labels, eval_features, eval_labels, device, alpha_steps, beta_values):
-    selector, text, visual = build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values)
+def evaluate_run(
+    text_features,
+    support_features,
+    support_labels,
+    eval_features,
+    eval_labels,
+    device,
+    alpha_steps,
+    beta_values,
+    force_loo_accuracy=True,
+):
+    selector, text, visual = build_selector(
+        text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy
+    )
     all_curves = candidate_curves(selector, text, visual, ["vv", "tt", "hybrid"], selector.centroid_mix_beta_values)
     oracle = oracle_alpha(text, visual, eval_features, eval_labels, selector.alphas, device)
 
@@ -270,6 +294,7 @@ def main():
     seeds = parse_int_list(args.seeds)
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = parse_float_list(args.betas, get_config_value(config, "model.centroid_mix.beta_values", DEFAULT_BETAS))
+    force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", True), True)
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
@@ -279,7 +304,10 @@ def main():
     set_global_seed(1)
     train_dataset, eval_dataset, val_fraction, dataset_root = load_datasets(config)
     classnames = list(train_dataset.classes)
-    console.print(f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, seeds={seeds}, device={device}")
+    console.print(
+        f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
+        f"seeds={seeds}, force_loo_accuracy={force_loo_accuracy}, device={device}"
+    )
 
     model = load_model(config, device)
     train_features_all, train_labels_all = extract_image_features(model, train_dataset, device, batch_size, num_workers)
@@ -320,6 +348,7 @@ def main():
                 device,
                 alpha_steps,
                 beta_values,
+                force_loo_accuracy,
             )
             for row in rows:
                 raw.append({"dataset": dataset_name, "kshot": 1, "seed": int(seed), **row})
@@ -369,6 +398,7 @@ def main():
                     "dataset_root": str(dataset_root),
                     "seeds": seeds,
                     "beta_values": beta_values,
+                    "force_loo_accuracy": force_loo_accuracy,
                     "raw": raw,
                     "aggregate": aggregate,
                 },

@@ -35,6 +35,7 @@ from utils import (
 
 from src.models.apt import APT, DEFAULT_TRAINING_EPOCHS, DEFAULT_CHECKPOINT_DIR
 from src.models.protofuse import ProtoFuse
+from src.pipelines.posthoc_protofuse import resolve_force_loo_accuracy
 
 
 class APTTrainingPipeline:
@@ -149,7 +150,7 @@ class APTTrainingPipeline:
     def _metrics_title(self, method_name=None):
         method = method_name or self.METHOD_NAME
         dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
-        return f"{method} x {dataset} x {self.kshot}-shot x seed {self.seed}"
+        return f"{method} x {dataset}"
 
     def _should_log_epoch(self, epoch_idx: int, epochs_total: int) -> bool:
         return (epoch_idx % self.epoch_log_interval == 0) or (epoch_idx == epochs_total)
@@ -178,7 +179,8 @@ class APTTrainingPipeline:
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        return alpha_steps, beta_values
+        force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
+        return alpha_steps, beta_values, force_loo_accuracy
 
     @property
     def val_dataset(self):
@@ -549,7 +551,7 @@ class APTTrainingPipeline:
         )
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values = self._posthoc_protofuse_selector_settings()
+        alpha_steps, beta_values, force_loo_accuracy = self._posthoc_protofuse_selector_settings()
 
         logger.info("Applying post-hoc ProtoFuse to frozen APT")
         self.trainer.clear_posthoc_protofuse()
@@ -567,12 +569,14 @@ class APTTrainingPipeline:
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
+            force_loo_accuracy=force_loo_accuracy,
         )
         apt_alpha = self.trainer.select_posthoc_alpha(
             train_features,
             train_text_features,
             train_labels,
             alpha_steps=alpha_steps,
+            force_loo_accuracy=force_loo_accuracy,
         )
         alpha = selection['alpha'] if apt_alpha is None else apt_alpha
 
