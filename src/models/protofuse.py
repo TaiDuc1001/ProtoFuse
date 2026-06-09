@@ -20,6 +20,11 @@ class ProtoFuse(BaseTrainer):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
         self.force_loo_accuracy = self._cfg_bool(False, 'model.force_loo_accuracy', 'force_loo_accuracy')
+        self.force_weighted_centroid = self._cfg_bool(
+            True,
+            'model.force_weighted_centroid',
+            'force_weighted_centroid',
+        )
         self.centroid_mix_beta_values = self._cfg_float_list(
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
             'model.centroid_mix.beta_values',
@@ -108,11 +113,13 @@ class ProtoFuse(BaseTrainer):
         alpha_steps=101,
         beta_values=None,
         force_loo_accuracy=False,
+        force_weighted_centroid=True,
     ):
         selector = cls.__new__(cls)
         selector.device = torch.device(device)
         selector.alpha_steps = max(2, int(alpha_steps))
         selector.force_loo_accuracy = cls._coerce_bool(force_loo_accuracy, False)
+        selector.force_weighted_centroid = cls._coerce_bool(force_weighted_centroid, True)
         selector.centroid_mix_beta_values = cls._coerce_float_list(
             beta_values,
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
@@ -177,12 +184,21 @@ class ProtoFuse(BaseTrainer):
             weights = similarities / sim_sum
         return F.normalize((weights.unsqueeze(-1) * class_features).sum(dim=0), dim=-1)
 
+    def _average_visual_centroid(self, class_features):
+        class_features = class_features.to(self.device)
+        return F.normalize(class_features.mean(dim=0), dim=-1)
+
+    def _visual_centroid(self, class_features, text_prototype):
+        if getattr(self, 'force_weighted_centroid', True):
+            return self._weighted_visual_centroid(class_features, text_prototype)
+        return self._average_visual_centroid(class_features)
+
     def build_visual_centroids(self, features, labels, num_classes):
         centroids = torch.zeros(num_classes, self.embed_dim, device=self.device)
         for i in range(num_classes):
             mask = (labels == i)
             if mask.any():
-                centroids[i] = self._weighted_visual_centroid(features[mask], self.text_prototypes[i])
+                centroids[i] = self._visual_centroid(features[mask], self.text_prototypes[i])
         return centroids
 
     def _curve_knee(self, values):
@@ -276,7 +292,7 @@ class ProtoFuse(BaseTrainer):
             for hold_idx in range(k):
                 held = F.normalize(class_feat[:, hold_idx, :], dim=-1)
                 V_minus = torch.stack([
-                    self._weighted_visual_centroid(
+                    self._visual_centroid(
                         class_feat[c, torch.arange(k, device=self.device) != hold_idx],
                         T[c],
                     )
