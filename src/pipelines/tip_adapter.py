@@ -109,7 +109,9 @@ class TipAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid = self._posthoc_protofuse_selector_settings()
+        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode = (
+            self._posthoc_protofuse_selector_settings()
+        )
 
         logger.info("Applying post-hoc ProtoFuse to Tip-Adapter")
         self.trainer.clear_posthoc_protofuse()
@@ -122,6 +124,7 @@ class TipAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             beta_values=beta_values,
             force_loo_accuracy=force_loo_accuracy,
             force_weighted_centroid=force_weighted_centroid,
+            oneshot_mode=oneshot_mode,
         )
         fused_prototypes = self.trainer.apply_posthoc_protofuse(
             alpha=selection['alpha'],

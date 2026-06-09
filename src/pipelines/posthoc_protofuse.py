@@ -40,6 +40,17 @@ def resolve_force_weighted_centroid(cfg, proto_cfg):
     return coerce_protofuse_bool(cfg.get('force_weighted_centroid', proto_default), True)
 
 
+def resolve_oneshot_mode(cfg, proto_cfg):
+    proto_default = get_config_value(
+        proto_cfg,
+        'model.oneshot_mode',
+        get_config_value(proto_cfg, 'oneshot_mode', None),
+    )
+    centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
+    centroid_default = centroid_mix_cfg.get('oneshot_mode', proto_default)
+    return cfg.get('oneshot_mode', centroid_default)
+
+
 class PosthocProtoFuseMixin:
     def _posthoc_protofuse_cfg(self):
         return self.config.get('posthoc_protofuse', ConfigNode())
@@ -67,4 +78,5 @@ class PosthocProtoFuseMixin:
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
         force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
         force_weighted_centroid = resolve_force_weighted_centroid(cfg, proto_cfg)
-        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid
+        oneshot_mode = resolve_oneshot_mode(cfg, proto_cfg)
+        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode

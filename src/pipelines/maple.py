@@ -14,7 +14,11 @@ from utils import (
 
 from src.models.maple import MaPLe
 from src.models.protofuse import ProtoFuse
-from src.pipelines.posthoc_protofuse import resolve_force_loo_accuracy, resolve_force_weighted_centroid
+from src.pipelines.posthoc_protofuse import (
+    resolve_force_loo_accuracy,
+    resolve_force_weighted_centroid,
+    resolve_oneshot_mode,
+)
 
 
 class MaPLeTrainingPipeline(BaseTrainingPipeline):
@@ -50,7 +54,8 @@ class MaPLeTrainingPipeline(BaseTrainingPipeline):
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
         force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
         force_weighted_centroid = resolve_force_weighted_centroid(cfg, proto_cfg)
-        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid
+        oneshot_mode = resolve_oneshot_mode(cfg, proto_cfg)
+        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode
 
     def _try_load_checkpoint(self) -> bool:
         if self.checkpoint_cache is None or self.checkpoint_id is None:
@@ -126,7 +131,9 @@ class MaPLeTrainingPipeline(BaseTrainingPipeline):
         )
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid = self._posthoc_protofuse_selector_settings()
+        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode = (
+            self._posthoc_protofuse_selector_settings()
+        )
 
         logger.info("Applying post-hoc ProtoFuse to frozen MaPLe")
         self.trainer.clear_posthoc_protofuse()
@@ -145,6 +152,7 @@ class MaPLeTrainingPipeline(BaseTrainingPipeline):
             beta_values=beta_values,
             force_loo_accuracy=force_loo_accuracy,
             force_weighted_centroid=force_weighted_centroid,
+            oneshot_mode=oneshot_mode,
         )
         alpha = selection['alpha']
 

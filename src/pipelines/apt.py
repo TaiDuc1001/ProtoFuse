@@ -35,7 +35,11 @@ from utils import (
 
 from src.models.apt import APT, DEFAULT_TRAINING_EPOCHS, DEFAULT_CHECKPOINT_DIR
 from src.models.protofuse import ProtoFuse
-from src.pipelines.posthoc_protofuse import resolve_force_loo_accuracy, resolve_force_weighted_centroid
+from src.pipelines.posthoc_protofuse import (
+    resolve_force_loo_accuracy,
+    resolve_force_weighted_centroid,
+    resolve_oneshot_mode,
+)
 
 
 class APTTrainingPipeline:
@@ -181,7 +185,8 @@ class APTTrainingPipeline:
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
         force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
         force_weighted_centroid = resolve_force_weighted_centroid(cfg, proto_cfg)
-        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid
+        oneshot_mode = resolve_oneshot_mode(cfg, proto_cfg)
+        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode
 
     @property
     def val_dataset(self):
@@ -552,7 +557,9 @@ class APTTrainingPipeline:
         )
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid = self._posthoc_protofuse_selector_settings()
+        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode = (
+            self._posthoc_protofuse_selector_settings()
+        )
 
         logger.info("Applying post-hoc ProtoFuse to frozen APT")
         self.trainer.clear_posthoc_protofuse()
@@ -572,6 +579,7 @@ class APTTrainingPipeline:
             beta_values=beta_values,
             force_loo_accuracy=force_loo_accuracy,
             force_weighted_centroid=force_weighted_centroid,
+            oneshot_mode=oneshot_mode,
         )
         apt_alpha = self.trainer.select_posthoc_alpha(
             train_features,

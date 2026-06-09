@@ -1,6 +1,10 @@
 model:
   backbone: "ViT-B/16"
   alpha_steps: 101
+  oneshot_mode:
+    # - tt
+    - vv
+    # - hybrid
   force_loo_accuracy: true
   force_weighted_centroid: false
   centroid_mix:

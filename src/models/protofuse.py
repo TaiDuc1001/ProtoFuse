@@ -15,10 +15,17 @@ from src.models.apt import CUSTOM_TEMPLATES
 
 class ProtoFuse(BaseTrainer):
     DEFAULT_LR = 0.0
+    DEFAULT_ONESHOT_MODES = ('vv', 'tt', 'hybrid')
+    ALLOWED_ONESHOT_MODES = frozenset(DEFAULT_ONESHOT_MODES)
 
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
+        self.oneshot_mode = self._cfg_oneshot_mode(
+            self.DEFAULT_ONESHOT_MODES,
+            'model.oneshot_mode',
+            'oneshot_mode',
+        )
         self.force_loo_accuracy = self._cfg_bool(False, 'model.force_loo_accuracy', 'force_loo_accuracy')
         self.force_weighted_centroid = self._cfg_bool(
             True,
@@ -72,6 +79,10 @@ class ProtoFuse(BaseTrainer):
         raw = self._cfg_value(*paths, default=default)
         return self._coerce_float_list(raw, default)
 
+    def _cfg_oneshot_mode(self, default, *paths):
+        raw = self._cfg_value(*paths, default=default)
+        return self._coerce_oneshot_mode(raw, default)
+
     def _cfg_bool(self, default, *paths):
         raw = self._cfg_value(*paths, default=default)
         return self._coerce_bool(raw, default)
@@ -104,6 +115,31 @@ class ProtoFuse(BaseTrainer):
         return [coerce_to_float(v, 0.0) for v in values]
 
     @classmethod
+    def _coerce_oneshot_mode(cls, raw, default=None):
+        if default is None:
+            default = cls.DEFAULT_ONESHOT_MODES
+        if raw is None:
+            raw = default
+        if isinstance(raw, str):
+            values = [v.strip().lower() for v in raw.split(',') if v.strip()]
+        elif isinstance(raw, (list, tuple)):
+            values = [str(v).strip().lower() for v in raw if str(v).strip()]
+        else:
+            values = [str(raw).strip().lower()]
+
+        modes = []
+        for mode in values:
+            if mode not in cls.ALLOWED_ONESHOT_MODES:
+                allowed = ', '.join(sorted(cls.ALLOWED_ONESHOT_MODES))
+                raise ValueError(f"Invalid ProtoFuse oneshot_mode '{mode}'. Allowed values: {allowed}")
+            if mode not in modes:
+                modes.append(mode)
+
+        if not modes:
+            return cls._coerce_oneshot_mode(default, cls.DEFAULT_ONESHOT_MODES)
+        return tuple(modes)
+
+    @classmethod
     def posthoc_fuse(
         cls,
         text_prototypes,
@@ -114,10 +150,12 @@ class ProtoFuse(BaseTrainer):
         beta_values=None,
         force_loo_accuracy=False,
         force_weighted_centroid=True,
+        oneshot_mode=None,
     ):
         selector = cls.__new__(cls)
         selector.device = torch.device(device)
         selector.alpha_steps = max(2, int(alpha_steps))
+        selector.oneshot_mode = cls._coerce_oneshot_mode(oneshot_mode, cls.DEFAULT_ONESHOT_MODES)
         selector.force_loo_accuracy = cls._coerce_bool(force_loo_accuracy, False)
         selector.force_weighted_centroid = cls._coerce_bool(force_weighted_centroid, True)
         selector.centroid_mix_beta_values = cls._coerce_float_list(
@@ -156,6 +194,7 @@ class ProtoFuse(BaseTrainer):
             'centroid_mask': centroid_mask,
             'missing_classes': torch.nonzero(~centroid_mask, as_tuple=False).flatten().cpu().tolist(),
             'alpha': alpha,
+            'oneshot_mode': selector.oneshot_mode,
         }
 
     def extract_features(self, dataloader):
@@ -256,7 +295,7 @@ class ProtoFuse(BaseTrainer):
             return 0.0
 
         best = {'score': -float('inf'), 'alpha': 0.0}
-        for mode in ('vv', 'tt', 'hybrid'):
+        for mode in self.oneshot_mode:
             neighbors = self._centroid_mix_neighbors(T, V_all, mode)
             for beta in beta_values:
                 net_curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
@@ -367,6 +406,7 @@ class ProtoFuse(BaseTrainer):
             'text_prototypes': self.text_prototypes,
             'best_alpha': self.best_alpha,
             'alpha_steps': self.alpha_steps,
+            'oneshot_mode': self.oneshot_mode,
             'classnames': self.classnames,
         }, path)
         # logger.info(f"ProtoFuse prototypes saved to {path}")
