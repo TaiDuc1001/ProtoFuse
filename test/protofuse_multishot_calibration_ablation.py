@@ -9,11 +9,9 @@ os.environ["MPLBACKEND"] = "Agg"
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -140,6 +138,15 @@ def loo_curves(selector, text, support_features, support_labels, kshot):
     }
 
 
+def support_accuracy_curve(alphas, text, visual, support_features, support_labels):
+    correct = []
+    for alpha in alphas:
+        proto = F.normalize((1.0 - alpha) * text + alpha * visual, dim=-1)
+        preds = (support_features @ proto.T).argmax(dim=-1)
+        correct.append(preds.eq(support_labels).sum().float())
+    return torch.stack(correct)
+
+
 def select_from_curve(alphas, curve):
     idx = int(curve.argmax().item())
     return float(alphas[idx].item())
@@ -162,12 +169,14 @@ def evaluate_run(
     )
     alphas = selector.alphas
     curves = loo_curves(selector, text, support_features, support_labels, kshot)
+    support_curve = support_accuracy_curve(alphas, text, visual, support_features, support_labels)
     oracle = oracle_alpha(text, visual, eval_features, eval_labels, alphas, device)
 
     strategies = [
         ("Text only (alpha=0)", 0.0),
         ("Visual only (alpha=1)", 1.0),
         *[(f"Fixed alpha={alpha:.2f}", alpha) for alpha in FIXED_ALPHAS],
+        ("Support accuracy, no LOO", select_from_curve(alphas, support_curve)),
         ("LOO force accuracy (ours)", select_from_curve(alphas, curves["accuracy_count"])),
         ("Oracle alpha on test", oracle["alpha"]),
     ]
@@ -192,31 +201,46 @@ def mean_std(values):
     return float(arr.mean()), float(arr.std())
 
 
-def build_table(aggregate, dataset_name):
-    table = Table(title=f"{dataset_name} multi-shot calibration ablation")
-    table.add_column("Calibration strategy")
-    table.add_column("accuracy (%)", justify="right")
-    table.add_column("Delta", justify="right")
-    table.add_column("alpha", justify="right")
-    table.add_column("runs", justify="right")
-    for row in aggregate:
-        table.add_row(
-            row["strategy"],
-            f"{row['accuracy_mean']:.2f} +/- {row['accuracy_std']:.2f}",
-            f"{row['delta_mean']:+.2f}",
-            f"{row['alpha_mean']:.2f} +/- {row['alpha_std']:.2f}",
-            str(row["runs"]),
-        )
-    return table
+def format_mean_std(stats):
+    if stats is None:
+        return "-"
+    return f"{stats['mean']:.2f} +/- {stats['std']:.2f}"
 
 
-def latex_rows(aggregate, include_delta=False):
+def result_table_rows(aggregate, kshots):
     rows = []
     for row in aggregate:
+        out = {"Calibration strategy": row["strategy"]}
+        for kshot in kshots:
+            out[f"{kshot}-shot"] = format_mean_std(row["accuracy_by_kshot"].get(str(kshot)))
+        out["avg acc"] = format_mean_std({"mean": row["accuracy_mean"], "std": row["accuracy_std"]})
+        out["Delta"] = f"{row['delta_mean']:+.2f}"
+        out["alpha"] = f"{row['alpha_mean']:.2f} +/- {row['alpha_std']:.2f}"
+        out["runs"] = str(row["runs"])
+        rows.append(out)
+    return rows
+
+
+def build_table(aggregate, dataset_name, kshots):
+    title = f"{dataset_name} multi-shot calibration ablation"
+    rows = result_table_rows(aggregate, kshots)
+    table = pd.DataFrame(rows).to_string(index=False)
+    return f"{title}\n{table}"
+
+
+def latex_rows(aggregate, kshots, include_delta=False):
+    rows = []
+    for row in aggregate:
+        values = [
+            f"{row['accuracy_by_kshot'][str(kshot)]['mean']:.2f}"
+            if str(kshot) in row["accuracy_by_kshot"]
+            else "-"
+            for kshot in kshots
+        ]
         value = f"{row['accuracy_mean']:.2f}"
         if include_delta:
             value = f"{value} ({row['delta_mean']:+.2f})"
-        rows.append(f"{row['strategy']} & {value} \\\\")
+        rows.append(f"{row['strategy']} & {' & '.join(values)} & {value} \\\\")
     return "\n".join(rows)
 
 
@@ -227,7 +251,7 @@ def parse_args():
     parser.add_argument("--seeds", default=",".join(str(v) for v in DEFAULT_SEEDS))
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--latex", action="store_true", help="Print compact LaTeX rows for the current dataset.")
-    parser.add_argument("--disable-coloring", action="store_true")
+    parser.add_argument("--disable-coloring", action="store_true", help="Deprecated no-op; output is plain text.")
     add_dataset_args(parser)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
@@ -237,7 +261,6 @@ def parse_args():
 def main():
     args, overrides = parse_args()
     config = merge_configs(load_config_file(args.config), overrides)
-    console = Console(no_color=args.disable_coloring)
 
     kshots = parse_int_list(args.kshots)
     seeds = parse_int_list(args.seeds)
@@ -253,7 +276,7 @@ def main():
     set_global_seed(1)
     train_dataset, eval_dataset, val_fraction, dataset_root = load_datasets(config)
     classnames = list(train_dataset.classes)
-    console.print(
+    print(
         f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
         f"kshots={kshots}, seeds={seeds}, force_loo_accuracy={force_loo_accuracy}, device={device}"
     )
@@ -272,40 +295,39 @@ def main():
 
     raw = []
     total = len(kshots) * len(seeds)
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), TimeElapsedColumn(), console=console) as progress:
-        task = progress.add_task("running", total=total)
-        for kshot in kshots:
-            for seed in seeds:
-                progress.update(task, description=f"{kshot}-shot | seed {seed}")
-                set_global_seed(seed)
-                if val_fraction is None:
-                    train_idx = support_positions(train_labels_all, kshot, seed)
-                    support_features = train_features_all[train_idx].contiguous()
-                    support_labels = train_labels_all[train_idx].contiguous()
-                    eval_features = eval_features_all
-                    eval_labels = eval_labels_all
-                else:
-                    train_idx, val_idx = split_positions_by_class(train_labels_all, kshot, seed, val_fraction)
-                    support_features = train_features_all[train_idx].contiguous()
-                    support_labels = train_labels_all[train_idx].contiguous()
-                    eval_features = train_features_all[val_idx].contiguous()
-                    eval_labels = train_labels_all[val_idx].contiguous()
+    completed = 0
+    for kshot in kshots:
+        for seed in seeds:
+            completed += 1
+            print(f"Running {kshot}-shot | seed {seed} ({completed}/{total})", flush=True)
+            set_global_seed(seed)
+            if val_fraction is None:
+                train_idx = support_positions(train_labels_all, kshot, seed)
+                support_features = train_features_all[train_idx].contiguous()
+                support_labels = train_labels_all[train_idx].contiguous()
+                eval_features = eval_features_all
+                eval_labels = eval_labels_all
+            else:
+                train_idx, val_idx = split_positions_by_class(train_labels_all, kshot, seed, val_fraction)
+                support_features = train_features_all[train_idx].contiguous()
+                support_labels = train_labels_all[train_idx].contiguous()
+                eval_features = train_features_all[val_idx].contiguous()
+                eval_labels = train_labels_all[val_idx].contiguous()
 
-                rows = evaluate_run(
-                    text_features,
-                    support_features,
-                    support_labels,
-                    eval_features,
-                    eval_labels,
-                    device,
-                    alpha_steps,
-                    beta_values,
-                    kshot,
-                    force_loo_accuracy,
-                )
-                for row in rows:
-                    raw.append({"dataset": dataset_name, "kshot": int(kshot), "seed": int(seed), **row})
-                progress.advance(task)
+            rows = evaluate_run(
+                text_features,
+                support_features,
+                support_labels,
+                eval_features,
+                eval_labels,
+                device,
+                alpha_steps,
+                beta_values,
+                kshot,
+                force_loo_accuracy,
+            )
+            for row in rows:
+                raw.append({"dataset": dataset_name, "kshot": int(kshot), "seed": int(seed), **row})
 
     order = []
     by_strategy = {}
@@ -320,12 +342,24 @@ def main():
         acc_mean, acc_std = mean_std([row["accuracy"] for row in members])
         delta_mean, delta_std = mean_std([row["delta"] for row in members])
         alpha_mean, alpha_std = mean_std([row["alpha"] for row in members])
+        accuracy_by_kshot = {}
+        for kshot in kshots:
+            shot_members = [row for row in members if row["kshot"] == int(kshot)]
+            if not shot_members:
+                continue
+            shot_mean, shot_std = mean_std([row["accuracy"] for row in shot_members])
+            accuracy_by_kshot[str(kshot)] = {
+                "mean": shot_mean,
+                "std": shot_std,
+                "runs": len(shot_members),
+            }
         aggregate.append(
             {
                 "strategy": strategy,
                 "runs": len(members),
                 "accuracy_mean": acc_mean,
                 "accuracy_std": acc_std,
+                "accuracy_by_kshot": accuracy_by_kshot,
                 "delta_mean": delta_mean,
                 "delta_std": delta_std,
                 "alpha_mean": alpha_mean,
@@ -333,11 +367,11 @@ def main():
             }
         )
 
-    console.print()
-    console.print(build_table(aggregate, dataset_name))
+    print()
+    print(build_table(aggregate, dataset_name, kshots))
     if args.latex:
-        console.print("\n[bold]LaTeX rows[/bold]")
-        console.print(latex_rows(aggregate, include_delta=True))
+        print("\nLaTeX rows")
+        print(latex_rows(aggregate, kshots, include_delta=True))
 
     if args.output_json:
         out_path = resolve_path(args.output_json)
@@ -357,7 +391,7 @@ def main():
                 f,
                 indent=2,
             )
-        console.print(f"Saved results to {out_path}")
+        print(f"Saved results to {out_path}")
 
 
 if __name__ == "__main__":

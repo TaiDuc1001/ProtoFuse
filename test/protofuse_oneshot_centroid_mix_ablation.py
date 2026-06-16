@@ -36,12 +36,7 @@ from utils import get_config_value, load_config_file, merge_configs, parse_overr
 
 DEFAULT_SEEDS = [1, 10, 100, 1000, 10000]
 DEFAULT_BETAS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
-FIXED_ALPHAS = [0.25, 0.50, 0.75]
-MODE_LABELS = {
-    "vv": "Centroid-mix, visual neighbor only",
-    "tt": "Centroid-mix, text neighbor only",
-    "hybrid": "Centroid-mix, hybrid neighbor only",
-}
+FIXED_ALPHAS = [0.25, 0.50]
 
 
 def add_dataset_args(parser):
@@ -68,11 +63,21 @@ def alpha_grid(steps, device):
     return torch.linspace(0.0, 1.0, max(2, int(steps)), device=device)
 
 
-def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy=True):
+def build_selector(
+    text_features,
+    support_features,
+    support_labels,
+    device,
+    alpha_steps,
+    beta_values,
+    force_loo_accuracy=True,
+    oneshot_mode=None,
+):
     selector = ProtoFuse.__new__(ProtoFuse)
     selector.device = torch.device(device)
     selector.alpha_steps = max(2, int(alpha_steps))
     selector.force_loo_accuracy = ProtoFuse._coerce_bool(force_loo_accuracy, True)
+    selector.oneshot_mode = ProtoFuse._coerce_oneshot_mode(oneshot_mode, ProtoFuse.DEFAULT_ONESHOT_MODES)
     selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, DEFAULT_BETAS)
     selector.alphas = alpha_grid(alpha_steps, selector.device)
     selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
@@ -101,18 +106,6 @@ def oracle_alpha(text, visual, eval_features, eval_labels, alphas, device):
     return best
 
 
-def curve_knee(values, device):
-    values = values.float()
-    span = values.max() - values.min()
-    if span <= 1e-12:
-        return None, 0.0, 0.0
-    y = (values - values.min()) / (span + 1e-12)
-    x = torch.linspace(0.0, 1.0, len(values), device=device)
-    knee_scores = y - x
-    idx = int(knee_scores.argmax().item())
-    return idx, float(knee_scores[idx].item()), float(span.item())
-
-
 def centroid_mix_neighbors(text, visual, mode):
     if mode == "vv":
         similarity = visual @ visual.T
@@ -127,30 +120,21 @@ def centroid_mix_neighbors(text, visual, mode):
     return similarity.argmax(dim=1)
 
 
-def centroid_mix_net_curve(alphas, text, visual, neighbors, beta, device, force_loo_accuracy=True):
+def centroid_mix_net_curve(alphas, text, visual, neighbors, beta, device):
     num_classes = text.shape[0]
     labels = torch.arange(num_classes, device=device)
     pseudo = F.normalize((1.0 - beta) * visual + beta * visual[neighbors], dim=-1)
-    text_correct = None if force_loo_accuracy else (pseudo @ text.T).argmax(dim=-1).eq(labels)
     scores = []
     for alpha in alphas:
         proto = F.normalize((1.0 - alpha) * text + alpha * visual, dim=-1)
         fused_correct = (pseudo @ proto.T).argmax(dim=-1).eq(labels)
-        if force_loo_accuracy:
-            scores.append(fused_correct.sum().float())
-        else:
-            rescue = ((~text_correct) & fused_correct).sum().float()
-            damage = (text_correct & ~fused_correct).sum().float()
-            scores.append(rescue - damage)
+        scores.append(fused_correct.sum().float())
     return torch.stack(scores)
 
 
 def candidate_curves(selector, text, visual, modes, beta_values):
     rows = []
     beta_values = sorted({round(float(beta), 6) for beta in beta_values if 0.0 < float(beta) < 0.5})
-    if 0.45 not in beta_values:
-        beta_values.append(0.45)
-        beta_values.sort()
     if text.shape[0] < 2:
         return rows
     for mode in modes:
@@ -163,19 +147,13 @@ def candidate_curves(selector, text, visual, modes, beta_values):
                 neighbors,
                 beta,
                 selector.device,
-                force_loo_accuracy=getattr(selector, "force_loo_accuracy", True),
             )
-            knee_idx, knee_strength, signal_span = curve_knee(curve, selector.device)
             max_idx = int(curve.argmax().item())
             rows.append(
                 {
                     "mode": mode,
                     "beta": float(beta),
                     "curve": curve,
-                    "knee_idx": knee_idx,
-                    "knee_strength": knee_strength,
-                    "signal_span": signal_span,
-                    "quality": knee_strength * signal_span / max(1, text.shape[0]),
                     "max_idx": max_idx,
                     "max_score": float(curve[max_idx].item()),
                 }
@@ -183,21 +161,35 @@ def candidate_curves(selector, text, visual, modes, beta_values):
     return rows
 
 
-def select_mode_knee(selector, curves, fallback=True):
-    valid = [row for row in curves if row["knee_idx"] is not None]
-    if not valid:
-        return 0.0
-    best = max(valid, key=lambda row: (row["quality"], -float(selector.alphas[row["knee_idx"]].item())))
-    if fallback and best["quality"] <= 0.0:
-        return 0.0
-    return float(selector.alphas[best["knee_idx"]].item())
+def conservative_gain_score(values, alphas):
+    values = values.float()
+    span = values.max() - values.min()
+    if span <= 1e-12:
+        return None, 0.0
+
+    gain = values - values.min()
+    scores = gain - alphas * span
+    score_idx = int(scores.argmax().item())
+    return score_idx, float(scores[score_idx].item())
 
 
-def select_all_argmax(selector, curves):
+def select_accuracy_only(selector, curves):
     if not curves:
         return 0.0
     best = max(curves, key=lambda row: (row["max_score"], -float(selector.alphas[row["max_idx"]].item())))
     return float(selector.alphas[best["max_idx"]].item())
+
+
+def select_conservative_gain(selector, curves):
+    best = {"score": -float("inf"), "alpha": 0.0}
+    for row in curves:
+        alpha_idx, score = conservative_gain_score(row["curve"], selector.alphas)
+        if alpha_idx is None:
+            continue
+        alpha = float(selector.alphas[alpha_idx].item())
+        if score > best["score"] or (score == best["score"] and alpha < best["alpha"]):
+            best = {"score": score, "alpha": alpha}
+    return best["alpha"] if best["score"] > 0.0 else 0.0
 
 
 def evaluate_run(
@@ -210,29 +202,28 @@ def evaluate_run(
     alpha_steps,
     beta_values,
     force_loo_accuracy=True,
+    oneshot_mode=None,
 ):
     selector, text, visual = build_selector(
-        text_features, support_features, support_labels, device, alpha_steps, beta_values, force_loo_accuracy
+        text_features,
+        support_features,
+        support_labels,
+        device,
+        alpha_steps,
+        beta_values,
+        force_loo_accuracy,
+        oneshot_mode,
     )
-    all_curves = candidate_curves(selector, text, visual, ["vv", "tt", "hybrid"], selector.centroid_mix_beta_values)
+    all_curves = candidate_curves(selector, text, visual, selector.oneshot_mode, selector.centroid_mix_beta_values)
     oracle = oracle_alpha(text, visual, eval_features, eval_labels, selector.alphas, device)
 
     strategies = [
-        ("Text only (alpha=0)", 0.0),
-        ("Visual only (alpha=1)", 1.0),
-        *[(f"Fixed alpha={alpha:.2f}", alpha) for alpha in FIXED_ALPHAS],
+        ("Text-only, α = 0", 0.0),
+        *[(f"Fixed α = {alpha:.2f}", alpha) for alpha in FIXED_ALPHAS],
+        ("Centroid-mix accuracy only, no penalty", select_accuracy_only(selector, all_curves)),
+        ("Centroid-mix + conservative penalty, ours", select_conservative_gain(selector, all_curves)),
+        ("Oracle α on test", oracle["alpha"]),
     ]
-    for mode, label in MODE_LABELS.items():
-        mode_curves = [row for row in all_curves if row["mode"] == mode]
-        strategies.append((label, select_mode_knee(selector, mode_curves, fallback=True)))
-    strategies.extend(
-        [
-            ("All modes, argmax score", select_all_argmax(selector, all_curves)),
-            ("All modes, knee selection w/o fallback", select_mode_knee(selector, all_curves, fallback=False)),
-            ("All modes, knee selection + fallback (ours)", select_mode_knee(selector, all_curves, fallback=True)),
-            ("Oracle alpha on test", oracle["alpha"]),
-        ]
-    )
 
     text_acc = accuracy_for_alpha(0.0, text, visual, eval_features, eval_labels, device)
     rows = []
@@ -295,6 +286,10 @@ def main():
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = parse_float_list(args.betas, get_config_value(config, "model.centroid_mix.beta_values", DEFAULT_BETAS))
     force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", True), True)
+    oneshot_mode = ProtoFuse._coerce_oneshot_mode(
+        get_config_value(config, "model.oneshot_mode", ProtoFuse.DEFAULT_ONESHOT_MODES),
+        ProtoFuse.DEFAULT_ONESHOT_MODES,
+    )
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
@@ -306,7 +301,7 @@ def main():
     classnames = list(train_dataset.classes)
     console.print(
         f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
-        f"seeds={seeds}, force_loo_accuracy={force_loo_accuracy}, device={device}"
+        f"seeds={seeds}, oneshot_mode={oneshot_mode}, force_loo_accuracy={force_loo_accuracy}, device={device}"
     )
 
     model = load_model(config, device)
@@ -349,6 +344,7 @@ def main():
                 alpha_steps,
                 beta_values,
                 force_loo_accuracy,
+                oneshot_mode,
             )
             for row in rows:
                 raw.append({"dataset": dataset_name, "kshot": 1, "seed": int(seed), **row})
@@ -398,6 +394,7 @@ def main():
                     "dataset_root": str(dataset_root),
                     "seeds": seeds,
                     "beta_values": beta_values,
+                    "oneshot_mode": list(oneshot_mode),
                     "force_loo_accuracy": force_loo_accuracy,
                     "raw": raw,
                     "aggregate": aggregate,

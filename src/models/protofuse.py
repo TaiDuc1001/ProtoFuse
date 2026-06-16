@@ -240,16 +240,17 @@ class ProtoFuse(BaseTrainer):
                 centroids[i] = self._visual_centroid(features[mask], self.text_prototypes[i])
         return centroids
 
-    def _curve_knee(self, values):
+    def _conservative_gain_score(self, values):
         values = values.float()
         span = values.max() - values.min()
         if span <= 1e-12:
-            return None, 0.0, 0.0
-        y = (values - values.min()) / (span + 1e-12)
-        x = torch.linspace(0.0, 1.0, len(values), device=self.device)
-        knee_scores = y - x
-        knee_idx = int(knee_scores.argmax().item())
-        return knee_idx, knee_scores[knee_idx].item(), span.item()
+            return None, 0.0
+
+        gain = values - values.min()
+        visual_penalty = self.alphas * span
+        scores = gain - visual_penalty
+        score_idx = int(scores.argmax().item())
+        return score_idx, scores[score_idx].item()
 
     def _centroid_mix_neighbors(self, T, V_all, mode):
         if mode == 'vv':
@@ -299,14 +300,12 @@ class ProtoFuse(BaseTrainer):
             neighbors = self._centroid_mix_neighbors(T, V_all, mode)
             for beta in beta_values:
                 net_curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
-                knee_idx, knee_strength, signal_span = self._curve_knee(net_curve)
-                if knee_idx is None:
+                alpha_idx, score = self._conservative_gain_score(net_curve)
+                if alpha_idx is None:
                     continue
-                amplitude = signal_span / max(1, num_classes)
-                quality = knee_strength * amplitude
-                alpha = self.alphas[knee_idx].item()
-                if quality > best['score'] or (quality == best['score'] and alpha < best['alpha']):
-                    best = {'score': quality, 'alpha': alpha}
+                alpha = self.alphas[alpha_idx].item()
+                if score > best['score'] or (score == best['score'] and alpha < best['alpha']):
+                    best = {'score': score, 'alpha': alpha}
 
         return best['alpha'] if best['score'] > 0.0 else 0.0
 
