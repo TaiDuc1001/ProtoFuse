@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clip import clip
 from src.models.apt import CUSTOM_TEMPLATES
-from utils import load_clip_to_cpu
+from utils import coerce_to_bool, discover_dataset_envs, format_detected_datasets, load_clip_to_cpu
 
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -29,8 +29,9 @@ CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Print one zero-shot CLIP accuracy number.")
-    parser.add_argument("--data.root", "--root", dest="root", required=True, help="Dataset root.")
-    parser.add_argument("--data.dataset_name", "--name", dest="dataset_name", required=True, help="Dataset name for prompt template.")
+    parser.add_argument("--data.root", "--root", dest="root", default=None, help="Dataset root.")
+    parser.add_argument("--data.dataset_name", "--name", dest="dataset_name", default=None, help="Dataset name for prompt template.")
+    parser.add_argument("--data.all", "--all-datasets", dest="data_all", nargs="?", const=True, default=False)
     parser.add_argument("--model.backbone", "--model", dest="backbone", required=True, help="CLIP backbone, e.g. ViT-B/16.")
     parser.add_argument("--device", "--training.device", dest="device", default=None, help="Device override.")
     parser.add_argument("--batch-size", "--training.batch_size", dest="batch_size", type=int, default=128)
@@ -134,11 +135,8 @@ def zeroshot_accuracy(model, dataset, text_features, device, batch_size, num_wor
     return 100.0 * correct / total
 
 
-def main():
-    args = parse_args()
-
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    root = resolve_path(args.root)
+def run_one(args, root_value, dataset_name, device, model):
+    root = resolve_path(root_value)
     if not root.exists():
         raise FileNotFoundError(f"Dataset root not found: {root}")
 
@@ -146,14 +144,33 @@ def main():
     classnames, dataset = load_datasets(root, transform)
     if not args.quiet:
         print(
-            f"zeroshot dataset={args.dataset_name} backbone={args.backbone} "
+            f"zeroshot dataset={dataset_name} backbone={args.backbone} "
             f"device={device} classes={len(classnames)} images={len(dataset)}",
             file=sys.stderr,
         )
-    model = load_model(args.backbone, device, args.precision)
-    text_features = build_text_features(model, classnames, args.dataset_name, device)
+    text_features = build_text_features(model, classnames, dataset_name, device)
     accuracy = zeroshot_accuracy(model, dataset, text_features, device, args.batch_size, args.num_workers)
     print(f"{accuracy:.{args.digits}f}")
+
+
+def main():
+    args = parse_args()
+    data_all = coerce_to_bool(args.data_all, False, key="data.all")
+    if data_all:
+        datasets = discover_dataset_envs()
+        if not datasets:
+            raise RuntimeError("No environment variables ending with _DATA_ROOT were found for data.all=True.")
+        print(format_detected_datasets(datasets), file=sys.stderr)
+        runs = [(dataset["root"], dataset["dataset_name"]) for dataset in datasets]
+    else:
+        if args.root is None or args.dataset_name is None:
+            raise ValueError("Pass --root and --name, or use --data.all True.")
+        runs = [(args.root, args.dataset_name)]
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(args.backbone, device, args.precision)
+    for root_value, dataset_name in runs:
+        run_one(args, root_value, dataset_name, device, model)
 
 
 if __name__ == "__main__":

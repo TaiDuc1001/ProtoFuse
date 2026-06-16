@@ -368,6 +368,22 @@ def coerce_to_int(value, default, key=None):
     raise ValueError(f"Configuration value for {key or 'unknown'} must be numeric.")
 
 
+def coerce_to_bool(value, default=False, key=None):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "y", "on"):
+            return True
+        if lowered in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(f"Configuration value for {key or 'unknown'} must be boolean.")
+
+
 def coerce_to_float(value, default, key=None):
     if value is None:
         return float(default)
@@ -453,6 +469,89 @@ def parse_override_arguments(tokens):
         set_nested_value(overrides, keys, value)
         i += 1
     return overrides
+
+
+DATA_ROOT_ENV_SUFFIX = "_DATA_ROOT"
+DATASET_NAME_OVERRIDES = {
+    "FGVC-Aircraft": "FGVCAircraft",
+}
+
+
+def derive_dataset_name_from_root(dataset_root):
+    dataset_name = os.path.basename(os.path.normpath(str(dataset_root)))
+    if not dataset_name:
+        raise ValueError(f"Cannot derive dataset name from empty root: {dataset_root!r}")
+    return DATASET_NAME_OVERRIDES.get(dataset_name, dataset_name)
+
+
+def discover_dataset_envs(environ=None):
+    source = os.environ if environ is None else environ
+    datasets = []
+    for env_key in sorted(source):
+        if not env_key.endswith(DATA_ROOT_ENV_SUFFIX):
+            continue
+        dataset_root = source[env_key]
+        if not dataset_root:
+            continue
+        datasets.append(
+            {
+                "env_key": env_key,
+                "root": dataset_root,
+                "dataset_name": derive_dataset_name_from_root(dataset_root),
+            }
+        )
+    return datasets
+
+
+def format_detected_datasets(datasets):
+    return "Detected datasets: " + ", ".join(
+        f"{dataset['dataset_name']} ({dataset['env_key']})" for dataset in datasets
+    )
+
+
+def announce_detected_datasets(datasets):
+    message = format_detected_datasets(datasets)
+    if getattr(logger, "_logger").handlers:
+        logger.info(message)
+    else:
+        print(message)
+
+
+def data_all_enabled(config):
+    return coerce_to_bool(get_config_value(config, "data.all", False), False, key="data.all")
+
+
+def iter_dataset_configs(config, environ=None):
+    if not data_all_enabled(config):
+        yield config, None
+        return
+
+    datasets = discover_dataset_envs(environ)
+    if not datasets:
+        raise RuntimeError("No environment variables ending with _DATA_ROOT were found for data.all=True.")
+
+    announce_detected_datasets(datasets)
+
+    for dataset in datasets:
+        dataset_config = copy.deepcopy(config)
+        data_cfg = dataset_config.setdefault("data", {})
+        data_cfg["root"] = dataset["root"]
+        data_cfg["dataset_name"] = dataset["dataset_name"]
+        yield dataset_config, dataset
+
+
+def run_for_dataset_configs(config, runner, environ=None):
+    results = []
+    for dataset_config, dataset in iter_dataset_configs(config, environ=environ):
+        if dataset is not None:
+            logger.info(
+                "Running dataset %s from %s=%s",
+                dataset["dataset_name"],
+                dataset["env_key"],
+                dataset["root"],
+            )
+        results.append(runner(dataset_config, dataset))
+    return results
 
 
 def load_clip_to_cpu(backbone_name):
@@ -1157,6 +1256,7 @@ def log_experiment_accuracy(accuracy: float) -> None:
 DEFAULT_ARG_SCHEMA = {
     'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
     'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
+    'data.all': {'type': str, 'help': 'Run once for every environment variable ending with _DATA_ROOT', 'config_path': 'data.all'},
     'debug': {'type': bool, 'help': 'Enable debug logging', 'default': True},
     'disable_coloring': {'type': bool, 'help': 'Disable colored output for log files', 'default': True},
 }

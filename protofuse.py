@@ -10,6 +10,7 @@ from utils import (
     parse_override_arguments,
     merge_configs,
     load_config_file,
+    run_for_dataset_configs,
 )
 
 from src.pipelines.protofuse import ProtoFusePipeline
@@ -23,7 +24,7 @@ def parse_args():
 def main():
     args, overrides = parse_args()
     setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
-    pipeline = ProtoFusePipeline(merge_configs(load_config_file(args.config), overrides))
-    pipeline.run()
+    config = merge_configs(load_config_file(args.config), overrides)
+    run_for_dataset_configs(config, lambda dataset_config, _: ProtoFusePipeline(dataset_config).run())
 
 if __name__ == "__main__": main()

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from clip import clip
 from src.models.apt import CUSTOM_TEMPLATES
 from src.models.protofuse import ProtoFuse
-from utils import get_config_value, load_clip_to_cpu, load_config_file, merge_configs, parse_override_arguments, set_global_seed
+from utils import get_config_value, iter_dataset_configs, load_clip_to_cpu, load_config_file, merge_configs, parse_override_arguments, set_global_seed
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -302,9 +302,7 @@ def parse_args():
     return parsed, overrides
 
 
-def main():
-    args, overrides = parse_args()
-    config = merge_configs(load_config_file(args.config), overrides)
+def run_one(args, config):
     console = Console(no_color=args.disable_coloring)
 
     alpha_steps_values = parse_int_list(args.alpha_steps)
@@ -450,6 +448,13 @@ def main():
         with open(out_path, "w") as f:
             json.dump(payload, f, indent=2)
         console.print(f"Saved results to {out_path}")
+
+
+def main():
+    args, overrides = parse_args()
+    config = merge_configs(load_config_file(args.config), overrides)
+    for dataset_config, _ in iter_dataset_configs(config):
+        run_one(args, dataset_config)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from clip import clip
 from src.models.protofuse import ProtoFuse
 from src.models.apt import CUSTOM_TEMPLATES
-from utils import load_clip_to_cpu
+from utils import coerce_to_bool, discover_dataset_envs, format_detected_datasets, load_clip_to_cpu
 
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--config", default="configs/protofuse.yaml")
     parser.add_argument("--data.root", "--root", dest="root", default=None)
     parser.add_argument("--data.dataset_name", "--name", dest="dataset_name", default=None)
+    parser.add_argument("--data.all", "--all-datasets", dest="data_all", nargs="?", const=True, default=False)
     parser.add_argument("--model.backbone", "--model", dest="backbone", default=None)
     parser.add_argument("--split", default="train", help="Dataset split to read first, if it exists.")
     parser.add_argument("--support-split", default="train", help="Dataset split used to build ProtoFuse prototypes.")
@@ -149,24 +150,21 @@ def encode_images(model, dataset, device, batch_size, num_workers):
     return torch.cat(features, dim=0), torch.cat(labels, dim=0)
 
 
-def main():
-    args = parse_args()
-    config = load_config(args.config)
-
-    root = args.root or config_get(config, "data", "root")
-    dataset_name = args.dataset_name or config_get(config, "data", "dataset_name", "ImageNet")
-    backbone = args.backbone or config_get(config, "model", "backbone", "ViT-B/16")
-    precision = args.precision or config_get(config, "training", "precision", "fp32")
-    device = args.device or config_get(config, "training", "device") or ("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = args.batch_size or config_get(config, "training", "batch_size", 128)
-    num_workers = args.num_workers if args.num_workers is not None else config_get(config, "data", "num_workers", 4)
-    kshot = args.kshot if args.kshot is not None else config_get(config, "data", "kshot", -1)
-    seed = args.seed if args.seed is not None else config_get(config, "data", "seed", 42)
-    alpha_steps = config_get(config, "model", "alpha_steps", 101)
-    force_loo_accuracy = ProtoFuse._coerce_bool(config_get(config, "model", "force_loo_accuracy", False), False)
-    centroid_mix = config_get(config, "model", "centroid_mix", {})
-    beta_values = centroid_mix.get("beta_values") if isinstance(centroid_mix, dict) else None
-
+def run_one(
+    args,
+    root,
+    dataset_name,
+    backbone,
+    precision,
+    device,
+    batch_size,
+    num_workers,
+    kshot,
+    seed,
+    alpha_steps,
+    force_loo_accuracy,
+    beta_values,
+):
     if root is None:
         raise ValueError("Missing dataset root. Pass --root or set data.root in the config.")
 
@@ -216,6 +214,52 @@ def main():
     print(f"zeroshot_cosine: {zeroshot_cosine:.{args.digits}f}")
     print(f"protofuse_cosine: {protofuse_cosine:.{args.digits}f}")
     print(f"protofuse_alpha: {float(fused['alpha']):.{args.digits}f}")
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+
+    backbone = args.backbone or config_get(config, "model", "backbone", "ViT-B/16")
+    precision = args.precision or config_get(config, "training", "precision", "fp32")
+    device = args.device or config_get(config, "training", "device") or ("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = args.batch_size or config_get(config, "training", "batch_size", 128)
+    num_workers = args.num_workers if args.num_workers is not None else config_get(config, "data", "num_workers", 4)
+    kshot = args.kshot if args.kshot is not None else config_get(config, "data", "kshot", -1)
+    seed = args.seed if args.seed is not None else config_get(config, "data", "seed", 42)
+    alpha_steps = config_get(config, "model", "alpha_steps", 101)
+    force_loo_accuracy = ProtoFuse._coerce_bool(config_get(config, "model", "force_loo_accuracy", False), False)
+    centroid_mix = config_get(config, "model", "centroid_mix", {})
+    beta_values = centroid_mix.get("beta_values") if isinstance(centroid_mix, dict) else None
+
+    data_all = coerce_to_bool(args.data_all, False, key="data.all")
+    if data_all:
+        datasets = discover_dataset_envs()
+        if not datasets:
+            raise RuntimeError("No environment variables ending with _DATA_ROOT were found for data.all=True.")
+        print(format_detected_datasets(datasets), file=sys.stderr)
+        runs = [(dataset["root"], dataset["dataset_name"]) for dataset in datasets]
+    else:
+        root = args.root or config_get(config, "data", "root")
+        dataset_name = args.dataset_name or config_get(config, "data", "dataset_name", "ImageNet")
+        runs = [(root, dataset_name)]
+
+    for root, dataset_name in runs:
+        run_one(
+            args,
+            root,
+            dataset_name,
+            backbone,
+            precision,
+            device,
+            batch_size,
+            num_workers,
+            kshot,
+            seed,
+            alpha_steps,
+            force_loo_accuracy,
+            beta_values,
+        )
 
 
 if __name__ == "__main__":

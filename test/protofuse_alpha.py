@@ -20,6 +20,7 @@ from utils import (
     merge_configs,
     parse_override_arguments,
     process_parsed_args,
+    run_for_dataset_configs,
     setup_logging,
 )
 from src.pipelines.protofuse import ProtoFusePipeline
@@ -158,8 +159,7 @@ def main():
     if getattr(args, "output_dir", None) is None:
         config.setdefault("logging", {})
         config["logging"]["output_dir"] = ProtoFuseAlphaSweepPipeline.DEFAULT_OUTPUT_DIR
-    pipeline = ProtoFuseAlphaSweepPipeline(config)
-    pipeline.run()
+    run_for_dataset_configs(config, lambda dataset_config, _: ProtoFuseAlphaSweepPipeline(dataset_config).run())
 
 
 if __name__ == "__main__":

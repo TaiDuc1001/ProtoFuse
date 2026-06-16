@@ -27,6 +27,7 @@ from utils import (
     DEFAULT_ARG_SCHEMA,
     create_argument_parser,
     get_config_value,
+    iter_dataset_configs,
     load_config_file,
     log_experiment_start,
     logger,
@@ -1184,13 +1185,11 @@ def runtime_args_from_config(config, spec):
     )
 
 
-def run():
+def run_one(parsed, config):
     global DEVICE, BATCH_SIZE, NUM_WORKERS, CACHE_DIR, CLIP_MEAN, CLIP_STD
 
-    parsed, config = parse_args()
     spec = dataset_spec_from_config(config)
     args = runtime_args_from_config(config, spec)
-    setup_logging(getattr(parsed, "debug", True), getattr(parsed, "disable_coloring", True))
 
     DEVICE = args.device
     BATCH_SIZE = args.batch_size
@@ -1230,6 +1229,13 @@ def run():
 
     logger.section("Finalization", "save")
     save_outputs(args, summary_rows, alpha_rows, class_tv_rows, support_rows, shot_scaling_rows)
+
+
+def run():
+    parsed, config = parse_args()
+    setup_logging(getattr(parsed, "debug", True), getattr(parsed, "disable_coloring", True))
+    for dataset_config, _ in iter_dataset_configs(config):
+        run_one(parsed, dataset_config)
 
 
 if __name__ == "__main__":

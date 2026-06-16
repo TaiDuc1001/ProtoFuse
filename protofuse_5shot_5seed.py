@@ -14,6 +14,7 @@ from utils import (
     merge_configs,
     parse_override_arguments,
     process_parsed_args,
+    run_for_dataset_configs,
     setup_logging,
 )
 
@@ -125,8 +126,11 @@ def main():
     args, overrides = parse_args()
     setup_logging(getattr(args, "debug", True), getattr(args, "disable_coloring", True))
     config = merge_configs(load_config_file(args.config), overrides)
-    results = run_batch(config)
-    print_summary_table(results, "ProtoFuse", config["data"]["dataset_name"])
+    def run_one(dataset_config, _):
+        results = run_batch(dataset_config)
+        print_summary_table(results, "ProtoFuse", dataset_config["data"]["dataset_name"])
+
+    run_for_dataset_configs(config, run_one)
 
 
 if __name__ == "__main__":

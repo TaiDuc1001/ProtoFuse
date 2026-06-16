@@ -31,7 +31,7 @@ from protofuse_candidates import (
     resolve_path,
 )
 from src.models.protofuse import ProtoFuse
-from utils import get_config_value, load_config_file, merge_configs, parse_override_arguments, set_global_seed
+from utils import get_config_value, iter_dataset_configs, load_config_file, merge_configs, parse_override_arguments, set_global_seed
 
 
 DEFAULT_KSHOTS = [1, 2, 4, 8, 16]
@@ -171,9 +171,7 @@ def parse_args():
     return parsed, apply_dataset_args(parsed, overrides)
 
 
-def main():
-    args, overrides = parse_args()
-    config = merge_configs(load_config_file(args.config), overrides)
+def run_one(args, config):
     console = Console(no_color=args.disable_coloring)
 
     kshots = parse_int_list(args.kshots)
@@ -295,6 +293,13 @@ def main():
                 indent=2,
             )
         console.print(f"Saved results to {out_path}")
+
+
+def main():
+    args, overrides = parse_args()
+    config = merge_configs(load_config_file(args.config), overrides)
+    for dataset_config, _ in iter_dataset_configs(config):
+        run_one(args, dataset_config)
 
 
 if __name__ == "__main__":

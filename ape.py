@@ -6,6 +6,7 @@ from utils import (
     parse_override_arguments,
     merge_configs,
     load_config_file,
+    run_for_dataset_configs,
 )
 
 from src.pipelines.ape import APEPipeline
@@ -26,8 +27,7 @@ def main():
     setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
     base_config = load_config_file(args.config)
     merged = merge_configs(base_config, overrides)
-    pipeline = APEPipeline(merged)
-    pipeline.run()
+    run_for_dataset_configs(merged, lambda dataset_config, _: APEPipeline(dataset_config).run())
 
 
 if __name__ == "__main__":
