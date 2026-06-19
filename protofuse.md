@@ -222,18 +222,10 @@ $$
 n(c) = \arg\max_{j \ne c} \operatorname{sim}(c, j)
 $$
 
-The similarity can be based on visual prototypes, text prototypes, or both:
+The neighbor is selected using visual-prototype similarity:
 
 $$
-\operatorname{sim}_{vv}(c,j) = V_c^\top V_j
-$$
-
-$$
-\operatorname{sim}_{tt}(c,j) = T_c^\top T_j
-$$
-
-$$
-\operatorname{sim}_{hybrid}(c,j) = \frac{1}{2}V_c^\top V_j + \frac{1}{2}T_c^\top T_j
+\operatorname{sim}(c,j) = V_c^\top V_j
 $$
 
 For a small mixing coefficient $\beta$, ProtoFuse creates a pseudo feature:

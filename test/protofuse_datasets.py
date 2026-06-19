@@ -311,20 +311,9 @@ def prepare_train_eval_tensors(train_all_features, train_all_labels, train_indic
     return train_features, val_features, remapped_train, remapped_val
 
 
-def weighted_visual_centroid(class_features, text_prototype):
+def visual_centroid(class_features):
     class_features = class_features.to(DEVICE)
-    text_prototype = text_prototype.to(DEVICE)
-    similarities = F.cosine_similarity(
-        F.normalize(class_features, dim=-1),
-        F.normalize(text_prototype, dim=-1).unsqueeze(0),
-        dim=-1,
-    ).clamp_min(0.0)
-    sim_sum = similarities.sum()
-    if sim_sum <= 1e-12:
-        weights = torch.full_like(similarities, 1.0 / max(1, similarities.numel()))
-    else:
-        weights = similarities / sim_sum
-    return F.normalize((weights.unsqueeze(-1) * class_features).sum(dim=0), dim=-1)
+    return F.normalize(class_features.mean(dim=0), dim=-1)
 
 
 def build_visual_centroids(train_features, remapped_train_labels, text_features, num_classes):
@@ -333,7 +322,7 @@ def build_visual_centroids(train_features, remapped_train_labels, text_features,
     for class_idx in range(num_classes):
         mask = remapped_train_labels == class_idx
         if mask.any():
-            centroids[class_idx] = weighted_visual_centroid(train_features[mask], text_features[class_idx])
+            centroids[class_idx] = visual_centroid(train_features[mask])
     return centroids
 
 
@@ -390,15 +379,8 @@ def curve_knee(values):
     return knee_idx, _float(knee_scores[knee_idx]), _float(span)
 
 
-def centroid_mix_neighbors(T, V, mode):
-    if mode == "vv":
-        similarity = V @ V.T
-    elif mode == "tt":
-        similarity = T @ T.T
-    elif mode == "hybrid":
-        similarity = 0.5 * (V @ V.T) + 0.5 * (T @ T.T)
-    else:
-        raise ValueError(f"Unknown neighbor mode: {mode}")
+def centroid_mix_neighbors(V):
+    similarity = V @ V.T
     similarity = similarity.clone()
     similarity.fill_diagonal_(-float("inf"))
     return similarity.argmax(dim=1)
@@ -430,18 +412,17 @@ def centroid_mix_alpha(T, V, num_classes, alphas, beta_values):
         return 0.0
 
     best = {"score": -float("inf"), "alpha": 0.0}
-    for mode in ("vv", "tt", "hybrid"):
-        neighbors = centroid_mix_neighbors(T, V, mode)
-        for beta in beta_values:
-            net_curve = centroid_mix_net_curve(T, V, neighbors, beta, alphas, num_classes)
-            knee_idx, knee_strength, signal_span = curve_knee(net_curve)
-            if knee_idx is None:
-                continue
-            amplitude = signal_span / max(1, num_classes)
-            quality = knee_strength * amplitude
-            alpha = _float(alphas[knee_idx])
-            if quality > best["score"] or (quality == best["score"] and alpha < best["alpha"]):
-                best = {"score": quality, "alpha": alpha}
+    neighbors = centroid_mix_neighbors(V)
+    for beta in beta_values:
+        net_curve = centroid_mix_net_curve(T, V, neighbors, beta, alphas, num_classes)
+        knee_idx, knee_strength, signal_span = curve_knee(net_curve)
+        if knee_idx is None:
+            continue
+        amplitude = signal_span / max(1, num_classes)
+        quality = knee_strength * amplitude
+        alpha = _float(alphas[knee_idx])
+        if quality > best["score"] or (quality == best["score"] and alpha < best["alpha"]):
+            best = {"score": quality, "alpha": alpha}
 
     return best["alpha"] if best["score"] > 0.0 else 0.0
 
@@ -461,7 +442,7 @@ def select_protofuse_alpha(T, V, train_features, train_labels, num_classes, alph
         held = F.normalize(class_feat[:, hold_idx, :], dim=-1)
         keep = torch.arange(min_shots, device=DEVICE) != hold_idx
         v_minus = torch.stack(
-            [weighted_visual_centroid(class_feat[c, keep], T[c]) for c in range(num_classes)]
+            [visual_centroid(class_feat[c, keep]) for c in range(num_classes)]
         )
 
         text_preds = (held @ T.T).argmax(dim=-1)

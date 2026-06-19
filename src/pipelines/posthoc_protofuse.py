@@ -6,51 +6,6 @@ from utils import (
     logger,
 )
 
-
-def coerce_protofuse_bool(raw, default=False):
-    if raw is None:
-        return bool(default)
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, str):
-        value = raw.strip().lower()
-        if value in {'1', 'true', 'yes', 'y', 'on'}:
-            return True
-        if value in {'0', 'false', 'no', 'n', 'off'}:
-            return False
-        return bool(default)
-    return bool(raw)
-
-
-def resolve_force_loo_accuracy(cfg, proto_cfg):
-    proto_default = get_config_value(
-        proto_cfg,
-        'model.force_loo_accuracy',
-        get_config_value(proto_cfg, 'force_loo_accuracy', False),
-    )
-    return coerce_protofuse_bool(cfg.get('force_loo_accuracy', proto_default), False)
-
-
-def resolve_force_weighted_centroid(cfg, proto_cfg):
-    proto_default = get_config_value(
-        proto_cfg,
-        'model.force_weighted_centroid',
-        get_config_value(proto_cfg, 'force_weighted_centroid', True),
-    )
-    return coerce_protofuse_bool(cfg.get('force_weighted_centroid', proto_default), True)
-
-
-def resolve_oneshot_mode(cfg, proto_cfg):
-    proto_default = get_config_value(
-        proto_cfg,
-        'model.oneshot_mode',
-        get_config_value(proto_cfg, 'oneshot_mode', None),
-    )
-    centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
-    centroid_default = centroid_mix_cfg.get('oneshot_mode', proto_default)
-    return cfg.get('oneshot_mode', centroid_default)
-
-
 class PosthocProtoFuseMixin:
     def _posthoc_protofuse_cfg(self):
         return self.config.get('posthoc_protofuse', ConfigNode())
@@ -76,7 +31,4 @@ class PosthocProtoFuseMixin:
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        force_loo_accuracy = resolve_force_loo_accuracy(cfg, proto_cfg)
-        force_weighted_centroid = resolve_force_weighted_centroid(cfg, proto_cfg)
-        oneshot_mode = resolve_oneshot_mode(cfg, proto_cfg)
-        return alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode
+        return alpha_steps, beta_values

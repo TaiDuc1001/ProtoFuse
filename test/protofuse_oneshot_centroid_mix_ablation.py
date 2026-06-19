@@ -70,14 +70,10 @@ def build_selector(
     device,
     alpha_steps,
     beta_values,
-    force_loo_accuracy=True,
-    oneshot_mode=None,
 ):
     selector = ProtoFuse.__new__(ProtoFuse)
     selector.device = torch.device(device)
     selector.alpha_steps = max(2, int(alpha_steps))
-    selector.force_loo_accuracy = ProtoFuse._coerce_bool(force_loo_accuracy, True)
-    selector.oneshot_mode = ProtoFuse._coerce_oneshot_mode(oneshot_mode, ProtoFuse.DEFAULT_ONESHOT_MODES)
     selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, DEFAULT_BETAS)
     selector.alphas = alpha_grid(alpha_steps, selector.device)
     selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
@@ -106,15 +102,8 @@ def oracle_alpha(text, visual, eval_features, eval_labels, alphas, device):
     return best
 
 
-def centroid_mix_neighbors(text, visual, mode):
-    if mode == "vv":
-        similarity = visual @ visual.T
-    elif mode == "tt":
-        similarity = text @ text.T
-    elif mode == "hybrid":
-        similarity = 0.5 * (visual @ visual.T) + 0.5 * (text @ text.T)
-    else:
-        raise ValueError(f"Unknown neighbor mode: {mode}")
+def centroid_mix_neighbors(visual):
+    similarity = visual @ visual.T
     similarity = similarity.clone()
     similarity.fill_diagonal_(-float("inf"))
     return similarity.argmax(dim=1)
@@ -132,32 +121,31 @@ def centroid_mix_net_curve(alphas, text, visual, neighbors, beta, device):
     return torch.stack(scores)
 
 
-def candidate_curves(selector, text, visual, modes, beta_values):
+def candidate_curves(selector, text, visual, beta_values):
     rows = []
     beta_values = sorted({round(float(beta), 6) for beta in beta_values if 0.0 < float(beta) < 0.5})
     if text.shape[0] < 2:
         return rows
-    for mode in modes:
-        neighbors = centroid_mix_neighbors(text, visual, mode)
-        for beta in beta_values:
-            curve = centroid_mix_net_curve(
-                selector.alphas,
-                text,
-                visual,
-                neighbors,
-                beta,
-                selector.device,
-            )
-            max_idx = int(curve.argmax().item())
-            rows.append(
-                {
-                    "mode": mode,
-                    "beta": float(beta),
-                    "curve": curve,
-                    "max_idx": max_idx,
-                    "max_score": float(curve[max_idx].item()),
-                }
-            )
+    neighbors = centroid_mix_neighbors(visual)
+    for beta in beta_values:
+        curve = centroid_mix_net_curve(
+            selector.alphas,
+            text,
+            visual,
+            neighbors,
+            beta,
+            selector.device,
+        )
+        max_idx = int(curve.argmax().item())
+        rows.append(
+            {
+                "mode": "vv",
+                "beta": float(beta),
+                "curve": curve,
+                "max_idx": max_idx,
+                "max_score": float(curve[max_idx].item()),
+            }
+        )
     return rows
 
 
@@ -201,8 +189,6 @@ def evaluate_run(
     device,
     alpha_steps,
     beta_values,
-    force_loo_accuracy=True,
-    oneshot_mode=None,
 ):
     selector, text, visual = build_selector(
         text_features,
@@ -211,10 +197,8 @@ def evaluate_run(
         device,
         alpha_steps,
         beta_values,
-        force_loo_accuracy,
-        oneshot_mode,
     )
-    all_curves = candidate_curves(selector, text, visual, selector.oneshot_mode, selector.centroid_mix_beta_values)
+    all_curves = candidate_curves(selector, text, visual, selector.centroid_mix_beta_values)
     oracle = oracle_alpha(text, visual, eval_features, eval_labels, selector.alphas, device)
 
     strategies = [
@@ -283,11 +267,6 @@ def run_one(args, config):
     seeds = parse_int_list(args.seeds)
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = parse_float_list(args.betas, get_config_value(config, "model.centroid_mix.beta_values", DEFAULT_BETAS))
-    force_loo_accuracy = ProtoFuse._coerce_bool(get_config_value(config, "model.force_loo_accuracy", True), True)
-    oneshot_mode = ProtoFuse._coerce_oneshot_mode(
-        get_config_value(config, "model.oneshot_mode", ProtoFuse.DEFAULT_ONESHOT_MODES),
-        ProtoFuse.DEFAULT_ONESHOT_MODES,
-    )
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
@@ -299,7 +278,7 @@ def run_one(args, config):
     classnames = list(train_dataset.classes)
     console.print(
         f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
-        f"seeds={seeds}, oneshot_mode={oneshot_mode}, force_loo_accuracy={force_loo_accuracy}, device={device}"
+        f"seeds={seeds}, device={device}"
     )
 
     model = load_model(config, device)
@@ -341,8 +320,6 @@ def run_one(args, config):
                 device,
                 alpha_steps,
                 beta_values,
-                force_loo_accuracy,
-                oneshot_mode,
             )
             for row in rows:
                 raw.append({"dataset": dataset_name, "kshot": 1, "seed": int(seed), **row})
@@ -392,8 +369,6 @@ def run_one(args, config):
                     "dataset_root": str(dataset_root),
                     "seeds": seeds,
                     "beta_values": beta_values,
-                    "oneshot_mode": list(oneshot_mode),
-                    "force_loo_accuracy": force_loo_accuracy,
                     "raw": raw,
                     "aggregate": aggregate,
                 },

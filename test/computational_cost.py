@@ -585,10 +585,6 @@ def run_timo(cfg, classnames, text_features, train_features, train_labels, devic
 
 def run_protofuse(cfg, classnames, text_features, train_features, train_labels, device):
     alpha_steps = int(cfg.get("model", ConfigNode()).get("alpha_steps", 101))
-    force_loo_accuracy = ProtoFuse._coerce_bool(
-        cfg.get("model", ConfigNode()).get("force_loo_accuracy", False),
-        False,
-    )
     beta_values = cfg.get("model", ConfigNode()).get("centroid_mix", ConfigNode()).get(
         "beta_values", [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
     )
@@ -603,7 +599,6 @@ def run_protofuse(cfg, classnames, text_features, train_features, train_labels, 
             device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            force_loo_accuracy=force_loo_accuracy,
         )
         state["fused_prototypes"] = selection["fused_prototypes"]
         return tensor_bytes(selection["fused_prototypes"])

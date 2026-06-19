@@ -119,16 +119,8 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
         other_logits.scatter_(1, labels.view(-1, 1), -float("inf"))
         return source_score - other_logits.max(dim=1).values
 
-    def _neighbor_indices(self, T, V, mode, top_l):
-        if mode == "vv":
-            score = V @ V.T
-        elif mode == "tt":
-            score = T @ T.T
-        elif mode == "hybrid":
-            score = 0.5 * (V @ V.T) + 0.5 * (T @ T.T)
-        else:
-            raise ValueError(f"Unknown neighbor_score: {mode}")
-
+    def _neighbor_indices(self, V, top_l):
+        score = V @ V.T
         score = score.clone()
         score.fill_diagonal_(-float("inf"))
         if top_l == "all":
@@ -315,26 +307,9 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
             }
         return result
 
-    def _neighbor_quality(self, T, V, neighbors, mode, test_text_preds, test_labels):
-        if mode == "vv":
-            score = V @ V.T
-        elif mode == "tt":
-            score = T @ T.T
-        else:
-            score = 0.5 * (V @ V.T) + 0.5 * (T @ T.T)
+    def _neighbor_quality(self, V, neighbors, test_text_preds, test_labels):
+        score = V @ V.T
         selected_scores = score.gather(1, neighbors)
-
-        vv = V @ V.T
-        tt = T @ T.T
-        vv.fill_diagonal_(-float("inf"))
-        tt.fill_diagonal_(-float("inf"))
-        vv_top = vv.topk(neighbors.shape[1], dim=1).indices
-        tt_top = tt.topk(neighbors.shape[1], dim=1).indices
-        agreement = []
-        for class_idx in range(neighbors.shape[0]):
-            vv_set = set(vv_top[class_idx].tolist())
-            tt_set = set(tt_top[class_idx].tolist())
-            agreement.append(len(vv_set & tt_set) / max(1, neighbors.shape[1]))
 
         wrong = test_text_preds.ne(test_labels)
         if wrong.any():
@@ -347,7 +322,6 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
         return {
             "neighbor_similarity_mean": self._float(selected_scores.mean()),
             "neighbor_similarity_std": self._float(selected_scores.std(unbiased=False)),
-            "neighbor_rank_agreement_vv_tt": float(sum(agreement) / max(1, len(agreement))),
             "neighbor_is_text_pred_error_target_ratio": self._float(error_target_ratio),
         }
 
@@ -461,7 +435,7 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
         )]
         beta_values = [b for b in beta_values if 0.0 < b < 0.5]
-        neighbor_scores = ["vv", "tt", "hybrid"]
+        neighbor_scores = ["vv"]
         top_l = 1
         logger.info("Running one-shot parameter-free knee selector log on test")
 
@@ -486,12 +460,10 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
         curve_rows = []
         config_id = 0
         for neighbor_score in neighbor_scores:
-            neighbors = self._neighbor_indices(T, V, neighbor_score, top_l)
+            neighbors = self._neighbor_indices(V, top_l)
             neighbor_quality = self._neighbor_quality(
-                T,
                 V,
                 neighbors,
-                neighbor_score,
                 text_preds.to(self.device),
                 remapped_test.to(self.device),
             )
@@ -692,17 +664,17 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
         )[1]
 
         for beta in (0.25, 0.30):
-            for neighbor in ("vv", "tt"):
-                source = next((row for row in configs if abs(row["beta"] - beta) < 1e-8 and row["neighbor"] == neighbor), None)
-                if source is not None:
-                    beta_key = f"{int(round(beta * 100)):03d}"
-                    selectors[f"knee_fixed_beta_{beta_key}_{neighbor}"] = selector_from_idx(
-                        f"knee_fixed_beta_{beta_key}_{neighbor}",
-                        source["knee_idx"],
-                        source,
-                        beta,
-                        neighbor,
-                    )[1]
+            neighbor = "vv"
+            source = next((row for row in configs if abs(row["beta"] - beta) < 1e-8 and row["neighbor"] == neighbor), None)
+            if source is not None:
+                beta_key = f"{int(round(beta * 100)):03d}"
+                selectors[f"knee_fixed_beta_{beta_key}_{neighbor}"] = selector_from_idx(
+                    f"knee_fixed_beta_{beta_key}_{neighbor}",
+                    source["knee_idx"],
+                    source,
+                    beta,
+                    neighbor,
+                )[1]
 
         for neighbor in neighbor_scores:
             neighbor_configs = [row for row in configs if row["neighbor"] == neighbor]
@@ -729,7 +701,7 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
             full_ensemble["knee_idx"],
             full_ensemble,
             None,
-            "vv+tt+hybrid",
+            "vv",
         )[1]
         selectors["neighbor_ensemble_knee"] = dict(selectors["full_ensemble_knee"])
         selectors["median_knee_all"] = selector_from_idx(
@@ -737,14 +709,14 @@ class ProtoFuseOneShotCentroidMixCeilingPipeline(ProtoFusePipeline):
             self._nearest_alpha_idx(alphas, median_knee_alpha),
             None,
             None,
-            "vv+tt+hybrid",
+            "vv",
         )[1]
         selectors["min_knee_all"] = selector_from_idx(
             "min_knee_all",
             self._nearest_alpha_idx(alphas, min_knee_alpha),
             None,
             None,
-            "vv+tt+hybrid",
+            "vv",
         )[1]
 
         acc_values = torch.tensor([self._float(real["acc"][row["knee_idx"]]) for row in configs], dtype=torch.float32)

@@ -602,7 +602,7 @@ class ProtoFuseDamageForensicsPipeline(ProtoFusePipeline):
             held = F.normalize(class_features[:, fold_idx, :], dim=-1)
             keep = torch.arange(k, device=self.device) != fold_idx
             V_minus = torch.stack([
-                self.trainer._weighted_visual_centroid(class_features[class_idx, keep], T[class_idx])
+                self.trainer._visual_centroid(class_features[class_idx, keep])
                 for class_idx in range(num_classes)
             ])
             text_logits = held @ T.T

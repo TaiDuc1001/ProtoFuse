@@ -74,7 +74,7 @@ class TIMOPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values, force_loo_accuracy, force_weighted_centroid, oneshot_mode = (
+        alpha_steps, beta_values = (
             self._posthoc_protofuse_selector_settings()
         )
 
@@ -87,9 +87,6 @@ class TIMOPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            force_loo_accuracy=force_loo_accuracy,
-            force_weighted_centroid=force_weighted_centroid,
-            oneshot_mode=oneshot_mode,
         )
         fused_clip_weights, fused_text_features_all = self.trainer.apply_posthoc_protofuse(
             alpha=selection['alpha'],

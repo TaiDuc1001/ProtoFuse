@@ -15,23 +15,12 @@ from src.models.apt import CUSTOM_TEMPLATES
 
 class ProtoFuse(BaseTrainer):
     DEFAULT_LR = 0.0
-    DEFAULT_ONESHOT_MODES = ('vv', 'tt', 'hybrid')
-    ALLOWED_ONESHOT_MODES = frozenset(DEFAULT_ONESHOT_MODES)
+    NUMERICAL_EPSILON = 1e-12
 
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
-        self.oneshot_mode = self._cfg_oneshot_mode(
-            self.DEFAULT_ONESHOT_MODES,
-            'model.oneshot_mode',
-            'oneshot_mode',
-        )
-        self.force_loo_accuracy = self._cfg_bool(False, 'model.force_loo_accuracy', 'force_loo_accuracy')
-        self.force_weighted_centroid = self._cfg_bool(
-            True,
-            'model.force_weighted_centroid',
-            'force_weighted_centroid',
-        )
+        self.rho = min(max(self._cfg_float(0.5, 'model.rho', 'rho'), 0.0), 1.0)
         self.centroid_mix_beta_values = self._cfg_float_list(
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
             'model.centroid_mix.beta_values',
@@ -63,6 +52,13 @@ class ProtoFuse(BaseTrainer):
         self.alphas = torch.linspace(0, 1, self.alpha_steps, device=self.device)
         self.fused_prototypes = None
         self.best_alpha = None
+        self.alpha_init = None
+        self.alpha_final = None
+        self.selected_candidate = None
+        self.candidate_scores = None
+        self.support_visual_centroids = None
+        self.query_centroids = None
+        self.expanded_visual_centroids = None
 
         # logger.info(f"ProtoFuse: {len(self.classnames)} classes, α steps={self.alpha_steps}")
         # logger.info(f"Template: \"{self.template}\"")
@@ -79,29 +75,6 @@ class ProtoFuse(BaseTrainer):
         raw = self._cfg_value(*paths, default=default)
         return self._coerce_float_list(raw, default)
 
-    def _cfg_oneshot_mode(self, default, *paths):
-        raw = self._cfg_value(*paths, default=default)
-        return self._coerce_oneshot_mode(raw, default)
-
-    def _cfg_bool(self, default, *paths):
-        raw = self._cfg_value(*paths, default=default)
-        return self._coerce_bool(raw, default)
-
-    @staticmethod
-    def _coerce_bool(raw, default=False):
-        if raw is None:
-            return bool(default)
-        if isinstance(raw, bool):
-            return raw
-        if isinstance(raw, str):
-            value = raw.strip().lower()
-            if value in {'1', 'true', 'yes', 'y', 'on'}:
-                return True
-            if value in {'0', 'false', 'no', 'n', 'off'}:
-                return False
-            return bool(default)
-        return bool(raw)
-
     @staticmethod
     def _coerce_float_list(raw, default):
         if raw is None:
@@ -115,31 +88,6 @@ class ProtoFuse(BaseTrainer):
         return [coerce_to_float(v, 0.0) for v in values]
 
     @classmethod
-    def _coerce_oneshot_mode(cls, raw, default=None):
-        if default is None:
-            default = cls.DEFAULT_ONESHOT_MODES
-        if raw is None:
-            raw = default
-        if isinstance(raw, str):
-            values = [v.strip().lower() for v in raw.split(',') if v.strip()]
-        elif isinstance(raw, (list, tuple)):
-            values = [str(v).strip().lower() for v in raw if str(v).strip()]
-        else:
-            values = [str(raw).strip().lower()]
-
-        modes = []
-        for mode in values:
-            if mode not in cls.ALLOWED_ONESHOT_MODES:
-                allowed = ', '.join(sorted(cls.ALLOWED_ONESHOT_MODES))
-                raise ValueError(f"Invalid ProtoFuse oneshot_mode '{mode}'. Allowed values: {allowed}")
-            if mode not in modes:
-                modes.append(mode)
-
-        if not modes:
-            return cls._coerce_oneshot_mode(default, cls.DEFAULT_ONESHOT_MODES)
-        return tuple(modes)
-
-    @classmethod
     def posthoc_fuse(
         cls,
         text_prototypes,
@@ -148,16 +96,13 @@ class ProtoFuse(BaseTrainer):
         device,
         alpha_steps=101,
         beta_values=None,
-        force_loo_accuracy=False,
-        force_weighted_centroid=True,
-        oneshot_mode=None,
+        query_features=None,
+        rho=0.5,
     ):
         selector = cls.__new__(cls)
         selector.device = torch.device(device)
         selector.alpha_steps = max(2, int(alpha_steps))
-        selector.oneshot_mode = cls._coerce_oneshot_mode(oneshot_mode, cls.DEFAULT_ONESHOT_MODES)
-        selector.force_loo_accuracy = cls._coerce_bool(force_loo_accuracy, False)
-        selector.force_weighted_centroid = cls._coerce_bool(force_weighted_centroid, True)
+        selector.rho = min(max(coerce_to_float(rho, 0.5), 0.0), 1.0)
         selector.centroid_mix_beta_values = cls._coerce_float_list(
             beta_values,
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
@@ -171,13 +116,36 @@ class ProtoFuse(BaseTrainer):
         num_classes = selector.text_prototypes.shape[0]
 
         visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
-        fused_prototypes, alpha = selector.hopc_alpha(
+        fused_prototypes, alpha_init = selector.hopc_alpha(
             selector.text_prototypes,
             visual_centroids,
             train_features,
             train_labels,
             num_classes,
         )
+        query_centroids = visual_centroids
+        expanded_centroids = visual_centroids
+        alpha = alpha_init
+        if query_features is not None:
+            query_features = F.normalize(query_features.to(selector.device).float(), dim=-1)
+            query_centroids = selector.build_query_pseudo_centroids(
+                query_features,
+                selector.text_prototypes,
+                visual_centroids,
+                alpha_init,
+            )
+            expanded_centroids = selector.expand_visual_centroids(
+                visual_centroids,
+                query_centroids,
+            )
+            fused_prototypes, alpha = selector.hopc_alpha(
+                selector.text_prototypes,
+                expanded_centroids,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids=query_centroids,
+            )
 
         centroid_mask = torch.zeros(num_classes, device=selector.device, dtype=torch.bool)
         valid_labels = train_labels[(train_labels >= 0) & (train_labels < num_classes)]
@@ -189,12 +157,15 @@ class ProtoFuse(BaseTrainer):
         return {
             'fused_prototypes': fused_for_inference,
             'raw_fused_prototypes': fused_prototypes,
-            'visual_centroids': visual_centroids,
+            'visual_centroids': expanded_centroids,
+            'support_visual_centroids': visual_centroids,
+            'query_centroids': query_centroids,
             'text_prototypes': selector.text_prototypes,
             'centroid_mask': centroid_mask,
             'missing_classes': torch.nonzero(~centroid_mask, as_tuple=False).flatten().cpu().tolist(),
             'alpha': alpha,
-            'oneshot_mode': selector.oneshot_mode,
+            'alpha_init': alpha_init,
+            'rho': selector.rho,
         }
 
     def extract_features(self, dataloader):
@@ -208,37 +179,55 @@ class ProtoFuse(BaseTrainer):
                 all_labels.append(labels)
         return torch.cat(all_features, dim=0), torch.cat(all_labels, dim=0)
 
-    def _weighted_visual_centroid(self, class_features, text_prototype):
-        class_features = class_features.to(self.device)
-        text_prototype = text_prototype.to(self.device)
-        similarities = F.cosine_similarity(
-            F.normalize(class_features, dim=-1),
-            F.normalize(text_prototype, dim=-1).unsqueeze(0),
-            dim=-1,
-        ).clamp_min(0.0)
-        sim_sum = similarities.sum()
-        if sim_sum <= 1e-12:
-            weights = torch.full_like(similarities, 1.0 / similarities.numel())
-        else:
-            weights = similarities / sim_sum
-        return F.normalize((weights.unsqueeze(-1) * class_features).sum(dim=0), dim=-1)
-
-    def _average_visual_centroid(self, class_features):
+    def _visual_centroid(self, class_features):
         class_features = class_features.to(self.device)
         return F.normalize(class_features.mean(dim=0), dim=-1)
-
-    def _visual_centroid(self, class_features, text_prototype):
-        if getattr(self, 'force_weighted_centroid', True):
-            return self._weighted_visual_centroid(class_features, text_prototype)
-        return self._average_visual_centroid(class_features)
 
     def build_visual_centroids(self, features, labels, num_classes):
         centroids = torch.zeros(num_classes, self.embed_dim, device=self.device)
         for i in range(num_classes):
             mask = (labels == i)
             if mask.any():
-                centroids[i] = self._visual_centroid(features[mask], self.text_prototypes[i])
+                centroids[i] = self._visual_centroid(features[mask])
         return centroids
+
+    def build_query_pseudo_centroids(self, query_features, T, V, alpha_init):
+        query_features = F.normalize(query_features.to(self.device).float(), dim=-1)
+        num_classes = T.shape[0]
+        query_centroids = V.clone()
+
+        if query_features.numel() == 0 or num_classes < 2:
+            return query_centroids
+
+        initial_prototypes = F.normalize(
+            (1.0 - alpha_init) * T + alpha_init * V,
+            dim=-1,
+        )
+        similarities = query_features @ initial_prototypes.T
+        top2_scores, top2_classes = similarities.topk(k=2, dim=-1)
+        pseudo_labels = top2_classes[:, 0]
+        confidence = ((top2_scores[:, 0] - top2_scores[:, 1]) / 2.0).clamp(0.0, 1.0)
+
+        confidence_mass = torch.zeros(
+            num_classes,
+            device=self.device,
+            dtype=query_features.dtype,
+        )
+        confidence_mass.index_add_(0, pseudo_labels, confidence)
+
+        weighted_sums = torch.zeros_like(V)
+        weighted_sums.index_add_(0, pseudo_labels, confidence.unsqueeze(-1) * query_features)
+        valid_mass = confidence_mass > self.NUMERICAL_EPSILON
+        if valid_mass.any():
+            query_centroids[valid_mass] = F.normalize(
+                weighted_sums[valid_mass] / confidence_mass[valid_mass].unsqueeze(-1),
+                dim=-1,
+            )
+
+        return query_centroids
+
+    def expand_visual_centroids(self, V, query_centroids):
+        return F.normalize((1.0 - self.rho) * V + self.rho * query_centroids, dim=-1)
 
     def _conservative_gain_score(self, values):
         values = values.float()
@@ -252,15 +241,8 @@ class ProtoFuse(BaseTrainer):
         score_idx = int(scores.argmax().item())
         return score_idx, scores[score_idx].item()
 
-    def _centroid_mix_neighbors(self, T, V_all, mode):
-        if mode == 'vv':
-            similarity = V_all @ V_all.T
-        elif mode == 'tt':
-            similarity = T @ T.T
-        elif mode == 'hybrid':
-            similarity = 0.5 * (V_all @ V_all.T) + 0.5 * (T @ T.T)
-        else:
-            raise ValueError(f"Unknown centroid-mix neighbor mode: {mode}")
+    def _centroid_mix_neighbors(self, V_all):
+        similarity = V_all @ V_all.T
         similarity = similarity.clone()
         similarity.fill_diagonal_(-float('inf'))
         return similarity.argmax(dim=1)
@@ -268,23 +250,12 @@ class ProtoFuse(BaseTrainer):
     def _centroid_mix_net_curve(self, T, V_all, neighbors, beta, num_classes):
         labels = torch.arange(num_classes, device=self.device)
         pseudo_features = F.normalize((1.0 - beta) * V_all + beta * V_all[neighbors], dim=-1)
-        if getattr(self, 'force_loo_accuracy', False):
-            text_correct = None
-        else:
-            text_preds = (pseudo_features @ T.T).argmax(dim=-1)
-            text_correct = text_preds.eq(labels)
-
         net_scores = []
         for alpha in self.alphas:
             proto = F.normalize((1.0 - alpha) * T + alpha * V_all, dim=-1)
             fused_preds = (pseudo_features @ proto.T).argmax(dim=-1)
             fused_correct = fused_preds.eq(labels)
-            if getattr(self, 'force_loo_accuracy', False):
-                net_scores.append(fused_correct.sum().float())
-            else:
-                rescue = (~text_correct) & fused_correct
-                damage = text_correct & ~fused_correct
-                net_scores.append(rescue.sum().float() - damage.sum().float())
+            net_scores.append(fused_correct.sum().float())
         return torch.stack(net_scores)
 
     def _centroid_mix_alpha(self, T, V_all, num_classes):
@@ -296,20 +267,127 @@ class ProtoFuse(BaseTrainer):
             return 0.0
 
         best = {'score': -float('inf'), 'alpha': 0.0}
-        for mode in self.oneshot_mode:
-            neighbors = self._centroid_mix_neighbors(T, V_all, mode)
-            for beta in beta_values:
-                net_curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
-                alpha_idx, score = self._conservative_gain_score(net_curve)
-                if alpha_idx is None:
-                    continue
-                alpha = self.alphas[alpha_idx].item()
-                if score > best['score'] or (score == best['score'] and alpha < best['alpha']):
-                    best = {'score': score, 'alpha': alpha}
+        neighbors = self._centroid_mix_neighbors(V_all)
+        for beta in beta_values:
+            net_curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
+            alpha_idx, score = self._conservative_gain_score(net_curve)
+            if alpha_idx is None:
+                continue
+            alpha = self.alphas[alpha_idx].item()
+            if score > best['score'] or (score == best['score'] and alpha < best['alpha']):
+                best = {'score': score, 'alpha': alpha}
 
         return best['alpha'] if best['score'] > 0.0 else 0.0
 
-    def hopc_alpha(self, T, V_all, train_features, train_labels, num_classes):
+    def support_calibration_score(
+        self,
+        T,
+        V_all,
+        alpha,
+        train_features,
+        train_labels,
+        num_classes,
+        query_centroids=None,
+    ):
+        class_indices = [
+            torch.nonzero(train_labels == class_idx, as_tuple=False).flatten()
+            for class_idx in range(num_classes)
+        ]
+        shots_per_class = min(int(indices.numel()) for indices in class_indices)
+
+        if shots_per_class < 2:
+            alpha_idx = int(torch.abs(self.alphas - float(alpha)).argmin().item())
+            beta_values = sorted({
+                round(float(beta), 6)
+                for beta in self.centroid_mix_beta_values
+                if 0.0 < float(beta) < 0.5
+            })
+            if 0.45 not in beta_values:
+                beta_values.append(0.45)
+                beta_values.sort()
+            neighbors = self._centroid_mix_neighbors(V_all)
+            scores = []
+            for beta in beta_values:
+                curve = self._centroid_mix_net_curve(
+                    T,
+                    V_all,
+                    neighbors,
+                    beta,
+                    num_classes,
+                )
+                scores.append(curve[alpha_idx])
+            if not scores:
+                return 0.0
+            return float(torch.stack(scores).max().item())
+
+        k = shots_per_class
+        class_features = torch.stack([
+            train_features[class_indices[class_idx][:k]].to(self.device)
+            for class_idx in range(num_classes)
+        ])
+        targets = torch.arange(num_classes, device=self.device)
+        score = torch.zeros((), device=self.device)
+
+        for hold_idx in range(k):
+            held = F.normalize(class_features[:, hold_idx, :], dim=-1)
+            keep = torch.arange(k, device=self.device) != hold_idx
+            fold_centroids = torch.stack([
+                self._visual_centroid(class_features[class_idx, keep])
+                for class_idx in range(num_classes)
+            ])
+            if query_centroids is not None:
+                fold_centroids = self.expand_visual_centroids(
+                    fold_centroids,
+                    query_centroids,
+                )
+            prototypes = F.normalize(
+                (1.0 - float(alpha)) * T + float(alpha) * fold_centroids,
+                dim=-1,
+            )
+            fused_correct = (held @ prototypes.T).argmax(dim=-1).eq(targets)
+            score += fused_correct.sum().float()
+        return float(score.item())
+
+    def select_fallback_candidate(
+        self,
+        T,
+        V,
+        expanded_V,
+        alpha_init,
+        alpha_final,
+        train_features,
+        train_labels,
+        num_classes,
+        query_centroids,
+    ):
+        candidates = [
+            ("orig", V, alpha_init, None),
+            ("qx_fixed_alpha", expanded_V, alpha_init, query_centroids),
+            ("qx_recal_alpha", expanded_V, alpha_final, query_centroids),
+        ]
+        scored = []
+        for name, centroids, alpha, fold_query_centroids in candidates:
+            score = self.support_calibration_score(
+                T,
+                centroids,
+                alpha,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids=fold_query_centroids,
+            )
+            scored.append((name, centroids, float(alpha), score))
+        return max(scored, key=lambda candidate: candidate[3]), scored
+
+    def hopc_alpha(
+        self,
+        T,
+        V_all,
+        train_features,
+        train_labels,
+        num_classes,
+        query_centroids=None,
+    ):
         class_indices = [[] for _ in range(num_classes)]
         for idx, lbl in enumerate(train_labels.tolist()):
             class_indices[lbl].append(idx)
@@ -331,11 +409,15 @@ class ProtoFuse(BaseTrainer):
                 held = F.normalize(class_feat[:, hold_idx, :], dim=-1)
                 V_minus = torch.stack([
                     self._visual_centroid(
-                        class_feat[c, torch.arange(k, device=self.device) != hold_idx],
-                        T[c],
+                        class_feat[c, torch.arange(k, device=self.device) != hold_idx]
                     )
                     for c in range(num_classes)
                 ])
+                if query_centroids is not None:
+                    V_minus = self.expand_visual_centroids(
+                        V_minus,
+                        query_centroids,
+                    )
 
                 refined = F.normalize(
                     (1 - self.alphas).view(-1, 1, 1) * T + self.alphas.view(-1, 1, 1) * V_minus,
@@ -344,14 +426,7 @@ class ProtoFuse(BaseTrainer):
                 fused_preds = torch.einsum("cd,akd->ack", held, refined).argmax(dim=-1)
                 fused_correct = fused_preds.eq(targets.view(1, -1))
 
-                if getattr(self, 'force_loo_accuracy', False):
-                    net_scores += fused_correct.sum(dim=1).float()
-                else:
-                    text_preds = (held @ T.T).argmax(dim=-1)
-                    text_correct = text_preds.eq(targets)
-                    rescue = (~text_correct).view(1, -1) & fused_correct
-                    damage = text_correct.view(1, -1) & ~fused_correct
-                    net_scores += rescue.sum(dim=1).float() - damage.sum(dim=1).float()
+                net_scores += fused_correct.sum(dim=1).float()
 
             best_alpha = self.alphas[net_scores.argmax()].item()
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
@@ -362,9 +437,58 @@ class ProtoFuse(BaseTrainer):
         V = self.build_visual_centroids(train_features, train_labels, num_classes)
         T = self.text_prototypes
 
-        proto, alpha = self.hopc_alpha(T, V, train_features, train_labels, num_classes)
+        _, alpha_init = self.hopc_alpha(T, V, train_features, train_labels, num_classes)
+        query_centroids = self.build_query_pseudo_centroids(
+            eval_features,
+            T,
+            V,
+            alpha_init,
+        )
+        expanded_V = self.expand_visual_centroids(V, query_centroids)
+        _, alpha_final = self.hopc_alpha(
+            T,
+            expanded_V,
+            train_features,
+            train_labels,
+            num_classes,
+            query_centroids=query_centroids,
+        )
+        selected, candidate_scores = self.select_fallback_candidate(
+            T,
+            V,
+            expanded_V,
+            alpha_init,
+            alpha_final,
+            train_features,
+            train_labels,
+            num_classes,
+            query_centroids,
+        )
+        selected_candidate, selected_V, alpha, selected_score = selected
+        proto = F.normalize((1.0 - alpha) * T + alpha * selected_V, dim=-1)
         self.fused_prototypes = proto
         self.best_alpha = alpha
+        self.alpha_init = alpha_init
+        self.alpha_final = alpha_final
+        self.selected_candidate = selected_candidate
+        self.candidate_scores = {name: score for name, _, _, score in candidate_scores}
+        self.support_visual_centroids = V
+        self.query_centroids = query_centroids
+        self.expanded_visual_centroids = selected_V
+        if not getattr(self, '_transductive_log_emitted', False):
+            centroid_shift = torch.linalg.vector_norm(expanded_V - V, dim=-1).mean().item()
+            score_text = ",".join(
+                f"{name}:{score:.3f}" for name, _, _, score in candidate_scores
+            )
+            print(
+                f"[ProtoFuse transductive] applied=true rho={self.rho:.2f} "
+                f"alpha_init={alpha_init:.2f} alpha_final={alpha_final:.2f} "
+                f"selected={selected_candidate} alpha={alpha:.2f} "
+                f"score={selected_score:.3f} candidates={score_text} "
+                f"centroid_shift={centroid_shift:.6f}",
+                flush=True,
+            )
+            self._transductive_log_emitted = True
 
         eval_norm = F.normalize(eval_features.to(self.device), dim=-1)
         logits = eval_norm @ proto.T
@@ -374,6 +498,11 @@ class ProtoFuse(BaseTrainer):
 
         metrics = compute_metrics(labels_list, preds)
         metrics['alpha'] = alpha
+        metrics['alpha_init'] = alpha_init
+        metrics['alpha_final'] = alpha_final
+        metrics['rho'] = self.rho
+        metrics['selected_candidate'] = selected_candidate
+        metrics['candidate_scores'] = self.candidate_scores
         return metrics
 
     def train_step(self, batch):
@@ -404,8 +533,15 @@ class ProtoFuse(BaseTrainer):
             'fused_prototypes': self.fused_prototypes,
             'text_prototypes': self.text_prototypes,
             'best_alpha': self.best_alpha,
+            'alpha_init': getattr(self, 'alpha_init', None),
+            'alpha_final': getattr(self, 'alpha_final', None),
+            'selected_candidate': getattr(self, 'selected_candidate', None),
+            'candidate_scores': getattr(self, 'candidate_scores', None),
+            'rho': self.rho,
+            'support_visual_centroids': getattr(self, 'support_visual_centroids', None),
+            'query_centroids': getattr(self, 'query_centroids', None),
+            'expanded_visual_centroids': getattr(self, 'expanded_visual_centroids', None),
             'alpha_steps': self.alpha_steps,
-            'oneshot_mode': self.oneshot_mode,
             'classnames': self.classnames,
         }, path)
         # logger.info(f"ProtoFuse prototypes saved to {path}")
@@ -415,4 +551,12 @@ class ProtoFuse(BaseTrainer):
         self.fused_prototypes = data['fused_prototypes']
         self.text_prototypes = data['text_prototypes']
         self.best_alpha = data['best_alpha']
+        self.alpha_init = data.get('alpha_init')
+        self.alpha_final = data.get('alpha_final')
+        self.selected_candidate = data.get('selected_candidate')
+        self.candidate_scores = data.get('candidate_scores')
+        self.rho = data.get('rho', getattr(self, 'rho', 0.5))
+        self.support_visual_centroids = data.get('support_visual_centroids')
+        self.query_centroids = data.get('query_centroids')
+        self.expanded_visual_centroids = data.get('expanded_visual_centroids')
         # logger.info(f"ProtoFuse prototypes loaded from {path}")

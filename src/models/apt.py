@@ -581,7 +581,6 @@ class APT:
         train_text_features,
         train_labels,
         alpha_steps=101,
-        force_loo_accuracy=False,
     ):
         if self.text_prototypes is None:
             raise RuntimeError("Call support_text_prototypes before selecting APT post-hoc alpha.")
@@ -624,24 +623,13 @@ class APT:
                 visual_minus.append(self._weighted_centroid_from_features(class_features, self.text_prototypes[class_idx]))
             visual_minus = torch.stack(visual_minus, dim=0)
 
-            if force_loo_accuracy:
-                baseline_correct = None
-            else:
-                baseline_logits = torch.einsum("cd,ckd->ck", held_images, held_text)
-                baseline_correct = baseline_logits.argmax(dim=-1).eq(targets)
-
             for alpha_idx, alpha in enumerate(alphas):
                 fused_text = F.normalize(
                     (1.0 - alpha) * held_text + alpha * visual_minus.unsqueeze(0),
                     dim=-1,
                 )
                 fused_correct = torch.einsum("cd,ckd->ck", held_images, fused_text).argmax(dim=-1).eq(targets)
-                if force_loo_accuracy:
-                    net_scores[alpha_idx] += fused_correct.sum().float()
-                else:
-                    rescue = (~baseline_correct) & fused_correct
-                    damage = baseline_correct & ~fused_correct
-                    net_scores[alpha_idx] += rescue.sum().float() - damage.sum().float()
+                net_scores[alpha_idx] += fused_correct.sum().float()
 
         return alphas[int(net_scores.argmax().item())].item()
 
