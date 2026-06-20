@@ -26,13 +26,20 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.models.ape import APE
+from src.models.ape import APE, _search_ape_hyperparameters
 from src.models.apt import CUSTOM_TEMPLATES
 from src.models.proto_adapter import ProtoAdapter
 from src.models.protofuse import ProtoFuse
 from src.models.timo import TIMO, _gda, _image_guide_text, _vec_sort
 from src.models.tip_adapter import TipAdapter
-from utils import ConfigNode, deep_merge_dicts, load_clip_to_cpu, load_config_file, set_global_seed
+from utils import (
+    ConfigNode,
+    deep_merge_dicts,
+    discover_dataset_envs,
+    load_clip_to_cpu,
+    load_config_file,
+    set_global_seed,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -71,7 +78,7 @@ def parse_method_list(raw):
     return methods
 
 
-def load_method_config(method, args, kshot, seed):
+def load_method_config(method, args, kshot, seed, dataset_root, dataset_name):
     config_name = {
         "zeroshot": "protofuse",
         "tip": "tip_adapter",
@@ -90,8 +97,8 @@ def load_method_config(method, args, kshot, seed):
             "batch_size": args.batch_size,
         },
         "data": {
-            "dataset_name": args.dataset_name,
-            "root": str(args.dataset_root),
+            "dataset_name": dataset_name,
+            "root": str(dataset_root),
             "kshot": kshot,
             "seed": seed,
             "num_workers": args.num_workers,
@@ -456,23 +463,20 @@ def run_ape(cfg, classnames, text_features, train_features, train_labels, device
         r_ff_val = new_val_features @ new_cache_keys.t()
         r_fw_val = 100.0 * raw_val_features @ clip_weights
 
-        beta_list = [i * (trainer.search_scale[0] - 0.1) / trainer.search_step[0] + 0.1 for i in range(trainer.search_step[0])]
-        alpha_list = [i * (trainer.search_scale[1] - 0.1) / trainer.search_step[1] + 0.1 for i in range(trainer.search_step[1])]
-        gamma_list = [i * trainer.search_scale[2] / trainer.search_step[2] for i in range(trainer.search_step[2])]
-
-        best_acc = 0.0
-        best_alpha, best_beta, best_gamma = trainer.init_alpha, trainer.init_beta, trainer.init_gamma
-        for beta in beta_list:
-            for alpha in alpha_list:
-                for gamma in gamma_list:
-                    with torch.no_grad():
-                        soft_values = flat_values * (cache_div * gamma).exp()
-                        cache_logits = ((-1) * (beta - beta * r_ff_val)).exp() @ soft_values
-                        logits = r_fw_val + cache_logits * alpha
-                    acc = trainer._cls_acc(logits, val_labels_dev)
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_alpha, best_beta, best_gamma = alpha, beta, gamma
+        best_acc, best_alpha, best_beta, best_gamma = (
+            _search_ape_hyperparameters(
+                r_ff_val,
+                r_fw_val,
+                flat_values,
+                cache_div,
+                val_labels_dev,
+                trainer.search_scale,
+                trainer.search_step,
+                trainer.init_alpha,
+                trainer.init_beta,
+                trainer.init_gamma,
+            )
+        )
 
         inference_soft_values = flat_values * (cache_div * best_gamma).exp()
         trainer.benchmark_state = SimpleNamespace(
@@ -583,30 +587,45 @@ def run_timo(cfg, classnames, text_features, train_features, train_labels, devic
     return (*setup_metrics, logits_fn)
 
 
-def run_protofuse(cfg, classnames, text_features, train_features, train_labels, device):
+def run_protofuse(
+    cfg,
+    classnames,
+    text_features,
+    train_features,
+    train_labels,
+    query_features,
+    query_labels,
+    device,
+):
     alpha_steps = int(cfg.get("model", ConfigNode()).get("alpha_steps", 101))
+    rho = float(cfg.get("model", ConfigNode()).get("rho", 0.5))
     beta_values = cfg.get("model", ConfigNode()).get("centroid_mix", ConfigNode()).get(
-        "beta_values", [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+        "beta_values", [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
     )
 
-    state = {}
+    trainer = ProtoFuse.from_precomputed(
+        text_features,
+        device,
+        alpha_steps=alpha_steps,
+        beta_values=beta_values,
+        rho=rho,
+        classnames=classnames,
+    )
 
     def setup():
-        selection = ProtoFuse.posthoc_fuse(
-            text_features,
+        trainer.fuse_and_evaluate(
             train_features,
             train_labels,
-            device,
-            alpha_steps=alpha_steps,
-            beta_values=beta_values,
+            query_features,
+            query_labels,
+            len(classnames),
         )
-        state["fused_prototypes"] = selection["fused_prototypes"]
-        return tensor_bytes(selection["fused_prototypes"])
+        return tensor_bytes(trainer.fused_prototypes)
 
     setup_metrics = benchmark_setup(device, setup)
 
     def logits_fn(features):
-        return features.to(device).float() @ state["fused_prototypes"].t()
+        return features.to(device).float() @ trainer.fused_prototypes.T
 
     return (*setup_metrics, logits_fn)
 
@@ -647,8 +666,13 @@ def method_label(method):
     }[method]
 
 
-def build_summary_table(results, device):
-    table = Table(title=f"Average Computational Cost ({len(KSHOTS)} k-shot x {len(SEEDS)} seeds)")
+def build_summary_table(results, device, dataset_count=1):
+    table = Table(
+        title=(
+            f"Average Computational Cost "
+            f"({dataset_count} datasets x {len(KSHOTS)} k-shot x {len(SEEDS)} seeds)"
+        )
+    )
     table.add_column("method", style="bold")
     table.add_column("Setup (s)", justify="right")
     table.add_column("Peak Mem (MB)", justify="right")
@@ -697,6 +721,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark few-shot setup computational cost.")
     parser.add_argument("--dataset-root", type=Path, default=REPO_ROOT / "datasets" / "DTD")
     parser.add_argument("--dataset-name", default="DTD")
+    parser.add_argument(
+        "--data.all",
+        dest="all_datasets",
+        nargs="?",
+        const="true",
+        default="false",
+        help="Run every dataset discovered from *_DATA_ROOT environment variables.",
+    )
     parser.add_argument("--backbone", default="ViT-B/16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--precision", default="fp32")
@@ -713,28 +745,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    global KSHOTS, SEEDS, METHODS
-    args = parse_args()
-    KSHOTS = parse_int_list(args.kshots)
-    SEEDS = parse_int_list(args.seeds)
-    METHODS = parse_method_list(args.methods)
-
-    requested_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    if not str(requested_device).startswith("cuda"):
-        console.print("[yellow]CUDA is not available; GPU memory columns will be N/A.[/yellow]")
-
-    console.print("[bold]Loading dataset and extracting CLIP features with all caches disabled...[/bold]")
-    dataset = load_train_dataset(args.dataset_root)
-    test_dataset = load_test_dataset(args.dataset_root)
+def run_dataset(args, dataset_root, dataset_name, requested_device, clip_model):
+    console.print(
+        f"[bold]Running {dataset_name} from {dataset_root}[/bold]"
+    )
+    dataset = load_train_dataset(dataset_root)
+    test_dataset = load_test_dataset(dataset_root)
     classnames = list(dataset.classes)
     set_global_seed(1)
-    clip_model = load_clip_to_cpu(args.backbone)
-    if args.precision in {"fp32", "amp"}:
-        clip_model.float()
-    clip_model = clip_model.to(requested_device).eval()
-    for param in clip_model.parameters():
-        param.requires_grad_(False)
 
     image_features, labels = extract_image_features(
         clip_model,
@@ -743,30 +761,25 @@ def main():
         args.batch_size,
         args.num_workers,
     )
-    test_features, _ = extract_image_features(
+    test_features, test_labels = extract_image_features(
         clip_model,
         test_dataset,
         requested_device,
         args.batch_size,
         args.num_workers,
     )
-    text_features = build_text_features(clip_model, classnames, args.dataset_name, requested_device)
+    text_features = build_text_features(
+        clip_model,
+        classnames,
+        dataset_name,
+        requested_device,
+    )
     logit_scale = clip_model.logit_scale.detach().to(requested_device).exp()
     infer_features = prepare_infer_features(test_features, args.infer_features, requested_device)
-    del clip_model
-    gc.collect()
-    if str(requested_device).startswith("cuda"):
-        torch.cuda.empty_cache()
 
     console.print(
-        f"Dataset={args.dataset_name}, classes={len(classnames)}, support pool={len(dataset)}, "
+        f"Dataset={dataset_name}, classes={len(classnames)}, support pool={len(dataset)}, "
         f"test pool={len(test_dataset)}, backbone={args.backbone}, device={requested_device}"
-    )
-    console.print("Disk feature/checkpoint caches are disabled; APE criterion cache is bypassed in-memory.")
-    console.print(
-        "Infer Time is measured after adaptation on cached test image features and reports the time to "
-        f"compute logits for {args.infer_features:,} features. It excludes CLIP image encoding, data loading, "
-        "and setup/adaptation time."
     )
 
     results = []
@@ -786,7 +799,14 @@ def main():
                 for method in METHODS:
                     progress.update(task, description=f"{method_label(method)} | {kshot}-shot | seed {seed}")
                     set_global_seed(seed)
-                    cfg = load_method_config(method, args, kshot, seed)
+                    cfg = load_method_config(
+                        method,
+                        args,
+                        kshot,
+                        seed,
+                        dataset_root,
+                        dataset_name,
+                    )
                     runner = RUNNERS[method]
                     if method == "zeroshot":
                         metrics = runner(text_features, logit_scale, requested_device)
@@ -810,6 +830,17 @@ def main():
                             support_labels,
                             requested_device,
                         )
+                    elif method == "protofuse":
+                        metrics = runner(
+                            cfg,
+                            classnames,
+                            text_features,
+                            support_features,
+                            support_labels,
+                            test_features,
+                            test_labels,
+                            requested_device,
+                        )
                     else:
                         metrics = runner(
                             cfg,
@@ -829,6 +860,7 @@ def main():
                     )
                     results.append(
                         {
+                            "dataset": dataset_name,
                             "method": method,
                             "kshot": kshot,
                             "seed": seed,
@@ -842,10 +874,85 @@ def main():
                     if str(requested_device).startswith("cuda"):
                         torch.cuda.empty_cache()
                     progress.advance(task)
+    return results
+
+
+def main():
+    global KSHOTS, SEEDS, METHODS
+    args = parse_args()
+    KSHOTS = parse_int_list(args.kshots)
+    SEEDS = parse_int_list(args.seeds)
+    METHODS = parse_method_list(args.methods)
+
+    requested_device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if not str(requested_device).startswith("cuda"):
+        console.print("[yellow]CUDA is not available; GPU memory columns will be N/A.[/yellow]")
+
+    all_datasets = str(args.all_datasets).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if all_datasets:
+        discovered = discover_dataset_envs()
+        if not discovered:
+            raise RuntimeError(
+                "No environment variables ending with _DATA_ROOT were found."
+            )
+        dataset_runs = [
+            (Path(item["root"]), item["dataset_name"])
+            for item in discovered
+        ]
+    else:
+        dataset_runs = [(args.dataset_root, args.dataset_name)]
+
+    console.print("[bold]Loading CLIP once; dataset features are extracted per dataset.[/bold]")
+    clip_model = load_clip_to_cpu(args.backbone)
+    if args.precision in {"fp32", "amp"}:
+        clip_model.float()
+    clip_model = clip_model.to(requested_device).eval()
+    for param in clip_model.parameters():
+        param.requires_grad_(False)
+
+    console.print("Disk feature/checkpoint caches are disabled; APE criterion cache is bypassed in-memory.")
+    console.print(
+        "Infer Time is measured after adaptation on cached test image features and reports the time to "
+        f"compute logits for {args.infer_features:,} features. It excludes CLIP image encoding, data loading, "
+        "and setup/adaptation time."
+    )
+
+    results = []
+    completed_datasets = []
+    for dataset_root, dataset_name in dataset_runs:
+        results.extend(
+            run_dataset(
+                args,
+                dataset_root,
+                dataset_name,
+                requested_device,
+                clip_model,
+            )
+        )
+        completed_datasets.append(dataset_name)
+        gc.collect()
+        if str(requested_device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     console.print()
-    console.print(build_summary_table(results, requested_device))
-    if args.show_kshot_table:
+    console.print(
+        "[bold]Datasets run:[/bold] "
+        + ", ".join(completed_datasets)
+    )
+    console.print(
+        build_summary_table(
+            results,
+            requested_device,
+            dataset_count=len(completed_datasets),
+        )
+    )
+    if args.show_kshot_table and not all_datasets:
         console.print()
         console.print(build_kshot_table(results, requested_device))
 

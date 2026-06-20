@@ -86,13 +86,23 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
         # logger.info("Extracting test features...")
         test_features, test_labels = self._cached_test_features()
 
-        results = self.trainer.evaluate_ape(tune_features, tune_labels, test_features, test_labels)
+        criterion_cache_path = (
+            None if bool(self.logging_cfg.get("summary_only", False)) else "default"
+        )
+        results = self.trainer.evaluate_ape(
+            tune_features,
+            tune_labels,
+            test_features,
+            test_labels,
+            criterion_cache_path=criterion_cache_path,
+        )
         self.best_val_acc = results.get('accuracy', 0.0)
         self.metrics.append({'method': 'APE', **results})
 
         # logger.info(f"APE Accuracy: {results.get('accuracy', 0.0):.2f}%")
         # logger.info(f"APE MCA: {results.get('mca', 0.0):.2f}%")
-        log_experiment_metrics(results, title=self._metrics_title("APE"))
+        if not bool(self.logging_cfg.get("summary_only", False)):
+            log_experiment_metrics(results, title=self._metrics_title("APE"))
 
         if self._posthoc_protofuse_enabled():
             self._run_posthoc_protofuse(train_features, train_labels, tune_features, tune_labels, test_features, test_labels, results)
@@ -108,14 +118,15 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             self.best_val_acc = max(self.best_val_acc, ape_t_results.get('accuracy', 0.0))
             self.metrics.append({'method': 'APE-T', **ape_t_results})
             # logger.info(f"APE-T Accuracy: {ape_t_results.get('accuracy', 0.0):.2f}%")
-            log_experiment_metrics(ape_t_results, title=self._metrics_title("APE-T"))
+            if not bool(self.logging_cfg.get("summary_only", False)):
+                log_experiment_metrics(ape_t_results, title=self._metrics_title("APE-T"))
 
     def _run_posthoc_protofuse(self, train_features, train_labels, tune_features, tune_labels, test_features, test_labels, baseline_metrics):
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values = (
+        alpha_steps, beta_values, rho = (
             self._posthoc_protofuse_selector_settings()
         )
 
@@ -128,6 +139,8 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
+            query_features=test_features,
+            rho=rho,
         )
         fused_clip_weights = self.trainer.apply_posthoc_protofuse(
             alpha=selection['alpha'],
@@ -162,7 +175,8 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
         })
         self.metrics.append(result)
         self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
-        log_experiment_metrics(result, title=self._metrics_title("APE+ProtoFuse"))
+        if not bool(self.logging_cfg.get("summary_only", False)):
+            log_experiment_metrics(result, title=self._metrics_title("APE+ProtoFuse"))
 
         if bool(cfg.get('save_prototypes', True)):
             proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')

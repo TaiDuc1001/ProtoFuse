@@ -6,16 +6,16 @@ from utils import (
     parse_override_arguments,
     merge_configs,
     load_config_file,
-    run_for_dataset_configs,
 )
 
 from src.pipelines.timo import TIMOPipeline
+from src.pipelines.batch_sweep import run_batch_sweep
 
 ARG_SCHEMA = DEFAULT_ARG_SCHEMA
 
 
 def parse_args():
-    parser = create_argument_parser("Run TIMO", ARG_SCHEMA)
+    parser = create_argument_parser("Run TIMO batch sweep", ARG_SCHEMA)
     parsed, unknown = parser.parse_known_args()
     overrides = parse_override_arguments(unknown)
     overrides = process_parsed_args(parsed, ARG_SCHEMA, overrides)
@@ -25,9 +25,8 @@ def parse_args():
 def main():
     args, overrides = parse_args()
     setup_logging(getattr(args, 'debug', True), getattr(args, 'disable_coloring', True))
-    base_config = load_config_file(args.config)
-    merged = merge_configs(base_config, overrides)
-    run_for_dataset_configs(merged, lambda dataset_config, _: TIMOPipeline(dataset_config).run())
+    config = merge_configs(load_config_file(args.config), overrides)
+    run_batch_sweep(config, overrides, TIMOPipeline)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             raise RuntimeError("Trainer not initialized before post-hoc ProtoFuse.")
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values = (
+        alpha_steps, beta_values, rho = (
             self._posthoc_protofuse_selector_settings()
         )
 
@@ -119,6 +119,8 @@ class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
+            query_features=eval_features,
+            rho=rho,
         )
         fused_prototypes = self.trainer.apply_posthoc_protofuse(
             alpha=selection['alpha'],
@@ -153,7 +155,8 @@ class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
         result = self._add_base_novel_metrics(result)
         self.metrics.append(result)
         self.best_val_acc = max(self.best_val_acc, result.get('accuracy', 0.0))
-        log_experiment_metrics(result, title=self._metrics_title("ProtoAdapter+ProtoFuse"))
+        if not bool(self.logging_cfg.get("summary_only", False)):
+            log_experiment_metrics(result, title=self._metrics_title("ProtoAdapter+ProtoFuse"))
 
         if bool(cfg.get('save_prototypes', True)):
             proto_path = os.path.join(self.run_dir, 'posthoc_protofuse.pt')
@@ -179,7 +182,8 @@ class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
         # logger.info(f"Proto-Adapter complete. Results written to {self.run_dir}")
 
         final_metrics = self.metrics[-1] if self.metrics else {}
-        log_experiment_metrics(final_metrics, title=self._metrics_title())
+        if not bool(self.logging_cfg.get("summary_only", False)):
+            log_experiment_metrics(final_metrics, title=self._metrics_title())
 
 
 BaseTrainingPipeline.register_extra_pipeline(ProtoAdapterPipeline)

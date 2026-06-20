@@ -178,7 +178,12 @@ class APTTrainingPipeline:
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        return alpha_steps, beta_values
+        rho = coerce_to_float(
+            cfg.get('rho', get_config_value(proto_cfg, 'model.rho', 0.5)),
+            0.5,
+            key='posthoc_protofuse.rho',
+        )
+        return alpha_steps, beta_values, rho
 
     @property
     def val_dataset(self):
@@ -549,7 +554,7 @@ class APTTrainingPipeline:
         )
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values = (
+        alpha_steps, beta_values, rho = (
             self._posthoc_protofuse_selector_settings()
         )
 
@@ -560,6 +565,7 @@ class APTTrainingPipeline:
         apt_metrics = self.trainer.evaluate(self.val_loader)
         log_experiment_metrics(apt_metrics, title=self._metrics_title("APT w/o ProtoFuse"))
         train_features, train_text_features, train_labels = self.trainer.extract_posthoc_features(train_loader)
+        query_features, _, _ = self.trainer.extract_posthoc_features(self.val_loader)
 
         text_prototypes = self.trainer.support_text_prototypes(train_text_features, train_labels)
         selection = ProtoFuse.posthoc_fuse(
@@ -569,14 +575,10 @@ class APTTrainingPipeline:
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
+            query_features=query_features,
+            rho=rho,
         )
-        apt_alpha = self.trainer.select_posthoc_alpha(
-            train_features,
-            train_text_features,
-            train_labels,
-            alpha_steps=alpha_steps,
-        )
-        alpha = selection['alpha'] if apt_alpha is None else apt_alpha
+        alpha = selection['alpha']
 
         self.trainer.apply_posthoc_protofuse(
             alpha=alpha,

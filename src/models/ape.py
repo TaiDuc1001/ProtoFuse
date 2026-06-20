@@ -99,6 +99,182 @@ def _cal_criterion_vectorized(cfg, clip_weights, cache_keys, only_use_txt, train
     return indices
 
 
+def _ape_search_grid(scale, steps, device, dtype):
+    beta = torch.arange(steps[0], device=device, dtype=dtype)
+    beta = beta * (scale[0] - 0.1) / steps[0] + 0.1
+    alpha = torch.arange(steps[1], device=device, dtype=dtype)
+    alpha = alpha * (scale[1] - 0.1) / steps[1] + 0.1
+    gamma = torch.arange(steps[2], device=device, dtype=dtype)
+    gamma = gamma * scale[2] / steps[2]
+    return beta, alpha, gamma
+
+
+def _search_ape_hyperparameters_vectorized(
+    r_ff_val,
+    r_fw_val,
+    flat_values,
+    cache_div,
+    val_labels,
+    search_scale,
+    search_step,
+    init_alpha,
+    init_beta,
+    init_gamma,
+):
+    device = r_ff_val.device
+    dtype = r_ff_val.dtype
+    beta_grid, alpha_grid, gamma_grid = _ape_search_grid(
+        search_scale,
+        search_step,
+        device,
+        dtype,
+    )
+    correct_counts = torch.zeros(
+        len(beta_grid),
+        len(alpha_grid),
+        len(gamma_grid),
+        device=device,
+        dtype=torch.int32,
+    )
+
+    beta_chunk = min(8, len(beta_grid))
+    gamma_chunk = min(4, len(gamma_grid))
+    max_logits_elements = 16_000_000
+    num_classes = r_fw_val.shape[1]
+    alpha_count = len(alpha_grid)
+    sample_chunk = max(
+        1,
+        min(
+            r_fw_val.shape[0],
+            max_logits_elements
+            // max(1, beta_chunk * gamma_chunk * alpha_count * num_classes),
+        ),
+    )
+    cache_div_vector = cache_div.reshape(-1)
+
+    with torch.no_grad():
+        for beta_start in range(0, len(beta_grid), beta_chunk):
+            betas = beta_grid[beta_start:beta_start + beta_chunk]
+            for gamma_start in range(0, len(gamma_grid), gamma_chunk):
+                gammas = gamma_grid[gamma_start:gamma_start + gamma_chunk]
+                soft_values = (
+                    flat_values.unsqueeze(0)
+                    * torch.exp(
+                        gammas.view(-1, 1, 1)
+                        * cache_div_vector.view(1, -1, 1)
+                    )
+                )
+                chunk_counts = torch.zeros(
+                    len(betas),
+                    alpha_count,
+                    len(gammas),
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                for sample_start in range(0, r_fw_val.shape[0], sample_chunk):
+                    sample_end = sample_start + sample_chunk
+                    affinities = torch.exp(
+                        betas.view(-1, 1, 1)
+                        * (
+                            r_ff_val[sample_start:sample_end].unsqueeze(0)
+                            - 1.0
+                        )
+                    )
+                    cache_logits = torch.einsum(
+                        "bns,gsc->bgnc",
+                        affinities,
+                        soft_values,
+                    )
+                    logits = (
+                        r_fw_val[sample_start:sample_end]
+                        .view(1, 1, 1, -1, num_classes)
+                        + alpha_grid.view(1, 1, -1, 1, 1)
+                        * cache_logits.unsqueeze(2)
+                    )
+                    predictions = logits.argmax(dim=-1)
+                    labels = val_labels[sample_start:sample_end].view(1, 1, 1, -1)
+                    chunk_counts += predictions.eq(labels).sum(dim=-1).permute(0, 2, 1)
+
+                correct_counts[
+                    beta_start:beta_start + len(betas),
+                    :,
+                    gamma_start:gamma_start + len(gammas),
+                ] = chunk_counts
+
+    flat_counts = correct_counts.reshape(-1)
+    best_count, best_index = flat_counts.max(dim=0)
+    if int(best_count.item()) <= 0:
+        return 0.0, float(init_alpha), float(init_beta), float(init_gamma)
+
+    best_index = int(best_index.item())
+    gamma_count = len(gamma_grid)
+    alpha_gamma_count = alpha_count * gamma_count
+    beta_idx = best_index // alpha_gamma_count
+    remainder = best_index % alpha_gamma_count
+    alpha_idx = remainder // gamma_count
+    gamma_idx = remainder % gamma_count
+    best_acc = 100.0 * float(best_count.item()) / max(1, val_labels.numel())
+    return (
+        best_acc,
+        alpha_idx * (search_scale[1] - 0.1) / search_step[1] + 0.1,
+        beta_idx * (search_scale[0] - 0.1) / search_step[0] + 0.1,
+        gamma_idx * search_scale[2] / search_step[2],
+    )
+
+
+def _search_ape_hyperparameters_scalar(
+    r_ff_val,
+    r_fw_val,
+    flat_values,
+    cache_div,
+    val_labels,
+    search_scale,
+    search_step,
+    init_alpha,
+    init_beta,
+    init_gamma,
+):
+    beta_grid = [
+        index * (search_scale[0] - 0.1) / search_step[0] + 0.1
+        for index in range(search_step[0])
+    ]
+    alpha_grid = [
+        index * (search_scale[1] - 0.1) / search_step[1] + 0.1
+        for index in range(search_step[1])
+    ]
+    gamma_grid = [
+        index * search_scale[2] / search_step[2]
+        for index in range(search_step[2])
+    ]
+
+    best_acc = 0.0
+    best_alpha, best_beta, best_gamma = init_alpha, init_beta, init_gamma
+    with torch.no_grad():
+        for beta in beta_grid:
+            affinities = torch.exp(beta * (r_ff_val - 1.0))
+            for alpha in alpha_grid:
+                for gamma in gamma_grid:
+                    soft_values = flat_values * torch.exp(cache_div * gamma)
+                    cache_logits = affinities @ soft_values
+                    predictions = (r_fw_val + alpha * cache_logits).argmax(dim=-1)
+                    accuracy = (
+                        100.0
+                        * predictions.eq(val_labels).float().mean().item()
+                    )
+                    if accuracy > best_acc:
+                        best_acc = accuracy
+                        best_alpha, best_beta, best_gamma = alpha, beta, gamma
+    return best_acc, best_alpha, best_beta, best_gamma
+
+
+def _search_ape_hyperparameters(*args, **kwargs):
+    r_ff_val = args[0] if args else kwargs["r_ff_val"]
+    if r_ff_val.is_cuda:
+        return _search_ape_hyperparameters_vectorized(*args, **kwargs)
+    return _search_ape_hyperparameters_scalar(*args, **kwargs)
+
+
 class APE(BaseTrainer):
     DEFAULT_LR = 0.001
 
@@ -285,23 +461,20 @@ class APE(BaseTrainer):
         R_fF_val = new_val_features @ new_cache_keys.t()
         R_fW_val = 100.0 * val_features_dev @ clip_weights
 
-        beta_list = [i * (self.search_scale[0] - 0.1) / self.search_step[0] + 0.1 for i in range(self.search_step[0])]
-        alpha_list = [i * (self.search_scale[1] - 0.1) / self.search_step[1] + 0.1 for i in range(self.search_step[1])]
-        gamma_list = [i * self.search_scale[2] / self.search_step[2] for i in range(self.search_step[2])]
-
-        best_acc = 0.0
-        best_alpha, best_beta, best_gamma = self.init_alpha, self.init_beta, self.init_gamma
-        for beta in beta_list:
-            for alpha in alpha_list:
-                for gamma in gamma_list:
-                    with torch.no_grad():
-                        soft_vals = flat_values * (cache_div * gamma).exp()
-                        cache_logits = ((-1) * (beta - beta * R_fF_val)).exp() @ soft_vals
-                        logits = R_fW_val + cache_logits * alpha
-                    acc = self._cls_acc(logits, val_labels_dev)
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_alpha, best_beta, best_gamma = alpha, beta, gamma
+        best_acc, best_alpha, best_beta, best_gamma = (
+            _search_ape_hyperparameters(
+                R_fF_val,
+                R_fW_val,
+                flat_values,
+                cache_div,
+                val_labels_dev,
+                self.search_scale,
+                self.search_step,
+                self.init_alpha,
+                self.init_beta,
+                self.init_gamma,
+            )
+        )
 
         # logger.info(f"APE val search best: alpha={best_alpha:.2f}, beta={best_beta:.2f}, gamma={best_gamma:.2f}, acc={best_acc:.2f}%")
 

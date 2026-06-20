@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Subset
 from utils import (
     BaseTrainingPipeline,
     ConfigNode,
+    coerce_to_float,
     coerce_to_int,
     get_config_value,
     load_config_file,
@@ -47,7 +48,12 @@ class CoOPTrainingPipeline(BaseTrainingPipeline):
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        return alpha_steps, beta_values
+        rho = coerce_to_float(
+            cfg.get('rho', get_config_value(proto_cfg, 'model.rho', 0.5)),
+            0.5,
+            key='posthoc_protofuse.rho',
+        )
+        return alpha_steps, beta_values, rho
 
     def _train_epochs(self):
         super()._train_epochs()
@@ -70,7 +76,7 @@ class CoOPTrainingPipeline(BaseTrainingPipeline):
         )
 
         cfg = self._posthoc_protofuse_cfg()
-        alpha_steps, beta_values = (
+        alpha_steps, beta_values, rho = (
             self._posthoc_protofuse_selector_settings()
         )
 
@@ -88,6 +94,8 @@ class CoOPTrainingPipeline(BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
+            query_features=eval_features,
+            rho=rho,
         )
         alpha = selection['alpha']
 

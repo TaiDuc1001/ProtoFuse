@@ -88,6 +88,42 @@ class ProtoFuse(BaseTrainer):
         return [coerce_to_float(v, 0.0) for v in values]
 
     @classmethod
+    def from_precomputed(
+        cls,
+        text_prototypes,
+        device,
+        alpha_steps=101,
+        beta_values=None,
+        rho=0.5,
+        classnames=None,
+    ):
+        trainer = cls.__new__(cls)
+        trainer.device = torch.device(device)
+        trainer.classnames = list(classnames or [])
+        trainer.alpha_steps = max(2, int(alpha_steps))
+        trainer.rho = min(max(coerce_to_float(rho, 0.5), 0.0), 1.0)
+        trainer.centroid_mix_beta_values = cls._coerce_float_list(
+            beta_values,
+            [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+        )
+        trainer.alphas = torch.linspace(0, 1, trainer.alpha_steps, device=trainer.device)
+        trainer.text_prototypes = F.normalize(
+            text_prototypes.to(trainer.device).float(),
+            dim=-1,
+        )
+        trainer.embed_dim = trainer.text_prototypes.shape[-1]
+        trainer.fused_prototypes = None
+        trainer.best_alpha = None
+        trainer.alpha_init = None
+        trainer.alpha_final = None
+        trainer.selected_candidate = None
+        trainer.candidate_scores = None
+        trainer.support_visual_centroids = None
+        trainer.query_centroids = None
+        trainer.expanded_visual_centroids = None
+        return trainer
+
+    @classmethod
     def posthoc_fuse(
         cls,
         text_prototypes,
@@ -99,17 +135,13 @@ class ProtoFuse(BaseTrainer):
         query_features=None,
         rho=0.5,
     ):
-        selector = cls.__new__(cls)
-        selector.device = torch.device(device)
-        selector.alpha_steps = max(2, int(alpha_steps))
-        selector.rho = min(max(coerce_to_float(rho, 0.5), 0.0), 1.0)
-        selector.centroid_mix_beta_values = cls._coerce_float_list(
-            beta_values,
-            [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+        selector = cls.from_precomputed(
+            text_prototypes,
+            device,
+            alpha_steps=alpha_steps,
+            beta_values=beta_values,
+            rho=rho,
         )
-        selector.alphas = torch.linspace(0, 1, selector.alpha_steps, device=selector.device)
-        selector.text_prototypes = F.normalize(text_prototypes.to(selector.device).float(), dim=-1)
-        selector.embed_dim = selector.text_prototypes.shape[-1]
 
         train_features = F.normalize(train_features.to(selector.device).float(), dim=-1)
         train_labels = train_labels.to(selector.device).long()
@@ -126,6 +158,9 @@ class ProtoFuse(BaseTrainer):
         query_centroids = visual_centroids
         expanded_centroids = visual_centroids
         alpha = alpha_init
+        alpha_final = alpha_init
+        selected_candidate = "orig"
+        candidate_scores = {"orig": 0.0}
         if query_features is not None:
             query_features = F.normalize(query_features.to(selector.device).float(), dim=-1)
             query_centroids = selector.build_query_pseudo_centroids(
@@ -138,13 +173,34 @@ class ProtoFuse(BaseTrainer):
                 visual_centroids,
                 query_centroids,
             )
-            fused_prototypes, alpha = selector.hopc_alpha(
+            _, alpha_final = selector.hopc_alpha(
                 selector.text_prototypes,
                 expanded_centroids,
                 train_features,
                 train_labels,
                 num_classes,
                 query_centroids=query_centroids,
+            )
+            selected, scored = selector.select_fallback_candidate(
+                selector.text_prototypes,
+                visual_centroids,
+                expanded_centroids,
+                alpha_init,
+                alpha_final,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids,
+            )
+            selected_candidate, selected_centroids, alpha, _ = selected
+            candidate_scores = {
+                name: score for name, _, _, score in scored
+            }
+            expanded_centroids = selected_centroids
+            fused_prototypes = F.normalize(
+                (1.0 - alpha) * selector.text_prototypes
+                + alpha * selected_centroids,
+                dim=-1,
             )
 
         centroid_mask = torch.zeros(num_classes, device=selector.device, dtype=torch.bool)
@@ -165,7 +221,10 @@ class ProtoFuse(BaseTrainer):
             'missing_classes': torch.nonzero(~centroid_mask, as_tuple=False).flatten().cpu().tolist(),
             'alpha': alpha,
             'alpha_init': alpha_init,
+            'alpha_final': alpha_final,
             'rho': selector.rho,
+            'selected_candidate': selected_candidate,
+            'candidate_scores': candidate_scores,
         }
 
     def extract_features(self, dataloader):
@@ -344,7 +403,8 @@ class ProtoFuse(BaseTrainer):
                 (1.0 - float(alpha)) * T + float(alpha) * fold_centroids,
                 dim=-1,
             )
-            fused_correct = (held @ prototypes.T).argmax(dim=-1).eq(targets)
+            logits = held @ prototypes.T
+            fused_correct = logits.argmax(dim=-1).eq(targets)
             score += fused_correct.sum().float()
         return float(score.item())
 
@@ -378,6 +438,10 @@ class ProtoFuse(BaseTrainer):
             )
             scored.append((name, centroids, float(alpha), score))
         return max(scored, key=lambda candidate: candidate[3]), scored
+
+    def logits_from_features(self, features):
+        features = F.normalize(features.to(self.device).float(), dim=-1)
+        return features @ self.fused_prototypes.T
 
     def hopc_alpha(
         self,
@@ -471,27 +535,26 @@ class ProtoFuse(BaseTrainer):
         self.alpha_init = alpha_init
         self.alpha_final = alpha_final
         self.selected_candidate = selected_candidate
-        self.candidate_scores = {name: score for name, _, _, score in candidate_scores}
+        self.candidate_scores = {
+            name: score for name, _, _, score in candidate_scores
+        }
         self.support_visual_centroids = V
         self.query_centroids = query_centroids
         self.expanded_visual_centroids = selected_V
-        if not getattr(self, '_transductive_log_emitted', False):
+        shots_per_class = int(torch.bincount(
+            train_labels.to(self.device).long(),
+            minlength=num_classes,
+        ).min().item())
+        logged_shots = getattr(self, '_transductive_logged_shots', set())
+        if shots_per_class not in logged_shots:
             centroid_shift = torch.linalg.vector_norm(expanded_V - V, dim=-1).mean().item()
             score_text = ",".join(
                 f"{name}:{score:.3f}" for name, _, _, score in candidate_scores
             )
-            print(
-                f"[ProtoFuse transductive] applied=true rho={self.rho:.2f} "
-                f"alpha_init={alpha_init:.2f} alpha_final={alpha_final:.2f} "
-                f"selected={selected_candidate} alpha={alpha:.2f} "
-                f"score={selected_score:.3f} candidates={score_text} "
-                f"centroid_shift={centroid_shift:.6f}",
-                flush=True,
-            )
-            self._transductive_log_emitted = True
+            logged_shots.add(shots_per_class)
+            self._transductive_logged_shots = logged_shots
 
-        eval_norm = F.normalize(eval_features.to(self.device), dim=-1)
-        logits = eval_norm @ proto.T
+        logits = self.logits_from_features(eval_features)
         preds = logits.argmax(dim=-1).cpu().tolist()
 
         labels_list = eval_labels.tolist()
@@ -518,8 +581,7 @@ class ProtoFuse(BaseTrainer):
             for images, labels in dataloader:
                 images = images.to(self.device)
                 features = self.clip_model.encode_image(images).float()
-                features = F.normalize(features, dim=-1)
-                logits = features @ self.fused_prototypes.T
+                logits = self.logits_from_features(features)
                 preds = logits.argmax(dim=-1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.numpy())

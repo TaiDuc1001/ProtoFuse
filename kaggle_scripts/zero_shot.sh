@@ -1,23 +1,3 @@
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${AIRCRAFT_DATA_ROOT}" --data.dataset_name "FGVC-Aircraft" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${DTD_DATA_ROOT}" --data.dataset_name "DTD" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${EUROSAT_DATA_ROOT}" --data.dataset_name "EuroSAT" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${CUB_DATA_ROOT}" --data.dataset_name "CUB-200-2011" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${FLOWERS_DATA_ROOT}" --data.dataset_name "Flowers102" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${CARS_DATA_ROOT}" --data.dataset_name "StanfordCars" 
-uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.root "${UCF_DATA_ROOT}" --data.dataset_name "UCF101" 
-
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${AIRCRAFT_DATA_ROOT}" --data.dataset_name "FGVC-Aircraft" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${DTD_DATA_ROOT}" --data.dataset_name "DTD" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${EUROSAT_DATA_ROOT}" --data.dataset_name "EuroSAT" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${CUB_DATA_ROOT}" --data.dataset_name "CUB-200-2011" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${FLOWERS_DATA_ROOT}" --data.dataset_name "Flowers102" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${CARS_DATA_ROOT}" --data.dataset_name "StanfordCars" 
-uv run test/zeroshot.py --model.backbone "RN50" --data.root "${UCF_DATA_ROOT}" --data.dataset_name "UCF101" 
-
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${AIRCRAFT_DATA_ROOT}" --data.dataset_name "FGVC-Aircraft" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${DTD_DATA_ROOT}" --data.dataset_name "DTD" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${EUROSAT_DATA_ROOT}" --data.dataset_name "EuroSAT" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${CUB_DATA_ROOT}" --data.dataset_name "CUB-200-2011" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${FLOWERS_DATA_ROOT}" --data.dataset_name "Flowers102" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${CARS_DATA_ROOT}" --data.dataset_name "StanfordCars" 
-uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.root "${UCF_DATA_ROOT}" --data.dataset_name "UCF101" 
+uv run test/zeroshot.py --model.backbone "ViT-B/16" --data.all True
+uv run test/zeroshot.py --model.backbone "RN50" --data.all True
+uv run test/zeroshot.py --model.backbone "ViT-L/14" --data.all True
