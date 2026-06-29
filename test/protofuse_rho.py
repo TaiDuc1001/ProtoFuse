@@ -46,7 +46,6 @@ from utils import (
 
 
 DEFAULT_RHOS = [0.0, 0.25, 0.5, 0.75, 1.0]
-DEFAULT_KSHOTS = [1, 2, 4, 8, 16]
 DEFAULT_SEEDS = [1, 10, 100, 1000, 10000]
 DATASET_DISPLAY_NAMES = {
     "FGVC-Aircraft": "Aircraft",
@@ -119,10 +118,6 @@ def parse_args():
         "--seeds",
         default=",".join(str(value) for value in DEFAULT_SEEDS),
     )
-    parser.add_argument(
-        "--kshots",
-        default=",".join(str(value) for value in DEFAULT_KSHOTS),
-    )
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument(
         "--output-figure",
@@ -136,15 +131,13 @@ def parse_args():
 
 def run_dataset(args, table_name, config, console):
     rhos = parse_float_list(args.rhos, DEFAULT_RHOS)
-    kshots = parse_int_list(args.kshots)
     seeds = parse_int_list(args.seeds)
     if len(rhos) != 5:
         raise ValueError(f"Expected exactly 5 rho values, found {len(rhos)}.")
-    if len(kshots) != 5:
-        raise ValueError(f"Expected exactly 5 shot values, found {len(kshots)}.")
     if len(seeds) != 5:
         raise ValueError(f"Expected exactly 5 seeds, found {len(seeds)}.")
 
+    kshot = int(get_config_value(config, "data.kshot", 16))
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = get_config_value(config, "model.centroid_mix.beta_values", None)
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
@@ -159,7 +152,7 @@ def run_dataset(args, table_name, config, console):
     classnames = list(train_dataset.classes)
     console.print(
         f"{table_name}: root={dataset_root}, classes={len(classnames)}, "
-        f"kshots={kshots}, rhos={rhos}, seeds={seeds}, device={device}"
+        f"kshot={kshot}, rhos={rhos}, seeds={seeds}, device={device}"
     )
 
     model = load_model(config, device)
@@ -193,53 +186,49 @@ def run_dataset(args, table_name, config, console):
         TimeElapsedColumn(),
     ]
     with Progress(*progress_columns, console=console) as progress:
-        task = progress.add_task(
-            f"{table_name}: rho sweep",
-            total=len(kshots) * len(seeds),
-        )
-        for kshot in kshots:
-            for seed in seeds:
-                progress.update(
-                    task,
-                    description=f"{table_name}: {kshot}-shot, seed {seed}",
+        task = progress.add_task(f"{table_name}: rho sweep", total=len(seeds))
+        for seed in seeds:
+            progress.update(
+                task,
+                description=f"{table_name}: {kshot}-shot, seed {seed}",
+            )
+            set_global_seed(seed)
+            if val_fraction is None:
+                train_idx = support_positions(train_labels_all, kshot, seed)
+                eval_features = eval_features_all
+                eval_labels = eval_labels_all
+            else:
+                train_idx, val_idx = split_positions_by_class(
+                    train_labels_all,
+                    kshot,
+                    seed,
+                    val_fraction,
                 )
-                set_global_seed(seed)
-                if val_fraction is None:
-                    train_idx = support_positions(train_labels_all, kshot, seed)
-                    eval_features = eval_features_all
-                    eval_labels = eval_labels_all
-                else:
-                    train_idx, val_idx = split_positions_by_class(
-                        train_labels_all,
-                        kshot,
-                        seed,
-                        val_fraction,
-                    )
-                    eval_features = train_features_all[val_idx].contiguous()
-                    eval_labels = train_labels_all[val_idx].contiguous()
+                eval_features = train_features_all[val_idx].contiguous()
+                eval_labels = train_labels_all[val_idx].contiguous()
 
-                rows = evaluate_rhos(
-                    rhos,
-                    text_features,
-                    train_features_all[train_idx].contiguous(),
-                    train_labels_all[train_idx].contiguous(),
-                    eval_features,
-                    eval_labels,
-                    device,
-                    alpha_steps,
-                    beta_values,
-                    eval_batch_size,
-                )
-                raw.extend(
-                    {
-                        "dataset": table_name,
-                        "kshot": int(kshot),
-                        "seed": int(seed),
-                        **row,
-                    }
-                    for row in rows
-                )
-                progress.advance(task)
+            rows = evaluate_rhos(
+                rhos,
+                text_features,
+                train_features_all[train_idx].contiguous(),
+                train_labels_all[train_idx].contiguous(),
+                eval_features,
+                eval_labels,
+                device,
+                alpha_steps,
+                beta_values,
+                eval_batch_size,
+            )
+            raw.extend(
+                {
+                    "dataset": table_name,
+                    "kshot": kshot,
+                    "seed": int(seed),
+                    **row,
+                }
+                for row in rows
+            )
+            progress.advance(task)
     return raw, str(dataset_root)
 
 
@@ -378,7 +367,7 @@ def main():
     _, summary = aggregate_results(raw)
     final_table = build_final_table(summary, rhos, dataset_names)
     console.print()
-    console.print("ProtoFuse rho sensitivity: 5-shot × 5-seed mean ± std")
+    console.print("ProtoFuse rho sensitivity: seed mean ± std")
     console.print(final_table.to_string(index=False))
 
     figure_path = resolve_path(args.output_figure)
@@ -393,7 +382,7 @@ def main():
                 {
                     "experiment": "protofuse_rho",
                     "datasets": dataset_roots,
-                    "kshots": parse_int_list(args.kshots),
+                    "kshot": int(get_config_value(config, "data.kshot", 16)),
                     "rhos": rhos,
                     "seeds": parse_int_list(args.seeds),
                     "raw": raw,
