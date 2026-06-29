@@ -120,6 +120,8 @@ class TIMOPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             'phase': 'posthoc_protofuse',
             'method': f'{self.METHOD_NAME}+ProtoFuse',
             'protofuse_alpha': selection['alpha'],
+            'before_protofuse_accuracy': baseline_metrics.get('accuracy'),
+            'protofuse_gain': gap_to_timo,
             'timo_accuracy': baseline_metrics.get('accuracy'),
             'gap_to_timo': gap_to_timo,
             'missing_centroid_classes': selection['missing_classes'],

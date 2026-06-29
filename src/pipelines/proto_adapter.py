@@ -148,6 +148,8 @@ class ProtoAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             'method': 'ProtoAdapter+ProtoFuse',
             'alpha': selection['alpha'],
             'protofuse_alpha': selection['alpha'],
+            'before_protofuse_accuracy': baseline_metrics.get('accuracy'),
+            'protofuse_gain': gap_to_proto,
             'proto_adapter_accuracy': baseline_metrics.get('accuracy'),
             'gap_to_proto_adapter': gap_to_proto,
             'missing_centroid_classes': selection['missing_classes'],

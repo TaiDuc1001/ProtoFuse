@@ -190,20 +190,45 @@ def _format_table(rows, columns):
 
 def print_summary(dataset_name, method_name, results, kshots, seeds):
     rows = []
+    include_protofuse_columns = True
     for kshot in kshots:
         members = [results[(int(kshot), int(seed))] for seed in seeds]
         accuracies = [float(member.get("accuracy", 0.0)) for member in members]
         mean, std = _mean_std(accuracies)
-        rows.append(
-            {
-                "kshot": f"{int(kshot)}-shot",
-                "runs": str(len(members)),
-                "acc": f"{mean:.2f}% +/- {std:.2f}%",
-            }
+        row = {
+            "kshot": f"{int(kshot)}-shot",
+            "runs": str(len(members)),
+            "acc": f"{mean:.2f}% +/- {std:.2f}%",
+        }
+        has_protofuse_metrics = all(
+            member.get("before_protofuse_accuracy") is not None
+            and member.get("protofuse_gain") is not None
+            for member in members
         )
+        include_protofuse_columns = (
+            include_protofuse_columns and has_protofuse_metrics
+        )
+        if has_protofuse_metrics:
+            before_mean, before_std = _mean_std(
+                [
+                    float(member["before_protofuse_accuracy"])
+                    for member in members
+                ]
+            )
+            gain_mean, gain_std = _mean_std(
+                [float(member["protofuse_gain"]) for member in members]
+            )
+            row["before ProtoFuse"] = (
+                f"{before_mean:.2f}% +/- {before_std:.2f}%"
+            )
+            row["gain"] = f"{gain_mean:+.2f}% +/- {gain_std:.2f}%"
+        rows.append(row)
 
     print(f"\n{dataset_name} x {method_name} x seed mean +/- std")
-    print(_format_table(rows, ["kshot", "runs", "acc"]), flush=True)
+    columns = ["kshot", "runs", "acc"]
+    # if include_protofuse_columns:
+    #     columns.extend(["before ProtoFuse", "gain"])
+    print(_format_table(rows, columns), flush=True)
 
 
 def run_batch_sweep(config, overrides, pipeline_cls):

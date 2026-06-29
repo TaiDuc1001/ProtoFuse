@@ -169,6 +169,8 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
         result.update({
             'phase': 'posthoc_protofuse',
             'protofuse_alpha': selection['alpha'],
+            'before_protofuse_accuracy': baseline_metrics.get('accuracy'),
+            'protofuse_gain': gap_to_ape,
             'ape_accuracy': baseline_metrics.get('accuracy'),
             'gap_to_ape': gap_to_ape,
             'missing_centroid_classes': selection['missing_classes'],

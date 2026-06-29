@@ -118,29 +118,18 @@ def _support_calibration_curve(trainer, T, V, train_features, train_labels, num_
 
     if shots_per_class < 2:
         best = None
-        beta_values = sorted(
-            {
-                round(float(beta), 6)
-                for beta in trainer.centroid_mix_beta_values
-                if 0.0 < float(beta) < 0.5
-            }
-        )
-        if 0.45 not in beta_values:
-            beta_values.append(0.45)
-            beta_values.sort()
-
+        beta_values = trainer._centroid_mix_beta_values()
         neighbors = trainer._centroid_mix_neighbors(V)
         for beta in beta_values:
             curve = trainer._centroid_mix_net_curve(T, V, neighbors, beta, num_classes)
-            alpha_idx, score = trainer._conservative_gain_score(curve)
-            if alpha_idx is None:
-                continue
+            alpha_idx = int(curve.argmax().item())
+            score = float(curve[alpha_idx].item())
             alpha = float(trainer.alphas[alpha_idx].item())
-            candidate = (float(score), -alpha, curve)
+            candidate = (score, -alpha, curve)
             if best is None or candidate[:2] > best[:2]:
                 best = candidate
 
-        if best is None or best[0] <= 0.0:
+        if best is None:
             return torch.zeros_like(trainer.alphas)
         return best[2].float()
 

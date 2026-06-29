@@ -9,146 +9,131 @@ os.environ["MPLBACKEND"] = "Agg"
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
+from rich.console import Console
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from protofuse_ablation_tables import (
+    batched_variant_accuracies,
+    build_selector,
+    build_table,
+    fused_prototypes,
+    latex_rows,
+    summarize_table,
+    table_dataset_configs,
+)
 from protofuse_candidates import (
     DEFAULT_CONFIG,
-    parse_int_list,
+    build_text_features,
+    extract_image_features,
     load_datasets,
     load_model,
-    extract_image_features,
-    build_text_features,
-    support_positions,
-    split_positions_by_class,
+    parse_int_list,
     resolve_path,
+    split_positions_by_class,
+    support_positions,
 )
-from src.models.protofuse import ProtoFuse
-from utils import get_config_value, iter_dataset_configs, load_config_file, merge_configs, parse_override_arguments, set_global_seed
+from utils import (
+    get_config_value,
+    load_config_file,
+    merge_configs,
+    parse_override_arguments,
+    set_global_seed,
+)
 
 
 DEFAULT_KSHOTS = [2, 4, 8, 16]
 DEFAULT_SEEDS = [1, 10, 100, 1000, 10000]
-FIXED_ALPHAS = [0.25, 0.50, 0.75]
-
-
-def add_dataset_args(parser):
-    parser.add_argument("--data.root", "--data-root", dest="data_root", default=None, help="Dataset root directory.")
-    parser.add_argument(
-        "--data.dataset_name",
-        "--dataset-name",
-        "--dataset_name",
-        dest="dataset_name",
-        default=None,
-        help="Dataset name used for prompt template and reporting.",
-    )
-
-
-def apply_dataset_args(args, overrides):
-    if args.data_root is not None:
-        overrides.setdefault("data", {})["root"] = args.data_root
-    if args.dataset_name is not None:
-        overrides.setdefault("data", {})["dataset_name"] = args.dataset_name
-    return overrides
-
-
-def alpha_grid(steps, device):
-    return torch.linspace(0.0, 1.0, max(2, int(steps)), device=device)
-
-
-def build_selector(text_features, support_features, support_labels, device, alpha_steps, beta_values):
-    selector = ProtoFuse.__new__(ProtoFuse)
-    selector.device = torch.device(device)
-    selector.alpha_steps = max(2, int(alpha_steps))
-    selector.centroid_mix_beta_values = ProtoFuse._coerce_float_list(beta_values, [])
-    selector.alphas = alpha_grid(alpha_steps, selector.device)
-    selector.text_prototypes = F.normalize(text_features.to(selector.device).float(), dim=-1)
-    selector.embed_dim = selector.text_prototypes.shape[-1]
-    support_features = F.normalize(support_features.to(selector.device).float(), dim=-1)
-    support_labels = support_labels.to(selector.device).long()
-    visual = selector.build_visual_centroids(support_features, support_labels, selector.text_prototypes.shape[0])
-    return selector, selector.text_prototypes, visual, support_features, support_labels
-
-
-def accuracy_for_alpha(alpha, text, visual, eval_features, eval_labels, device, normalize=True):
-    eval_features = F.normalize(eval_features.to(device).float(), dim=-1)
-    eval_labels = eval_labels.to(device).long()
-    proto = (1.0 - alpha) * text + alpha * visual
-    if normalize:
-        proto = F.normalize(proto, dim=-1)
-    preds = (eval_features @ proto.T).argmax(dim=-1)
-    return preds.eq(eval_labels).float().mean().item() * 100.0
-
-
-def oracle_alpha(text, visual, eval_features, eval_labels, alphas, device):
-    best = {"alpha": 0.0, "accuracy": -float("inf")}
-    for alpha in alphas:
-        value = float(alpha.item())
-        acc = accuracy_for_alpha(value, text, visual, eval_features, eval_labels, device)
-        if acc > best["accuracy"]:
-            best = {"alpha": value, "accuracy": acc}
-    return best
+VARIANTS = (
+    "Text-only",
+    "Fixed fusion, α=0.25",
+    "Fixed fusion, α=0.50",
+    "Fixed fusion, α=0.75",
+    "Support accuracy without LOO",
+    "LOO support-only",
+    "LOO + standard PLA, no recalibration",
+    "Full ProtoFuse",
+)
 
 
 def class_feature_tensor(features, labels, num_classes, kshot):
     by_class = []
     for class_idx in range(num_classes):
-        idx = torch.nonzero(labels.eq(class_idx), as_tuple=False).flatten()
-        if idx.numel() < kshot:
-            raise RuntimeError(f"Class {class_idx} has {idx.numel()} support samples, expected {kshot}.")
-        by_class.append(features[idx[:kshot]])
+        indices = torch.nonzero(labels.eq(class_idx), as_tuple=False).flatten()
+        if indices.numel() < kshot:
+            raise RuntimeError(
+                f"Class {class_idx} has {indices.numel()} support samples, expected {kshot}."
+            )
+        by_class.append(features[indices[:kshot]])
     return torch.stack(by_class, dim=0)
 
 
-def loo_curves(selector, text, support_features, support_labels, kshot):
-    num_classes = text.shape[0]
-    class_features = class_feature_tensor(support_features, support_labels, num_classes, kshot)
-    targets = torch.arange(num_classes, device=selector.device)
-    correct = torch.zeros(len(selector.alphas), device=selector.device)
-    rescue = torch.zeros(len(selector.alphas), device=selector.device)
-    damage = torch.zeros(len(selector.alphas), device=selector.device)
-
-    for hold_idx in range(kshot):
-        held = F.normalize(class_features[:, hold_idx, :], dim=-1)
-        keep = torch.arange(kshot, device=selector.device) != hold_idx
-        visual_minus = torch.stack(
-            [selector._visual_centroid(class_features[class_idx, keep]) for class_idx in range(num_classes)]
-        )
-        text_correct = (held @ text.T).argmax(dim=-1).eq(targets)
-        refined = F.normalize(
-            (1.0 - selector.alphas).view(-1, 1, 1) * text + selector.alphas.view(-1, 1, 1) * visual_minus,
+def support_accuracy_curve(alphas, text, visual, support_features, support_labels, alpha_batch_size=16):
+    counts = []
+    alpha_batch_size = max(1, int(alpha_batch_size))
+    for start in range(0, len(alphas), alpha_batch_size):
+        alpha_batch = alphas[start:start + alpha_batch_size]
+        prototypes = F.normalize(
+            (1.0 - alpha_batch).view(-1, 1, 1) * text
+            + alpha_batch.view(-1, 1, 1) * visual,
             dim=-1,
         )
-        fused_preds = torch.einsum("cd,akd->ack", held, refined).argmax(dim=-1)
-        fused_correct = fused_preds.eq(targets.view(1, -1))
-        correct += fused_correct.sum(dim=1).float()
-        rescue += ((~text_correct).view(1, -1) & fused_correct).sum(dim=1).float()
-        damage += (text_correct.view(1, -1) & ~fused_correct).sum(dim=1).float()
-
-    return {
-        "accuracy_count": correct,
-        "rescue": rescue,
-        "damage": damage,
-        "net": rescue - damage,
-    }
+        predictions = torch.einsum(
+            "nd,acd->anc", support_features, prototypes
+        ).argmax(dim=-1)
+        counts.append(
+            predictions.eq(support_labels.view(1, -1)).sum(dim=-1).float()
+        )
+    return torch.cat(counts, dim=0)
 
 
-def support_accuracy_curve(alphas, text, visual, support_features, support_labels):
-    correct = []
-    for alpha in alphas:
-        proto = F.normalize((1.0 - alpha) * text + alpha * visual, dim=-1)
-        preds = (support_features @ proto.T).argmax(dim=-1)
-        correct.append(preds.eq(support_labels).sum().float())
-    return torch.stack(correct)
+def loo_accuracy_curve(
+    alphas,
+    text,
+    class_features,
+    rho,
+    query_centroids=None,
+    holdout_batch_size=2,
+):
+    num_classes, kshot, _ = class_features.shape
+    targets = torch.arange(num_classes, device=class_features.device)
+    counts = torch.zeros(len(alphas), device=class_features.device)
+    class_sums = class_features.sum(dim=1)
+    holdout_batch_size = max(1, int(holdout_batch_size))
+
+    for start in range(0, kshot, holdout_batch_size):
+        held = F.normalize(
+            class_features[:, start:start + holdout_batch_size, :].permute(1, 0, 2),
+            dim=-1,
+        )
+        visual_minus = F.normalize(
+            (
+                class_sums.unsqueeze(0)
+                - class_features[:, start:start + holdout_batch_size, :].permute(1, 0, 2)
+            )
+            / float(kshot - 1),
+            dim=-1,
+        )
+        if query_centroids is not None:
+            visual_minus = F.normalize(
+                (1.0 - rho) * visual_minus + rho * query_centroids.unsqueeze(0),
+                dim=-1,
+            )
+        prototypes = F.normalize(
+            (1.0 - alphas).view(1, -1, 1, 1) * text.view(1, 1, num_classes, -1)
+            + alphas.view(1, -1, 1, 1) * visual_minus.unsqueeze(1),
+            dim=-1,
+        )
+        predictions = torch.einsum("hcd,hakd->hack", held, prototypes).argmax(dim=-1)
+        counts += predictions.eq(targets.view(1, 1, -1)).sum(dim=(0, 2)).float()
+    return counts
 
 
 def select_from_curve(alphas, curve):
-    idx = int(curve.argmax().item())
-    return float(alphas[idx].item())
+    return float(alphas[int(curve.argmax().item())].item())
 
 
 def evaluate_run(
@@ -160,237 +145,278 @@ def evaluate_run(
     device,
     alpha_steps,
     beta_values,
+    rho,
     kshot,
+    eval_batch_size,
 ):
     selector, text, visual, support_features, support_labels = build_selector(
-        text_features, support_features, support_labels, device, alpha_steps, beta_values
+        text_features,
+        support_features,
+        support_labels,
+        device,
+        alpha_steps,
+        beta_values,
+        rho,
     )
-    alphas = selector.alphas
-    curves = loo_curves(selector, text, support_features, support_labels, kshot)
-    support_curve = support_accuracy_curve(alphas, text, visual, support_features, support_labels)
-    oracle = oracle_alpha(text, visual, eval_features, eval_labels, alphas, device)
+    class_features = class_feature_tensor(
+        support_features,
+        support_labels,
+        text.shape[0],
+        kshot,
+    )
+    support_curve = support_accuracy_curve(
+        selector.alphas,
+        text,
+        visual,
+        support_features,
+        support_labels,
+    )
+    loo_curve = loo_accuracy_curve(
+        selector.alphas,
+        text,
+        class_features,
+        rho,
+    )
+    alpha_support = select_from_curve(selector.alphas, support_curve)
+    alpha_init = select_from_curve(selector.alphas, loo_curve)
 
-    strategies = [
-        ("Text only (alpha=0)", 0.0),
-        ("Visual only (alpha=1)", 1.0),
-        *[(f"Fixed alpha={alpha:.2f}", alpha) for alpha in FIXED_ALPHAS],
-        ("Support accuracy, no LOO", select_from_curve(alphas, support_curve)),
-        ("LOO force accuracy (ours)", select_from_curve(alphas, curves["accuracy_count"])),
-        ("Oracle alpha on test", oracle["alpha"]),
+    query_centroids = selector.pseudo_label_aggregation(
+        eval_features,
+        text,
+        visual,
+        alpha_init,
+        batch_size=eval_batch_size,
+    )
+    expanded_visual = selector.expand_visual_centroids(visual, query_centroids)
+
+    recalibrated_curve = loo_accuracy_curve(
+        selector.alphas,
+        text,
+        class_features,
+        rho,
+        query_centroids=query_centroids,
+    )
+    alpha_final = select_from_curve(selector.alphas, recalibrated_curve)
+
+    variants = [
+        (VARIANTS[0], fused_prototypes(text, visual, 0.0)),
+        (VARIANTS[1], fused_prototypes(text, visual, 0.25)),
+        (VARIANTS[2], fused_prototypes(text, visual, 0.50)),
+        (VARIANTS[3], fused_prototypes(text, visual, 0.75)),
+        (VARIANTS[4], fused_prototypes(text, visual, alpha_support)),
+        (VARIANTS[5], fused_prototypes(text, visual, alpha_init)),
+        (VARIANTS[6], fused_prototypes(text, expanded_visual, alpha_init)),
+        (VARIANTS[7], fused_prototypes(text, expanded_visual, alpha_final)),
+    ]
+    accuracies = batched_variant_accuracies(
+        variants,
+        eval_features,
+        eval_labels,
+        device,
+        eval_batch_size,
+    )
+    alphas = {
+        VARIANTS[0]: 0.0,
+        VARIANTS[1]: 0.25,
+        VARIANTS[2]: 0.50,
+        VARIANTS[3]: 0.75,
+        VARIANTS[4]: alpha_support,
+        VARIANTS[5]: alpha_init,
+        VARIANTS[6]: alpha_init,
+        VARIANTS[7]: alpha_final,
+    }
+    return [
+        {
+            "variant": variant,
+            "accuracy": float(accuracies[variant]),
+            "alpha": float(alphas[variant]),
+            "selected_candidate": "qx_recal_alpha" if variant == VARIANTS[7] else None,
+        }
+        for variant in VARIANTS
     ]
 
-    rows = []
-    text_acc = accuracy_for_alpha(0.0, text, visual, eval_features, eval_labels, device)
-    for strategy, selected_alpha in strategies:
-        acc = accuracy_for_alpha(selected_alpha, text, visual, eval_features, eval_labels, device)
-        rows.append(
-            {
-                "strategy": strategy,
-                "alpha": float(selected_alpha),
-                "accuracy": float(acc),
-                "delta": float(acc - text_acc),
-            }
-        )
-    return rows
 
-
-def mean_std(values):
-    arr = np.asarray(values, dtype=np.float64)
-    return float(arr.mean()), float(arr.std())
-
-
-def format_mean_std(stats):
-    if stats is None:
-        return "-"
-    return f"{stats['mean']:.2f} +/- {stats['std']:.2f}"
-
-
-def result_table_rows(aggregate, kshots):
-    rows = []
-    for row in aggregate:
-        out = {"Calibration strategy": row["strategy"]}
-        for kshot in kshots:
-            out[f"{kshot}-shot"] = format_mean_std(row["accuracy_by_kshot"].get(str(kshot)))
-        out["avg acc"] = format_mean_std({"mean": row["accuracy_mean"], "std": row["accuracy_std"]})
-        out["Delta"] = f"{row['delta_mean']:+.2f}"
-        out["alpha"] = f"{row['alpha_mean']:.2f} +/- {row['alpha_std']:.2f}"
-        out["runs"] = str(row["runs"])
-        rows.append(out)
-    return rows
-
-
-def build_table(aggregate, dataset_name, kshots):
-    title = f"{dataset_name} multi-shot calibration ablation"
-    rows = result_table_rows(aggregate, kshots)
-    table = pd.DataFrame(rows).to_string(index=False)
-    return f"{title}\n{table}"
-
-
-def latex_rows(aggregate, kshots, include_delta=False):
-    rows = []
-    for row in aggregate:
-        values = [
-            f"{row['accuracy_by_kshot'][str(kshot)]['mean']:.2f}"
-            if str(kshot) in row["accuracy_by_kshot"]
-            else "-"
-            for kshot in kshots
-        ]
-        value = f"{row['accuracy_mean']:.2f}"
-        if include_delta:
-            value = f"{value} ({row['delta_mean']:+.2f})"
-        rows.append(f"{row['strategy']} & {' & '.join(values)} & {value} \\\\")
-    return "\n".join(rows)
+def shotwise_delta_diagnostics(raw, kshots, datasets):
+    diagnostics = []
+    for current_idx in range(1, len(VARIANTS)):
+        previous = VARIANTS[current_idx - 1]
+        current = VARIANTS[current_idx]
+        for dataset in datasets:
+            deltas = {}
+            for kshot in kshots:
+                previous_values = [
+                    row["accuracy"]
+                    for row in raw
+                    if row["variant"] == previous
+                    and row["dataset"] == dataset
+                    and row["kshot"] == kshot
+                ]
+                current_values = [
+                    row["accuracy"]
+                    for row in raw
+                    if row["variant"] == current
+                    and row["dataset"] == dataset
+                    and row["kshot"] == kshot
+                ]
+                if previous_values and current_values:
+                    deltas[str(kshot)] = float(
+                        np.mean(current_values) - np.mean(previous_values)
+                    )
+            signs = {int(np.sign(value)) for value in deltas.values() if abs(value) > 1e-9}
+            diagnostics.append(
+                {
+                    "from": previous,
+                    "to": current,
+                    "dataset": dataset,
+                    "delta_by_kshot": deltas,
+                    "direction_consistent": len(signs) <= 1,
+                }
+            )
+    return diagnostics
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Table A: ProtoFuse multi-shot calibration ablation.")
+    parser = argparse.ArgumentParser(description="Table 6: ProtoFuse multi-shot component ablation.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--kshots", default=",".join(str(v) for v in DEFAULT_KSHOTS))
-    parser.add_argument("--seeds", default=",".join(str(v) for v in DEFAULT_SEEDS))
+    parser.add_argument("--kshots", default=",".join(str(value) for value in DEFAULT_KSHOTS))
+    parser.add_argument("--seeds", default=",".join(str(value) for value in DEFAULT_SEEDS))
+    parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--output-json", default=None)
-    parser.add_argument("--latex", action="store_true", help="Print compact LaTeX rows for the current dataset.")
-    parser.add_argument("--disable-coloring", action="store_true", help="Deprecated no-op; output is plain text.")
-    add_dataset_args(parser)
+    parser.add_argument("--latex", action="store_true")
+    parser.add_argument("--disable-coloring", action="store_true")
     parsed, unknown = parser.parse_known_args()
-    overrides = parse_override_arguments(unknown)
-    return parsed, apply_dataset_args(parsed, overrides)
+    return parsed, parse_override_arguments(unknown)
 
 
-def run_one(args, config):
+def run_dataset(args, table_name, config):
     kshots = parse_int_list(args.kshots)
     seeds = parse_int_list(args.seeds)
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = get_config_value(config, "model.centroid_mix.beta_values", None)
+    rho = float(get_config_value(config, "model.rho", 0.5))
     device_name = str(get_config_value(config, "training.device", "cuda:0"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
+    eval_batch_size = args.eval_batch_size or max(batch_size, 1024)
     num_workers = int(get_config_value(config, "data.num_workers", 4))
-    dataset_name = str(get_config_value(config, "data.dataset_name", "DTD"))
+    dataset_name = str(get_config_value(config, "data.dataset_name", table_name))
 
     set_global_seed(1)
     train_dataset, eval_dataset, val_fraction, dataset_root = load_datasets(config)
     classnames = list(train_dataset.classes)
     print(
-        f"Dataset={dataset_name}, root={dataset_root}, classes={len(classnames)}, "
-        f"kshots={kshots}, seeds={seeds}, device={device}"
+        f"{table_name}: root={dataset_root}, classes={len(classnames)}, "
+        f"kshots={kshots}, seeds={seeds}, device={device}",
+        flush=True,
     )
 
     model = load_model(config, device)
-    train_features_all, train_labels_all = extract_image_features(model, train_dataset, device, batch_size, num_workers)
+    train_features_all, train_labels_all = extract_image_features(
+        model, train_dataset, device, batch_size, num_workers
+    )
     if eval_dataset is None:
         eval_features_all, eval_labels_all = train_features_all, train_labels_all
     else:
-        eval_features_all, eval_labels_all = extract_image_features(model, eval_dataset, device, batch_size, num_workers)
+        eval_features_all, eval_labels_all = extract_image_features(
+            model, eval_dataset, device, batch_size, num_workers
+        )
     text_features = build_text_features(model, classnames, dataset_name, device)
     del model
     gc.collect()
-    if str(device).startswith("cuda"):
+    if device.type == "cuda":
         torch.cuda.empty_cache()
 
     raw = []
-    total = len(kshots) * len(seeds)
-    completed = 0
     for kshot in kshots:
         for seed in seeds:
-            completed += 1
-            print(f"Running {kshot}-shot | seed {seed} ({completed}/{total})", flush=True)
             set_global_seed(seed)
             if val_fraction is None:
                 train_idx = support_positions(train_labels_all, kshot, seed)
-                support_features = train_features_all[train_idx].contiguous()
-                support_labels = train_labels_all[train_idx].contiguous()
                 eval_features = eval_features_all
                 eval_labels = eval_labels_all
             else:
-                train_idx, val_idx = split_positions_by_class(train_labels_all, kshot, seed, val_fraction)
-                support_features = train_features_all[train_idx].contiguous()
-                support_labels = train_labels_all[train_idx].contiguous()
+                train_idx, val_idx = split_positions_by_class(
+                    train_labels_all, kshot, seed, val_fraction
+                )
                 eval_features = train_features_all[val_idx].contiguous()
                 eval_labels = train_labels_all[val_idx].contiguous()
-
             rows = evaluate_run(
                 text_features,
-                support_features,
-                support_labels,
+                train_features_all[train_idx].contiguous(),
+                train_labels_all[train_idx].contiguous(),
                 eval_features,
                 eval_labels,
                 device,
                 alpha_steps,
                 beta_values,
+                rho,
                 kshot,
+                eval_batch_size,
             )
-            for row in rows:
-                raw.append({"dataset": dataset_name, "kshot": int(kshot), "seed": int(seed), **row})
-
-    order = []
-    by_strategy = {}
-    for row in raw:
-        by_strategy.setdefault(row["strategy"], []).append(row)
-        if row["strategy"] not in order:
-            order.append(row["strategy"])
-
-    aggregate = []
-    for strategy in order:
-        members = by_strategy[strategy]
-        acc_mean, acc_std = mean_std([row["accuracy"] for row in members])
-        delta_mean, delta_std = mean_std([row["delta"] for row in members])
-        alpha_mean, alpha_std = mean_std([row["alpha"] for row in members])
-        accuracy_by_kshot = {}
-        for kshot in kshots:
-            shot_members = [row for row in members if row["kshot"] == int(kshot)]
-            if not shot_members:
-                continue
-            shot_mean, shot_std = mean_std([row["accuracy"] for row in shot_members])
-            accuracy_by_kshot[str(kshot)] = {
-                "mean": shot_mean,
-                "std": shot_std,
-                "runs": len(shot_members),
-            }
-        aggregate.append(
-            {
-                "strategy": strategy,
-                "runs": len(members),
-                "accuracy_mean": acc_mean,
-                "accuracy_std": acc_std,
-                "accuracy_by_kshot": accuracy_by_kshot,
-                "delta_mean": delta_mean,
-                "delta_std": delta_std,
-                "alpha_mean": alpha_mean,
-                "alpha_std": alpha_std,
-            }
-        )
-
-    print()
-    print(build_table(aggregate, dataset_name, kshots))
-    if args.latex:
-        print("\nLaTeX rows")
-        print(latex_rows(aggregate, kshots, include_delta=True))
-
-    if args.output_json:
-        out_path = resolve_path(args.output_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump(
+            raw.extend(
                 {
-                    "ablation": "multishot_calibration",
-                    "dataset": dataset_name,
-                    "dataset_root": str(dataset_root),
-                    "kshots": kshots,
-                    "seeds": seeds,
-                    "raw": raw,
-                    "aggregate": aggregate,
-                },
-                f,
-                indent=2,
+                    "dataset": table_name,
+                    "kshot": int(kshot),
+                    "seed": int(seed),
+                    **row,
+                }
+                for row in rows
             )
-        print(f"Saved results to {out_path}")
+    return raw, str(dataset_root)
 
 
 def main():
     args, overrides = parse_args()
     config = merge_configs(load_config_file(args.config), overrides)
-    for dataset_config, _ in iter_dataset_configs(config):
-        run_one(args, dataset_config)
+    kshots = parse_int_list(args.kshots)
+    console = Console(no_color=args.disable_coloring)
+
+    raw = []
+    dataset_roots = {}
+    dataset_configs = table_dataset_configs(config)
+    dataset_names = [table_name for table_name, _, _ in dataset_configs]
+    for table_name, dataset_config, _ in dataset_configs:
+        dataset_raw, dataset_root = run_dataset(args, table_name, dataset_config)
+        raw.extend(dataset_raw)
+        dataset_roots[table_name] = dataset_root
+
+    summary = summarize_table(raw, VARIANTS, kshots=kshots, datasets=dataset_names)
+    console.print()
+    console.print(build_table("Table 6: Multi-shot ablation", summary, dataset_names))
+    if args.latex:
+        console.print("\nLaTeX rows")
+        console.print(latex_rows(summary, dataset_names))
+
+    diagnostics = shotwise_delta_diagnostics(raw, kshots, dataset_names)
+    inconsistent = [row for row in diagnostics if not row["direction_consistent"]]
+    if inconsistent:
+        print(
+            f"\nShot-wise check: {len(inconsistent)} dataset/component transitions "
+            f"change direction across K={{{','.join(str(value) for value in kshots)}}}; "
+            "details are stored in JSON.",
+            flush=True,
+        )
+    else:
+        print("\nShot-wise check: all component deltas have a consistent direction.", flush=True)
+
+    if args.output_json:
+        out_path = resolve_path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as handle:
+            json.dump(
+                {
+                    "ablation": "table_6_multishot",
+                    "datasets": dataset_roots,
+                    "kshots": kshots,
+                    "seeds": parse_int_list(args.seeds),
+                    "raw": raw,
+                    "summary": summary,
+                    "shotwise_delta_diagnostics": diagnostics,
+                },
+                handle,
+                indent=2,
+            )
+        print(f"Saved results to {out_path}")
 
 
 if __name__ == "__main__":

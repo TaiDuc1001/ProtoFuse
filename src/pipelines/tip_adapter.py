@@ -152,6 +152,8 @@ class TipAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             'method': 'TipAdapter+ProtoFuse',
             'alpha': selection['alpha'],
             'protofuse_alpha': selection['alpha'],
+            'before_protofuse_accuracy': baseline_metrics.get('accuracy'),
+            'protofuse_gain': gap_to_tip,
             'tip_accuracy': baseline_metrics.get('accuracy'),
             'gap_to_tip': gap_to_tip,
             'missing_centroid_classes': selection['missing_classes'],
