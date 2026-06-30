@@ -132,9 +132,7 @@ class ProtoFuse(BaseTrainer):
         device,
         alpha_steps=101,
         beta_values=None,
-        query_features=None,
         rho=None,
-        query_batch_size=None,
     ):
         selector = cls.from_precomputed(
             text_prototypes,
@@ -166,18 +164,43 @@ class ProtoFuse(BaseTrainer):
         rho = min(1.0, 0.50 / math.sqrt(kshot))
         selector.rho = rho
         
-        Q_adversarial = selector._generate_sqs_adversarial(visual_centroids, fused_prototypes, beta_val)
-        query_centroids = selector.pseudo_label_aggregation(
-            Q_adversarial.view(-1, Q_adversarial.shape[-1]),
-            selector.text_prototypes,
+        expanded_centroids, query_centroids = selector.surrogatemix_expansion(
             visual_centroids,
+            fused_prototypes,
+            beta_val,
+            selector.text_prototypes,
             alpha_init,
+            rho,
         )
-        expanded_centroids = F.normalize((1.0 - rho) * visual_centroids + rho * query_centroids, dim=-1)
-        alpha = alpha_init
-        alpha_final = alpha_init
-        selected_candidate = "sqs_adversarial_fixed"
-        candidate_scores = {"sqs_adversarial_fixed": 0.0}
+        if is_one_shot:
+            alpha = alpha_init
+            alpha_final = alpha_init
+            selected_candidate = "cgse_fixed"
+            candidate_scores = {"cgse_fixed": 0.0}
+        else:
+            _, alpha_final = selector.hopc_alpha(
+                selector.text_prototypes,
+                expanded_centroids,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids=query_centroids,
+            )
+            selected, scored = selector.select_fallback_candidate(
+                selector.text_prototypes,
+                visual_centroids,
+                expanded_centroids,
+                alpha_init,
+                alpha_final,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids,
+            )
+            selected_candidate, expanded_centroids, alpha, _ = selected
+            candidate_scores = {
+                name: score for name, _, _, score in scored
+            }
         
         fused_prototypes = F.normalize(
             (1.0 - alpha) * selector.text_prototypes
@@ -232,29 +255,45 @@ class ProtoFuse(BaseTrainer):
                 centroids[i] = self._visual_centroid(features[mask])
         return centroids
 
-    def _generate_sqs_adversarial(self, V, proto_before, beta, top_k=5, samples_per_nb=2, std=0.02):
+    def generate_surrogate_mix(
+        self,
+        V,
+        anchor_features,
+        beta,
+        top_k=1,
+        samples_per_nb=1,
+        std=0.0,
+        filter_correct=False,
+    ):
         num_classes, D = V.shape
         top_k = min(top_k, num_classes - 1)
-        sim = proto_before @ proto_before.T
+        sim = anchor_features @ anchor_features.T
         sim.fill_diagonal_(-float('inf'))
         Q = []
         for c in range(num_classes):
             nbs = torch.topk(sim[c], k=top_k).indices
             class_q = []
             for m in nbs:
-                q_base = F.normalize((1.0 - beta) * proto_before[c] + beta * proto_before[m], dim=-1)
-                noise = torch.randn(samples_per_nb, D, device=self.device) * std
-                q_candidates = F.normalize(q_base.unsqueeze(0) + noise, dim=-1)
-                logits = q_candidates @ proto_before.T
-                preds = logits.argmax(dim=-1)
-                valid = q_candidates[preds == c]
-                if len(valid) == 0:
-                    class_q.append(q_candidates)
+                q_base = F.normalize((1.0 - beta) * anchor_features[c] + beta * anchor_features[m], dim=-1)
+                if std > 0.0:
+                    noise = torch.randn(samples_per_nb, D, device=self.device) * std
+                    q_candidates = F.normalize(q_base.unsqueeze(0) + noise, dim=-1)
                 else:
-                    if len(valid) < samples_per_nb:
-                        pad = q_candidates[:samples_per_nb - len(valid)]
-                        valid = torch.cat([valid, pad], dim=0)
-                    class_q.append(valid[:samples_per_nb])
+                    q_candidates = q_base.unsqueeze(0).expand(samples_per_nb, -1)
+
+                if filter_correct:
+                    logits = q_candidates @ anchor_features.T
+                    preds = logits.argmax(dim=-1)
+                    valid = q_candidates[preds == c]
+                    if len(valid) == 0:
+                        class_q.append(q_candidates)
+                    else:
+                        if len(valid) < samples_per_nb:
+                            pad = q_candidates[:samples_per_nb - len(valid)]
+                            valid = torch.cat([valid, pad], dim=0)
+                        class_q.append(valid[:samples_per_nb])
+                else:
+                    class_q.append(q_candidates)
             Q.append(torch.cat(class_q, dim=0))
         return torch.stack(Q, dim=0)
 
@@ -306,22 +345,58 @@ class ProtoFuse(BaseTrainer):
     def expand_visual_centroids(self, V, query_centroids):
         return F.normalize((1.0 - self.rho) * V + self.rho * query_centroids, dim=-1)
 
-    def _centroid_mix_neighbors(self, V_all):
-        similarity = V_all @ V_all.T
-        similarity = similarity.clone()
-        similarity.fill_diagonal_(-float('inf'))
-        return similarity.argmax(dim=1)
+    def surrogatemix_calibration(self, T, V, num_classes):
+        beta_values = self._centroid_mix_beta_values()
+        if num_classes < 2 or not beta_values:
+            return 0.0
 
-    def _centroid_mix_net_curve(self, T, V_all, neighbors, beta, num_classes):
-        labels = torch.arange(num_classes, device=self.device)
-        pseudo_features = F.normalize((1.0 - beta) * V_all + beta * V_all[neighbors], dim=-1)
-        net_scores = []
-        for alpha in self.alphas:
-            proto = F.normalize((1.0 - alpha) * T + alpha * V_all, dim=-1)
-            fused_preds = (pseudo_features @ proto.T).argmax(dim=-1)
-            fused_correct = fused_preds.eq(labels)
-            net_scores.append(fused_correct.sum().float())
-        return torch.stack(net_scores)
+        best = {'score': -float('inf'), 'alpha': 0.0}
+        for beta in beta_values:
+            Q = self.generate_surrogate_mix(
+                V,
+                V,
+                beta,
+                top_k=1,
+                samples_per_nb=1,
+                std=0.0,
+                filter_correct=False,
+            )
+            pseudo_features = Q.squeeze(1)
+
+            labels = torch.arange(num_classes, device=self.device)
+            net_scores = []
+            for alpha in self.alphas:
+                proto = F.normalize((1.0 - alpha) * T + alpha * V, dim=-1)
+                preds = (pseudo_features @ proto.T).argmax(dim=-1)
+                correct = preds.eq(labels).sum().float()
+                net_scores.append(correct)
+
+            curve = torch.stack(net_scores)
+            score = float(curve.max().item())
+            alpha = float(self.alphas[int(curve.argmax().item())].item())
+
+            if score > best['score'] or (score == best['score'] and alpha < best['alpha']):
+                best = {'score': score, 'alpha': alpha}
+        return best['alpha']
+
+    def surrogatemix_expansion(self, V, proto_before, beta_val, T, alpha_init, rho_val):
+        Q = self.generate_surrogate_mix(
+            V,
+            proto_before,
+            beta_val,
+            top_k=5,
+            samples_per_nb=2,
+            std=0.02,
+            filter_correct=True,
+        )
+        query_centroids = self.pseudo_label_aggregation(
+            Q.view(-1, Q.shape[-1]),
+            T,
+            V,
+            alpha_init,
+        )
+        expanded_visual = F.normalize((1.0 - rho_val) * V + rho_val * query_centroids, dim=-1)
+        return expanded_visual, query_centroids
 
     def _centroid_mix_beta_values(self):
         beta_values = sorted({round(float(b), 6) for b in self.centroid_mix_beta_values if 0.0 < float(b) < 0.5})
@@ -329,21 +404,6 @@ class ProtoFuse(BaseTrainer):
             beta_values.append(0.45)
             beta_values.sort()
         return beta_values
-
-    def _centroid_mix_alpha(self, T, V_all, num_classes):
-        beta_values = self._centroid_mix_beta_values()
-        if num_classes < 2 or not beta_values:
-            return 0.0
-
-        best = {'score': -float('inf'), 'alpha': 0.0}
-        neighbors = self._centroid_mix_neighbors(V_all)
-        for beta in beta_values:
-            curve = self._centroid_mix_net_curve(T, V_all, neighbors, beta, num_classes)
-            score = float(curve.max().item())
-            alpha = float(self.alphas[int(curve.argmax().item())].item())
-            if score > best['score'] or (score == best['score'] and alpha < best['alpha']):
-                best = {'score': score, 'alpha': alpha}
-        return best['alpha']
 
     def support_calibration_score(
         self,
@@ -371,17 +431,22 @@ class ProtoFuse(BaseTrainer):
             if 0.45 not in beta_values:
                 beta_values.append(0.45)
                 beta_values.sort()
-            neighbors = self._centroid_mix_neighbors(V_all)
             scores = []
             for beta in beta_values:
-                curve = self._centroid_mix_net_curve(
-                    T,
+                Q = self.generate_surrogate_mix(
                     V_all,
-                    neighbors,
+                    V_all,
                     beta,
-                    num_classes,
+                    top_k=1,
+                    samples_per_nb=1,
+                    std=0.0,
+                    filter_correct=False,
                 )
-                scores.append(curve[alpha_idx])
+                pseudo_features = Q.squeeze(1)
+                proto = F.normalize((1.0 - float(alpha)) * T + float(alpha) * V_all, dim=-1)
+                preds = (pseudo_features @ proto.T).argmax(dim=-1)
+                correct = preds.eq(torch.arange(num_classes, device=self.device)).sum().float()
+                scores.append(correct)
             if not scores:
                 return 0.0
             return float(torch.stack(scores).max().item())
@@ -466,7 +531,7 @@ class ProtoFuse(BaseTrainer):
         shots_per_class = min(len(idxs) for idxs in class_indices)
 
         if shots_per_class < 2:
-            best_alpha = self._centroid_mix_alpha(T, V_all, num_classes)
+            best_alpha = self.surrogatemix_calibration(T, V_all, num_classes)
             best_proto = F.normalize((1 - best_alpha) * T + best_alpha * V_all, dim=-1)
         else:
             k = shots_per_class
@@ -524,27 +589,51 @@ class ProtoFuse(BaseTrainer):
         rho = min(1.0, 0.50 / math.sqrt(kshot))
         self.rho = rho
         
-        Q_adversarial = self._generate_sqs_adversarial(V, proto_before, beta_val)
-        query_centroids = self.pseudo_label_aggregation(
-            Q_adversarial.view(-1, Q_adversarial.shape[-1]),
-            T,
+        selected_V, query_centroids = self.surrogatemix_expansion(
             V,
+            proto_before,
+            beta_val,
+            T,
             alpha_init,
+            rho,
         )
-        selected_V = F.normalize((1.0 - rho) * V + rho * query_centroids, dim=-1)
         expanded_V = selected_V
-        alpha = alpha_init
-        alpha_final = alpha_init
-        selected_candidate = "sqs_adversarial_fixed"
-        candidate_scores = [("sqs_adversarial_fixed", selected_V, alpha, 0.0)]
+        if is_one_shot:
+            alpha = alpha_init
+            alpha_final = alpha_init
+            selected_candidate = "cgse_fixed"
+            candidate_scores = [("cgse_fixed", selected_V, alpha, 0.0)]
+        else:
+            _, alpha_final = self.hopc_alpha(
+                T,
+                expanded_V,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids=query_centroids,
+            )
+            selected, candidate_scores = self.select_fallback_candidate(
+                T,
+                V,
+                expanded_V,
+                alpha_init,
+                alpha_final,
+                train_features,
+                train_labels,
+                num_classes,
+                query_centroids,
+            )
+            selected_candidate, selected_V, alpha, _ = selected
         
         proto = F.normalize((1.0 - alpha) * T + alpha * selected_V, dim=-1)
         self.fused_prototypes = proto
         self.best_alpha = alpha
         self.alpha_init = alpha_init
-        self.alpha_final = alpha_init
+        self.alpha_final = alpha_final
         self.selected_candidate = selected_candidate
-        self.candidate_scores = {"sqs_adversarial_fixed": 0.0}
+        self.candidate_scores = {
+            name: score for name, _, _, score in candidate_scores
+        }
         self.support_visual_centroids = V
         self.query_centroids = query_centroids
         self.expanded_visual_centroids = selected_V
