@@ -3,6 +3,7 @@ import random
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 from torchvision.datasets import ImageFolder
+from utils import fast_image_folder
 
 
 class FewShotFGVCDataset:
@@ -16,7 +17,7 @@ class FewShotFGVCDataset:
         if not os.path.isdir(split_path):
             split_path = root
 
-        self.dataset = ImageFolder(split_path, transform=transform)
+        self.dataset = fast_image_folder(split_path, transform=transform)
         self.samples = self.dataset.samples
         self.classes = self.dataset.classes
         self.class_to_idx = self.dataset.class_to_idx

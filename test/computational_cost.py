@@ -39,6 +39,7 @@ from utils import (
     load_clip_to_cpu,
     load_config_file,
     set_global_seed,
+    fast_image_folder,
 )
 
 
@@ -129,14 +130,14 @@ def load_train_dataset(root):
     root = Path(root)
     train_root = root / "train"
     dataset_root = train_root if train_root.exists() else root
-    return ImageFolder(str(dataset_root), transform=get_transform())
+    return fast_image_folder(str(dataset_root), transform=get_transform())
 
 
 def load_test_dataset(root):
     root = Path(root)
     test_root = root / "test"
     dataset_root = test_root if test_root.exists() else root
-    return ImageFolder(str(dataset_root), transform=get_transform())
+    return fast_image_folder(str(dataset_root), transform=get_transform())
 
 
 def extract_image_features(clip_model, dataset, device, batch_size, num_workers):

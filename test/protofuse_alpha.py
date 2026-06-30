@@ -33,6 +33,7 @@ from utils import (
     run_dataset_eda,
     set_global_seed,
     setup_logging,
+    fast_image_folder,
 )
 from src.pipelines.protofuse import ProtoFusePipeline
 
@@ -63,7 +64,7 @@ class ProtoFuseAlphaSweepPipeline(ProtoFusePipeline):
         transform = self._build_transforms()
         train_root = self._train_only_root()
         try:
-            self.dataset = ImageFolder(train_root, transform=transform)
+            self.dataset = fast_image_folder(train_root, transform=transform)
         except Exception as exc:
             raise RuntimeError(f"Failed to load train dataset from {train_root}: {exc}")
         if self.run_eda:

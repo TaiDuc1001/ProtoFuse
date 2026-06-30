@@ -31,6 +31,7 @@ from utils import (
     BaseTrainingPipeline,
     log_experiment_start,
     log_experiment_metrics,
+    fast_image_folder,
 )
 
 from src.models.apt import APT, DEFAULT_TRAINING_EPOCHS, DEFAULT_CHECKPOINT_DIR
@@ -310,7 +311,7 @@ class APTTrainingPipeline:
         transform = self._build_transforms()
         if self.val_fraction is not None:
             try:
-                self.dataset = ImageFolder(self.dataset_root, transform=transform)
+                self.dataset = fast_image_folder(self.dataset_root, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
             if self.run_eda:
@@ -319,11 +320,11 @@ class APTTrainingPipeline:
             train_path = os.path.join(self.dataset_root, 'train')
             test_path = os.path.join(self.dataset_root, 'test')
             try:
-                self.dataset = ImageFolder(train_path, transform=transform)
+                self.dataset = fast_image_folder(train_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
             try:
-                self._val_dataset = ImageFolder(test_path, transform=transform)
+                self._val_dataset = fast_image_folder(test_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
             if self.run_eda:

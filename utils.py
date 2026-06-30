@@ -238,6 +238,150 @@ class CLIPFeatureCache:
         return payload
 
 
+def _scan_class_dir(args):
+    class_dir, class_idx, extensions, is_valid_file = args
+    class_samples = []
+    # Use os.walk to match torchvision's exact recursive behavior
+    for root, _, files in os.walk(class_dir):
+        # Sort files to ensure deterministic order within class
+        for file in sorted(files):
+            path = os.path.join(root, file)
+            # Check extensions
+            if is_valid_file is not None:
+                if is_valid_file(path):
+                    class_samples.append((path, class_idx))
+            elif extensions is not None:
+                if path.lower().endswith(extensions):
+                    class_samples.append((path, class_idx))
+    return class_samples
+
+
+class CachedImageFolder(ImageFolder):
+    def __init__(
+        self,
+        root: str,
+        transform = None,
+        target_transform = None,
+        loader = None,
+        is_valid_file = None,
+        cache_dir: Optional[str] = None,
+        enabled: bool = True,
+    ):
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/protofuse/imagefolder")
+        self.cache_enabled = enabled
+        
+        kwargs = {}
+        if loader is not None:
+            kwargs['loader'] = loader
+        if is_valid_file is not None:
+            kwargs['is_valid_file'] = is_valid_file
+            
+        super().__init__(
+            root,
+            transform=transform,
+            target_transform=target_transform,
+            **kwargs
+        )
+
+    @staticmethod
+    def make_dataset(*args, **kwargs):
+        # Signature can be (self, directory, class_to_idx, extensions=None, is_valid_file=None)
+        # or (directory, class_to_idx, extensions=None, is_valid_file=None) depending on calling context
+        self_obj = None
+        if len(args) > 0 and isinstance(args[0], CachedImageFolder):
+            self_obj = args[0]
+            remaining_args = args[1:]
+        else:
+            remaining_args = args
+
+        directory = remaining_args[0] if len(remaining_args) > 0 else kwargs.get('directory')
+        class_to_idx = remaining_args[1] if len(remaining_args) > 1 else kwargs.get('class_to_idx')
+        extensions = remaining_args[2] if len(remaining_args) > 2 else kwargs.get('extensions')
+        is_valid_file = remaining_args[3] if len(remaining_args) > 3 else kwargs.get('is_valid_file')
+
+        cache_enabled = True
+        cache_dir = os.path.expanduser("~/.cache/protofuse/imagefolder")
+        if self_obj is not None:
+            cache_enabled = getattr(self_obj, 'cache_enabled', True)
+            cache_dir = getattr(self_obj, 'cache_dir', cache_dir)
+
+        cache_file_path = None
+        if cache_enabled:
+            try:
+                subdirs = []
+                for class_name in sorted(class_to_idx.keys()):
+                    class_dir = os.path.join(directory, class_name)
+                    if os.path.isdir(class_dir):
+                        mtime = os.path.getmtime(class_dir)
+                        subdirs.append(f"{class_name}:{mtime}")
+
+                sig_parts = [
+                    str(directory),
+                    json.dumps(subdirs),
+                    json.dumps(list(extensions) if extensions else []),
+                    str(is_valid_file)
+                ]
+                sig_str = "|".join(sig_parts)
+                cache_key = hashlib.md5(sig_str.encode()).hexdigest()
+
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_file_path = os.path.join(cache_dir, f"{cache_key}.json")
+
+                if os.path.exists(cache_file_path):
+                    with open(cache_file_path, "r") as f:
+                        cache_data = json.load(f)
+                    if isinstance(cache_data, dict) and "samples" in cache_data:
+                        samples = [tuple(item) for item in cache_data["samples"]]
+                        logger.info(f"[ImageFolder cache] hit ← loaded {len(samples)} samples from cache ({cache_key})")
+                        return samples
+            except Exception as e:
+                logger.warning(f"[ImageFolder cache] error reading cache: {e}")
+
+        logger.info(f"[ImageFolder cache] miss/disabled → scanning directory {directory} in parallel...")
+        start_time = time.perf_counter()
+
+        tasks = []
+        for class_name in sorted(class_to_idx.keys()):
+            class_dir = os.path.join(directory, class_name)
+            if os.path.isdir(class_dir):
+                class_idx = class_to_idx[class_name]
+                tasks.append((class_dir, class_idx, extensions, is_valid_file))
+
+        samples = []
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(32, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = executor.map(_scan_class_dir, tasks)
+            for res in results:
+                samples.extend(res)
+
+        duration = time.perf_counter() - start_time
+        logger.info(f"[ImageFolder cache] scanned {len(samples)} samples in {duration:.4f}s")
+
+        if cache_enabled and cache_file_path is not None:
+            try:
+                cache_data = {
+                    "version": 1,
+                    "root": directory,
+                    "classes": sorted(class_to_idx.keys()),
+                    "class_to_idx": class_to_idx,
+                    "samples": samples
+                }
+                temp_path = f"{cache_file_path}.tmp"
+                with open(temp_path, "w") as f:
+                    json.dump(cache_data, f)
+                os.replace(temp_path, cache_file_path)
+                logger.info(f"[ImageFolder cache] saved scanned samples to {cache_file_path}")
+            except Exception as e:
+                logger.warning(f"[ImageFolder cache] error writing cache: {e}")
+
+        return samples
+
+
+def fast_image_folder(root: str, transform=None, cache_dir: Optional[str] = None, enabled: bool = True, **kwargs):
+    return CachedImageFolder(root, transform=transform, cache_dir=cache_dir, enabled=enabled, **kwargs)
+
+
 class ConfigNode(dict):
     def __init__(self, initial: Optional[Dict[str, Any]] = None):
         super().__init__()
@@ -1747,7 +1891,7 @@ class BaseTrainingPipeline:
         transform = self._build_transforms()
         if self.val_fraction is not None:
             try:
-                self.dataset = ImageFolder(self.dataset_root, transform=transform)
+                self.dataset = fast_image_folder(self.dataset_root, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
             if self.run_eda:
@@ -1756,11 +1900,11 @@ class BaseTrainingPipeline:
             train_path = os.path.join(self.dataset_root, 'train')
             test_path = os.path.join(self.dataset_root, 'test')
             try:
-                self.dataset = ImageFolder(train_path, transform=transform)
+                self.dataset = fast_image_folder(train_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
             try:
-                self._val_dataset = ImageFolder(test_path, transform=transform)
+                self._val_dataset = fast_image_folder(test_path, transform=transform)
             except Exception as exc:
                 raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
             if self.run_eda:

@@ -35,6 +35,7 @@ from utils import (
     parse_override_arguments,
     process_parsed_args,
     setup_logging,
+    fast_image_folder,
 )
 
 
@@ -930,8 +931,8 @@ def evaluate_dataset(
             raise FileNotFoundError(
                 f"data.val_size is not set, so expected train/test folders under {spec['path']}"
             )
-        dataset = ImageFolder(str(train_path), transform=get_transform())
-        eval_dataset = ImageFolder(str(eval_path), transform=get_transform())
+        dataset = fast_image_folder(str(train_path), transform=get_transform())
+        eval_dataset = fast_image_folder(str(eval_path), transform=get_transform())
         if dataset.classes != eval_dataset.classes:
             raise ValueError("Train/test class folders do not match.")
         classnames = [name.replace("_", " ") for name in dataset.classes]
@@ -943,7 +944,7 @@ def evaluate_dataset(
             f"{len(task_classes)} classes"
         )
     else:
-        dataset = ImageFolder(str(spec["path"]), transform=get_transform())
+        dataset = fast_image_folder(str(spec["path"]), transform=get_transform())
         eval_dataset = None
         classnames = [name.replace("_", " ") for name in dataset.classes]
         task_classes = sorted(set(label for _, label in dataset.samples))

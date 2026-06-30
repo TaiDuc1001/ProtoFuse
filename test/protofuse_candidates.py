@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from clip import clip
 from src.models.apt import CUSTOM_TEMPLATES
 from src.models.protofuse import ProtoFuse
-from utils import get_config_value, iter_dataset_configs, load_clip_to_cpu, load_config_file, merge_configs, parse_override_arguments, set_global_seed
+from utils import get_config_value, iter_dataset_configs, load_clip_to_cpu, load_config_file, merge_configs, parse_override_arguments, set_global_seed, fast_image_folder
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -84,8 +84,8 @@ def load_datasets(config):
     train_root = root / "train"
     test_root = root / "test"
     if val_size is None and train_root.exists() and test_root.exists():
-        train_dataset = ImageFolder(str(train_root), transform=transform)
-        eval_dataset = ImageFolder(str(test_root), transform=transform)
+        train_dataset = fast_image_folder(str(train_root), transform=transform)
+        eval_dataset = fast_image_folder(str(test_root), transform=transform)
         if train_dataset.classes != eval_dataset.classes:
             raise ValueError("Train/test class folders do not match.")
         return train_dataset, eval_dataset, None, root
@@ -101,7 +101,7 @@ def load_datasets(config):
     if val_fraction <= 0.0 or val_fraction >= 1.0:
         raise ValueError("data.val_size must be in (0, 1) or 0-100 range when expressed as a percentage.")
 
-    dataset = ImageFolder(str(root), transform=transform)
+    dataset = fast_image_folder(str(root), transform=transform)
     return dataset, None, val_fraction, root
 
 

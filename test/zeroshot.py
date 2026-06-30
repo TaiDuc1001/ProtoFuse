@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clip import clip
 from src.models.apt import CUSTOM_TEMPLATES
-from utils import coerce_to_bool, discover_dataset_envs, format_detected_datasets, load_clip_to_cpu
+from utils import coerce_to_bool, discover_dataset_envs, format_detected_datasets, load_clip_to_cpu, fast_image_folder
 
 
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -64,14 +64,14 @@ def load_datasets(root, transform):
     train_root = root / "train"
     test_root = root / "test"
     if train_root.is_dir() and test_root.is_dir():
-        train_dataset = ImageFolder(str(train_root), transform=transform)
-        eval_dataset = ImageFolder(str(test_root), transform=transform)
+        train_dataset = fast_image_folder(str(train_root), transform=transform)
+        eval_dataset = fast_image_folder(str(test_root), transform=transform)
         if train_dataset.classes != eval_dataset.classes:
             raise ValueError("Train/test class folders do not match.")
         classnames = [name.replace("_", " ") for name in train_dataset.classes]
         return classnames, eval_dataset
 
-    eval_dataset = ImageFolder(str(root), transform=transform)
+    eval_dataset = fast_image_folder(str(root), transform=transform)
     classnames = [name.replace("_", " ") for name in eval_dataset.classes]
     return classnames, eval_dataset
 
