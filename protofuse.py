@@ -119,9 +119,27 @@ def _support_calibration_curve(trainer, T, V, train_features, train_labels, num_
     if shots_per_class < 2:
         best = None
         beta_values = trainer._centroid_mix_beta_values()
-        neighbors = trainer._centroid_mix_neighbors(V)
         for beta in beta_values:
-            curve = trainer._centroid_mix_net_curve(T, V, neighbors, beta, num_classes)
+            Q = trainer.generate_surrogate_mix(
+                V,
+                V,
+                beta,
+                top_k=1,
+                samples_per_nb=1,
+                std=0.0,
+                filter_correct=False,
+            )
+            pseudo_features = Q.squeeze(1)
+
+            labels = torch.arange(num_classes, device=trainer.device)
+            net_scores = []
+            for alpha in trainer.alphas:
+                proto = F.normalize((1.0 - alpha) * T + alpha * V, dim=-1)
+                preds = (pseudo_features @ proto.T).argmax(dim=-1)
+                correct = preds.eq(labels).sum().float()
+                net_scores.append(correct)
+
+            curve = torch.stack(net_scores)
             alpha_idx = int(curve.argmax().item())
             score = float(curve[alpha_idx].item())
             alpha = float(trainer.alphas[alpha_idx].item())

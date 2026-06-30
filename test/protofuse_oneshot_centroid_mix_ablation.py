@@ -52,10 +52,10 @@ VARIANTS = (
     "Fixed fusion, α=0.25",
     "Fixed fusion, α=0.50",
     "Fixed fusion, α=0.75",
-    "Centroid-mix calibration, support-only",
-    "Full ProtoFuse",
+    "SM-Cal only",
+    "SM-Exp w/ fixed α=0.25",
+    "Full ProtoFuse (SM-Cal + SM-Exp)",
 )
-
 
 def evaluate_run(
     text_features,
@@ -76,12 +76,11 @@ def evaluate_run(
         device,
         alpha_steps=alpha_steps,
         beta_values=beta_values,
-        query_features=eval_features,
         rho=rho,
-        query_batch_size=eval_batch_size,
     )
     text = selection["text_prototypes"]
     visual = selection["support_visual_centroids"]
+    expanded_visual = selection["visual_centroids"]
     alpha_main = float(selection["alpha"])
     variants = [
         (VARIANTS[0], fused_prototypes(text, visual, 0.0)),
@@ -89,10 +88,8 @@ def evaluate_run(
         (VARIANTS[2], fused_prototypes(text, visual, 0.50)),
         (VARIANTS[3], fused_prototypes(text, visual, 0.75)),
         (VARIANTS[4], fused_prototypes(text, visual, alpha_main)),
-        (
-            VARIANTS[5],
-            selection["raw_fused_prototypes"],
-        ),
+        (VARIANTS[5], fused_prototypes(text, expanded_visual, 0.25)),
+        (VARIANTS[6], selection["raw_fused_prototypes"]),
     ]
     accuracies = batched_variant_accuracies(
         variants,
@@ -107,7 +104,8 @@ def evaluate_run(
         VARIANTS[2]: 0.50,
         VARIANTS[3]: 0.75,
         VARIANTS[4]: alpha_main,
-        VARIANTS[5]: alpha_main,
+        VARIANTS[5]: 0.25,
+        VARIANTS[6]: alpha_main,
     }
     return [
         {
@@ -115,7 +113,7 @@ def evaluate_run(
             "accuracy": float(accuracies[variant]),
             "alpha": float(alphas[variant]),
             "selected_candidate": (
-                selection["selected_candidate"] if variant == VARIANTS[5] else None
+                selection["selected_candidate"] if variant == VARIANTS[6] else None
             ),
         }
         for variant in VARIANTS

@@ -139,7 +139,6 @@ class APEPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            query_features=test_features,
             rho=rho,
         )
         fused_clip_weights = self.trainer.apply_posthoc_protofuse(

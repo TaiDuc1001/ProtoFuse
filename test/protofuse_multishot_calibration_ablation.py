@@ -54,7 +54,6 @@ VARIANTS = (
     "Fixed fusion, α=0.75",
     "Support accuracy without LOO",
     "LOO support-only",
-    "LOO + standard PLA, no recalibration",
     "Full ProtoFuse",
 )
 
@@ -180,14 +179,17 @@ def evaluate_run(
     alpha_support = select_from_curve(selector.alphas, support_curve)
     alpha_init = select_from_curve(selector.alphas, loo_curve)
 
-    query_centroids = selector.pseudo_label_aggregation(
-        eval_features,
-        text,
+    import math
+    beta_val = min(0.45, 0.30 / math.sqrt(kshot))
+    proto_before = F.normalize((1.0 - alpha_init) * text + alpha_init * visual, dim=-1)
+    expanded_visual, query_centroids = selector.surrogatemix_expansion(
         visual,
+        proto_before,
+        beta_val,
+        text,
         alpha_init,
-        batch_size=eval_batch_size,
+        rho,
     )
-    expanded_visual = selector.expand_visual_centroids(visual, query_centroids)
 
     recalibrated_curve = loo_accuracy_curve(
         selector.alphas,
@@ -205,8 +207,7 @@ def evaluate_run(
         (VARIANTS[3], fused_prototypes(text, visual, 0.75)),
         (VARIANTS[4], fused_prototypes(text, visual, alpha_support)),
         (VARIANTS[5], fused_prototypes(text, visual, alpha_init)),
-        (VARIANTS[6], fused_prototypes(text, expanded_visual, alpha_init)),
-        (VARIANTS[7], fused_prototypes(text, expanded_visual, alpha_final)),
+        (VARIANTS[6], fused_prototypes(text, expanded_visual, alpha_final)),
     ]
     accuracies = batched_variant_accuracies(
         variants,
@@ -222,15 +223,14 @@ def evaluate_run(
         VARIANTS[3]: 0.75,
         VARIANTS[4]: alpha_support,
         VARIANTS[5]: alpha_init,
-        VARIANTS[6]: alpha_init,
-        VARIANTS[7]: alpha_final,
+        VARIANTS[6]: alpha_final,
     }
     return [
         {
             "variant": variant,
             "accuracy": float(accuracies[variant]),
             "alpha": float(alphas[variant]),
-            "selected_candidate": "qx_recal_alpha" if variant == VARIANTS[7] else None,
+            "selected_candidate": "qx_recal_alpha" if variant == VARIANTS[6] else None,
         }
         for variant in VARIANTS
     ]

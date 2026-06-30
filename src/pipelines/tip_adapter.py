@@ -122,7 +122,6 @@ class TipAdapterPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            query_features=eval_features,
             rho=rho,
         )
         fused_prototypes = self.trainer.apply_posthoc_protofuse(

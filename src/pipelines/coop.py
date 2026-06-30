@@ -90,7 +90,6 @@ class CoOPTrainingPipeline(BaseTrainingPipeline):
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            query_features=eval_features,
             rho=rho,
         )
         alpha = selection['alpha']

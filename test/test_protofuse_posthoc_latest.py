@@ -46,14 +46,13 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             support,
             labels,
             device="cpu",
-            query_features=query,
         )
 
         self.assertEqual(CountingProtoFuse.hopc_calls, 1)
         self.assertEqual(CountingProtoFuse.fallback_calls, 0)
         self.assertEqual(selection["alpha"], selection["alpha_init"])
         self.assertEqual(selection["alpha_final"], selection["alpha_init"])
-        self.assertEqual(selection["selected_candidate"], "sqs_adversarial_fixed")
+        self.assertEqual(selection["selected_candidate"], "cgse_fixed")
 
     def test_one_shot_trainer_path_also_uses_a_single_alpha(self):
         text = F.normalize(torch.eye(3), dim=-1)
@@ -74,7 +73,7 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
         self.assertEqual(CountingProtoFuse.fallback_calls, 0)
         self.assertEqual(metrics["alpha"], metrics["alpha_init"])
         self.assertEqual(metrics["alpha_final"], metrics["alpha_init"])
-        self.assertEqual(metrics["selected_candidate"], "sqs_adversarial_fixed")
+        self.assertEqual(metrics["selected_candidate"], "cgse_fixed")
 
     def test_query_features_enable_latest_qx_fallback(self):
         text = F.normalize(torch.eye(3), dim=-1)
@@ -94,15 +93,17 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             support,
             labels,
             device="cpu",
-            query_features=query,
         )
 
         import math
         self.assertAlmostEqual(selection["rho"], 0.50 / math.sqrt(2))
-        self.assertEqual(selection["selected_candidate"], "sqs_adversarial_fixed")
+        self.assertIn(
+            selection["selected_candidate"],
+            {"orig", "qx_fixed_alpha", "qx_recal_alpha"},
+        )
         self.assertEqual(
             set(selection["candidate_scores"]),
-            {"sqs_adversarial_fixed"},
+            {"orig", "qx_fixed_alpha", "qx_recal_alpha"},
         )
         self.assertIn("alpha_init", selection)
         self.assertIn("alpha_final", selection)
@@ -119,11 +120,10 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             support,
             labels,
             device="cpu",
-            query_features=query,
         )
 
-        self.assertEqual(CountingProtoFuse.hopc_calls, 1)
-        self.assertEqual(CountingProtoFuse.fallback_calls, 0)
+        self.assertEqual(CountingProtoFuse.hopc_calls, 2)
+        self.assertEqual(CountingProtoFuse.fallback_calls, 1)
 
 
 if __name__ == "__main__":

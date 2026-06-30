@@ -46,7 +46,7 @@ def tangent_direction(target, base, eps=1e-8):
     return F.normalize(d, dim=-1, eps=eps)
 
 
-def generate_sqs_adversarial(V, proto_before, beta, device, top_k=5, samples_per_nb=2, std=0.02):
+def generate_cgse(V, proto_before, beta, device, top_k=5, samples_per_nb=2, std=0.02):
     num_classes, D = V.shape
     sim = proto_before @ proto_before.T
     sim.fill_diagonal_(-float('inf'))
@@ -159,43 +159,26 @@ def run_forensic_run(pipeline, train_features, train_labels, eval_features, eval
     V = pipeline.trainer.build_visual_centroids(train_features, train_labels, num_classes).to(device)
     
     _, alpha_init = pipeline.trainer.hopc_alpha(T, V, train_features, train_labels, num_classes)
-    
-    query_centroids = pipeline.trainer.pseudo_label_aggregation(
-        eval_features,
-        T,
-        V,
-        alpha_init,
-    ).to(device)
-    
-    expanded_V = pipeline.trainer.expand_visual_centroids(V, query_centroids).to(device)
-    delta = tangent_direction(expanded_V, V)
-    
     proto_before = F.normalize((1.0 - alpha_init) * T + alpha_init * V, dim=-1)
-    proto_after = F.normalize((1.0 - alpha_init) * T + alpha_init * expanded_V, dim=-1)
     
     logits_before = eval_features.to(device) @ proto_before.T
-    logits_after = eval_features.to(device) @ proto_after.T
-    
     pred_before = logits_before.argmax(dim=-1).cpu()
-    pred_after = logits_after.argmax(dim=-1).cpu()
     
     acc_before_all = float(pred_before.eq(eval_labels.cpu()).float().mean().item() * 100.0)
-    acc_after_all = float(pred_after.eq(eval_labels.cpu()).float().mean().item() * 100.0)
-    acc_gain_all = acc_after_all - acc_before_all
 
     beta_val = min(0.45, 0.30 / math.sqrt(kshot))
     rho_val = min(1.0, 0.50 / math.sqrt(kshot))
-    Q_adversarial = generate_sqs_adversarial(V, proto_before, beta_val, device)
+    Q_cgse = generate_cgse(V, proto_before, beta_val, device)
     
     # 1. B1: fixed SQS-Adversarial
-    query_centroids_syn = pipeline.trainer.pseudo_label_aggregation(Q_adversarial.view(-1, Q_adversarial.shape[-1]), T, V, alpha_init).to(device)
+    query_centroids_syn = pipeline.trainer.pseudo_label_aggregation(Q_cgse.view(-1, Q_cgse.shape[-1]), T, V, alpha_init).to(device)
     V_syn = F.normalize((1.0 - rho_val) * V + rho_val * query_centroids_syn, dim=-1)
     proto_syn = F.normalize((1.0 - alpha_init) * T + alpha_init * V_syn, dim=-1)
     logits_syn = eval_features.to(device) @ proto_syn.T
     acc_adversarial = float(logits_syn.argmax(dim=-1).cpu().eq(eval_labels.cpu()).float().mean().item() * 100.0)
 
     # Class-wise gating parameters
-    a_c = F.normalize(Q_adversarial.mean(dim=1), dim=-1)
+    a_c = F.normalize(Q_cgse.mean(dim=1), dim=-1)
     sim_v = V @ V.T
     sim_v.fill_diagonal_(-float('inf'))
     visual_confusion_c = sim_v.max(dim=1).values
@@ -266,8 +249,6 @@ def run_forensic_run(pipeline, train_features, train_labels, eval_features, eval
         "kshot": int(kshot),
         
         "acc_before": acc_before_all,
-        "acc_after": acc_after_all,
-        "acc_gain": acc_gain_all,
         
         "sqs_adversarial_acc": acc_adversarial,
         "acc_cpd_b2": acc_b2,
@@ -378,7 +359,6 @@ def print_centroid_summary(dataset_name, results, kshots, seeds):
             {"Variant": "B2: gated SQS-Adversarial class-wise", "Uses test?": "No", "Accuracy": fmt_mean_std([r["acc_cpd_b2"] for r in members], suffix="%"), "Gain": fmt_mean_std([r["acc_cpd_b2"] - r["acc_before"] for r in members], suffix="%")},
             {"Variant": "B3: gated SQS-Adversarial episode-level", "Uses test?": "No", "Accuracy": fmt_mean_std([r["acc_cpd_b3"] for r in members], suffix="%"), "Gain": fmt_mean_std([r["acc_cpd_b3"] - r["acc_before"] for r in members], suffix="%")},
             {"Variant": "B4: Oracle-best SQS", "Uses test?": "No", "Accuracy": fmt_mean_std([r["oracle_best_acc"] for r in members], suffix="%"), "Gain": fmt_mean_std([r["oracle_best_acc"] - r["acc_before"] for r in members], suffix="%")},
-            {"Variant": "B5: Oracle PLA", "Uses test?": "Yes", "Accuracy": fmt_mean_std([r["acc_after"] for r in members], suffix="%"), "Gain": fmt_mean_std([r["acc_gain"] for r in members], suffix="%")},
         ]
         
         print(f"\n{dataset_name} x {int(kshot)}-shot Reliability-gated Forensic Comparison (n={len(members)} runs)")

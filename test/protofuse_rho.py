@@ -79,9 +79,7 @@ def evaluate_rhos(
             device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            query_features=eval_features,
             rho=rho,
-            query_batch_size=eval_batch_size,
         )
         name = f"rho={rho:.2f}"
         variants.append((name, selection["raw_fused_prototypes"]))

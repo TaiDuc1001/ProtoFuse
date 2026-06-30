@@ -571,7 +571,6 @@ class APTTrainingPipeline:
             device=self.device,
             alpha_steps=alpha_steps,
             beta_values=beta_values,
-            query_features=query_features,
             rho=rho,
         )
         alpha = selection['alpha']
