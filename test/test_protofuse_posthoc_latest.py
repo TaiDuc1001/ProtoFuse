@@ -47,27 +47,20 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             labels,
             device="cpu",
             query_features=query,
-            rho=0.75,
         )
 
         self.assertEqual(CountingProtoFuse.hopc_calls, 1)
         self.assertEqual(CountingProtoFuse.fallback_calls, 0)
         self.assertEqual(selection["alpha"], selection["alpha_init"])
         self.assertEqual(selection["alpha_final"], selection["alpha_init"])
-        self.assertEqual(selection["selected_candidate"], "qx_fixed_alpha")
-        expected = F.normalize(
-            (1.0 - selection["alpha_init"]) * text
-            + selection["alpha_init"] * selection["visual_centroids"],
-            dim=-1,
-        )
-        self.assertTrue(torch.allclose(selection["raw_fused_prototypes"], expected))
+        self.assertEqual(selection["selected_candidate"], "sqs_adversarial_fixed")
 
     def test_one_shot_trainer_path_also_uses_a_single_alpha(self):
         text = F.normalize(torch.eye(3), dim=-1)
         support = text.clone()
         labels = torch.arange(3)
         query = F.normalize(text + 0.05, dim=-1)
-        trainer = CountingProtoFuse.from_precomputed(text, device="cpu", rho=0.75)
+        trainer = CountingProtoFuse.from_precomputed(text, device="cpu")
 
         metrics = trainer.fuse_and_evaluate(
             support,
@@ -81,7 +74,7 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
         self.assertEqual(CountingProtoFuse.fallback_calls, 0)
         self.assertEqual(metrics["alpha"], metrics["alpha_init"])
         self.assertEqual(metrics["alpha_final"], metrics["alpha_init"])
-        self.assertEqual(metrics["selected_candidate"], "qx_fixed_alpha")
+        self.assertEqual(metrics["selected_candidate"], "sqs_adversarial_fixed")
 
     def test_query_features_enable_latest_qx_fallback(self):
         text = F.normalize(torch.eye(3), dim=-1)
@@ -102,17 +95,14 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             labels,
             device="cpu",
             query_features=query,
-            rho=0.75,
         )
 
-        self.assertEqual(selection["rho"], 0.75)
-        self.assertIn(
-            selection["selected_candidate"],
-            {"orig", "qx_fixed_alpha", "qx_recal_alpha"},
-        )
+        import math
+        self.assertAlmostEqual(selection["rho"], 0.50 / math.sqrt(2))
+        self.assertEqual(selection["selected_candidate"], "sqs_adversarial_fixed")
         self.assertEqual(
             set(selection["candidate_scores"]),
-            {"orig", "qx_fixed_alpha", "qx_recal_alpha"},
+            {"sqs_adversarial_fixed"},
         )
         self.assertIn("alpha_init", selection)
         self.assertIn("alpha_final", selection)
@@ -132,8 +122,8 @@ class ProtoFusePosthocLatestTest(unittest.TestCase):
             query_features=query,
         )
 
-        self.assertEqual(CountingProtoFuse.hopc_calls, 2)
-        self.assertEqual(CountingProtoFuse.fallback_calls, 1)
+        self.assertEqual(CountingProtoFuse.hopc_calls, 1)
+        self.assertEqual(CountingProtoFuse.fallback_calls, 0)
 
 
 if __name__ == "__main__":

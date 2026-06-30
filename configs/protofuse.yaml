@@ -1,7 +1,6 @@
 model:
   backbone: "ViT-B/16"
   alpha_steps: 101
-  rho: 0.5  # Optional tune range: [0.0, 0.25, 0.5, 0.75, 1.0]
   centroid_mix:
     beta_values: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
 

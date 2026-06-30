@@ -511,39 +511,6 @@ def print_dataset_summary(dataset_name, results, kshots, seeds):
     print(f"\n{dataset_name} x ProtoFuse x seed mean +/- std")
     print(format_table(rows, ["kshot", "runs", "acc", "alpha"]), flush=True)
 
-    failure_columns = [
-        "kshot",
-        "T ok / V wrong",
-        "T wrong / V ok",
-        "T wrong / V wrong",
-        "ours wrong / oracle ok",
-        "ours+oracle wrong",
-    ]
-    print(f"\n{dataset_name} x failure decomposition x seed mean +/- std")
-    print(format_table(build_failure_rows(results, kshots, seeds), failure_columns), flush=True)
-
-    calibration_columns = [
-        "kshot",
-        "selected alpha",
-        "oracle alpha",
-        "regret",
-        "curve corr",
-        f"top-{TOP_K_ALPHA} hit",
-    ]
-    print(f"\n{dataset_name} x alpha calibration x seed mean +/- std")
-    print(format_table(build_calibration_rows(results, kshots, seeds), calibration_columns), flush=True)
-
-    geometry_columns = [
-        "geometry metric",
-        "mean +/- std",
-        "corr(gain)",
-        "corr(regret)",
-        "corr(alpha)",
-    ]
-    run_count = len(kshots) * len(seeds)
-    print(f"\n{dataset_name} x support geometry correlation x n={run_count}")
-    print(format_table(build_geometry_rows(results, kshots, seeds), geometry_columns), flush=True)
-
 
 def main():
     args, overrides = parse_args()

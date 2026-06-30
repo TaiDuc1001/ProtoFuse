@@ -48,11 +48,7 @@ class MaPLeTrainingPipeline(BaseTrainingPipeline):
         proto_beta_values = get_config_value(proto_cfg, 'model.centroid_mix.beta_values', None)
         centroid_mix_cfg = cfg.get('centroid_mix', ConfigNode())
         beta_values = centroid_mix_cfg.get('beta_values', proto_beta_values)
-        rho = coerce_to_float(
-            cfg.get('rho', get_config_value(proto_cfg, 'model.rho', 0.5)),
-            0.5,
-            key='posthoc_protofuse.rho',
-        )
+        rho = None
         return alpha_steps, beta_values, rho
 
     def _try_load_checkpoint(self) -> bool:

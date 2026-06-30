@@ -20,7 +20,7 @@ class ProtoFuse(BaseTrainer):
     def build_model(self):
         backbone_name = self._cfg_str('ViT-B/16', 'model.backbone', 'backbone')
         self.alpha_steps = self._cfg_int(101, 'model.alpha_steps')
-        self.rho = min(max(self._cfg_float(0.5, 'model.rho', 'rho'), 0.0), 1.0)
+        self.rho = None
         self.centroid_mix_beta_values = self._cfg_float_list(
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
             'model.centroid_mix.beta_values',
@@ -94,14 +94,14 @@ class ProtoFuse(BaseTrainer):
         device,
         alpha_steps=101,
         beta_values=None,
-        rho=0.5,
+        rho=None,
         classnames=None,
     ):
         trainer = cls.__new__(cls)
         trainer.device = torch.device(device)
         trainer.classnames = list(classnames or [])
         trainer.alpha_steps = max(2, int(alpha_steps))
-        trainer.rho = min(max(coerce_to_float(rho, 0.5), 0.0), 1.0)
+        trainer.rho = None
         trainer.centroid_mix_beta_values = cls._coerce_float_list(
             beta_values,
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
@@ -133,7 +133,7 @@ class ProtoFuse(BaseTrainer):
         alpha_steps=101,
         beta_values=None,
         query_features=None,
-        rho=0.5,
+        rho=None,
         query_batch_size=None,
     ):
         selector = cls.from_precomputed(
@@ -158,58 +158,32 @@ class ProtoFuse(BaseTrainer):
             train_labels,
             num_classes,
         )
-        query_centroids = visual_centroids
-        expanded_centroids = visual_centroids
+        import math
+        kshot = int(class_counts.min().item())
+        if kshot < 1:
+            kshot = 1
+        beta_val = min(0.45, 0.30 / math.sqrt(kshot))
+        rho = min(1.0, 0.50 / math.sqrt(kshot))
+        selector.rho = rho
+        
+        Q_adversarial = selector._generate_sqs_adversarial(visual_centroids, fused_prototypes, beta_val)
+        query_centroids = selector.pseudo_label_aggregation(
+            Q_adversarial.view(-1, Q_adversarial.shape[-1]),
+            selector.text_prototypes,
+            visual_centroids,
+            alpha_init,
+        )
+        expanded_centroids = F.normalize((1.0 - rho) * visual_centroids + rho * query_centroids, dim=-1)
         alpha = alpha_init
         alpha_final = alpha_init
-        selected_candidate = "orig"
-        candidate_scores = {"orig": 0.0}
-        if query_features is not None:
-            query_centroids = selector.pseudo_label_aggregation(
-                query_features,
-                selector.text_prototypes,
-                visual_centroids,
-                alpha_init,
-                batch_size=query_batch_size,
-            )
-            expanded_centroids = selector.expand_visual_centroids(
-                visual_centroids,
-                query_centroids,
-            )
-            if is_one_shot:
-                alpha = alpha_init
-                alpha_final = alpha_init
-                selected_candidate = "qx_fixed_alpha"
-                candidate_scores = {"qx_fixed_alpha": 0.0}
-            else:
-                _, alpha_final = selector.hopc_alpha(
-                    selector.text_prototypes,
-                    expanded_centroids,
-                    train_features,
-                    train_labels,
-                    num_classes,
-                    query_centroids=query_centroids,
-                )
-                selected, scored = selector.select_fallback_candidate(
-                    selector.text_prototypes,
-                    visual_centroids,
-                    expanded_centroids,
-                    alpha_init,
-                    alpha_final,
-                    train_features,
-                    train_labels,
-                    num_classes,
-                    query_centroids,
-                )
-                selected_candidate, expanded_centroids, alpha, _ = selected
-                candidate_scores = {
-                    name: score for name, _, _, score in scored
-                }
-            fused_prototypes = F.normalize(
-                (1.0 - alpha) * selector.text_prototypes
-                + alpha * expanded_centroids,
-                dim=-1,
-            )
+        selected_candidate = "sqs_adversarial_fixed"
+        candidate_scores = {"sqs_adversarial_fixed": 0.0}
+        
+        fused_prototypes = F.normalize(
+            (1.0 - alpha) * selector.text_prototypes
+            + alpha * expanded_centroids,
+            dim=-1,
+        )
 
         centroid_mask = torch.zeros(num_classes, device=selector.device, dtype=torch.bool)
         valid_labels = train_labels[(train_labels >= 0) & (train_labels < num_classes)]
@@ -257,6 +231,32 @@ class ProtoFuse(BaseTrainer):
             if mask.any():
                 centroids[i] = self._visual_centroid(features[mask])
         return centroids
+
+    def _generate_sqs_adversarial(self, V, proto_before, beta, top_k=5, samples_per_nb=2, std=0.02):
+        num_classes, D = V.shape
+        top_k = min(top_k, num_classes - 1)
+        sim = proto_before @ proto_before.T
+        sim.fill_diagonal_(-float('inf'))
+        Q = []
+        for c in range(num_classes):
+            nbs = torch.topk(sim[c], k=top_k).indices
+            class_q = []
+            for m in nbs:
+                q_base = F.normalize((1.0 - beta) * proto_before[c] + beta * proto_before[m], dim=-1)
+                noise = torch.randn(samples_per_nb, D, device=self.device) * std
+                q_candidates = F.normalize(q_base.unsqueeze(0) + noise, dim=-1)
+                logits = q_candidates @ proto_before.T
+                preds = logits.argmax(dim=-1)
+                valid = q_candidates[preds == c]
+                if len(valid) == 0:
+                    class_q.append(q_candidates)
+                else:
+                    if len(valid) < samples_per_nb:
+                        pad = q_candidates[:samples_per_nb - len(valid)]
+                        valid = torch.cat([valid, pad], dim=0)
+                    class_q.append(valid[:samples_per_nb])
+            Q.append(torch.cat(class_q, dim=0))
+        return torch.stack(Q, dim=0)
 
     def pseudo_label_aggregation(
         self,
@@ -514,51 +514,37 @@ class ProtoFuse(BaseTrainer):
         is_one_shot = bool(class_counts.numel() == num_classes and class_counts.eq(1).all().item())
 
         _, alpha_init = self.hopc_alpha(T, V, train_features, train_labels, num_classes)
+        proto_before = F.normalize((1.0 - alpha_init) * T + alpha_init * V, dim=-1)
+        
+        import math
+        kshot = int(class_counts.min().item())
+        if kshot < 1:
+            kshot = 1
+        beta_val = min(0.45, 0.30 / math.sqrt(kshot))
+        rho = min(1.0, 0.50 / math.sqrt(kshot))
+        self.rho = rho
+        
+        Q_adversarial = self._generate_sqs_adversarial(V, proto_before, beta_val)
         query_centroids = self.pseudo_label_aggregation(
-            eval_features,
+            Q_adversarial.view(-1, Q_adversarial.shape[-1]),
             T,
             V,
             alpha_init,
         )
-        expanded_V = self.expand_visual_centroids(V, query_centroids)
-        if is_one_shot:
-            alpha = alpha_init
-            alpha_final = alpha_init
-            selected_candidate = "qx_fixed_alpha"
-            selected_V = expanded_V
-            candidate_scores = [
-                ("qx_fixed_alpha", selected_V, alpha, 0.0),
-            ]
-        else:
-            _, alpha_final = self.hopc_alpha(
-                T,
-                expanded_V,
-                train_features,
-                train_labels,
-                num_classes,
-                query_centroids=query_centroids,
-            )
-            selected, candidate_scores = self.select_fallback_candidate(
-                T,
-                V,
-                expanded_V,
-                alpha_init,
-                alpha_final,
-                train_features,
-                train_labels,
-                num_classes,
-                query_centroids,
-            )
-            selected_candidate, selected_V, alpha, _ = selected
+        selected_V = F.normalize((1.0 - rho) * V + rho * query_centroids, dim=-1)
+        expanded_V = selected_V
+        alpha = alpha_init
+        alpha_final = alpha_init
+        selected_candidate = "sqs_adversarial_fixed"
+        candidate_scores = [("sqs_adversarial_fixed", selected_V, alpha, 0.0)]
+        
         proto = F.normalize((1.0 - alpha) * T + alpha * selected_V, dim=-1)
         self.fused_prototypes = proto
         self.best_alpha = alpha
         self.alpha_init = alpha_init
-        self.alpha_final = alpha_final
+        self.alpha_final = alpha_init
         self.selected_candidate = selected_candidate
-        self.candidate_scores = {
-            name: score for name, _, _, score in candidate_scores
-        }
+        self.candidate_scores = {"sqs_adversarial_fixed": 0.0}
         self.support_visual_centroids = V
         self.query_centroids = query_centroids
         self.expanded_visual_centroids = selected_V
