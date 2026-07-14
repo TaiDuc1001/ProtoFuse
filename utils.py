@@ -355,6 +355,8 @@ class CachedImageFolder(ImageFolder):
             for res in results:
                 samples.extend(res)
 
+        samples.sort(key=lambda x: x[0])
+
         duration = time.perf_counter() - start_time
         logger.info(f"[ImageFolder cache] scanned {len(samples)} samples in {duration:.4f}s")
 
