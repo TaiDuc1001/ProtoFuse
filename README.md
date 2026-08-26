@@ -10,7 +10,7 @@ Few-shot CLIP adaptation experiments for fine-grained image classification. The 
 ## Installation
 
 ```bash
-git clone https://github.com/TaiDuc1001/protofuse.git
+git clone <repo_url>
 cd protofuse
 uv sync
 ```
