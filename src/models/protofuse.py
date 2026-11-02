@@ -101,7 +101,7 @@ class ProtoFuse(BaseTrainer):
         trainer.device = torch.device(device)
         trainer.classnames = list(classnames or [])
         trainer.alpha_steps = max(2, int(alpha_steps))
-        trainer.rho = None
+        trainer.rho = float(rho) if rho is not None else None
         trainer.centroid_mix_beta_values = cls._coerce_float_list(
             beta_values,
             [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
@@ -133,6 +133,9 @@ class ProtoFuse(BaseTrainer):
         alpha_steps=101,
         beta_values=None,
         rho=None,
+        visual_centroids=None,
+        fused_prototypes_init=None,
+        alpha_init=None,
     ):
         selector = cls.from_precomputed(
             text_prototypes,
@@ -148,14 +151,17 @@ class ProtoFuse(BaseTrainer):
         class_counts = torch.bincount(train_labels, minlength=num_classes)
         is_one_shot = bool(class_counts.numel() == num_classes and class_counts.eq(1).all().item())
 
-        visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
-        fused_prototypes, alpha_init = selector.hopc_alpha(
-            selector.text_prototypes,
-            visual_centroids,
-            train_features,
-            train_labels,
-            num_classes,
-        )
+        if visual_centroids is None:
+            visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
+        if fused_prototypes_init is None or alpha_init is None:
+            fused_prototypes_init, alpha_init = selector.hopc_alpha(
+                selector.text_prototypes,
+                visual_centroids,
+                train_features,
+                train_labels,
+                num_classes,
+            )
+        fused_prototypes = fused_prototypes_init
         import math
         kshot = int(class_counts.min().item())
         if kshot < 1:
@@ -164,7 +170,10 @@ class ProtoFuse(BaseTrainer):
         lambda_gamma = 0.30
         lambda_rho = 0.50
         gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
-        rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
+        if rho is not None:
+            rho_k = float(rho)
+        else:
+            rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
         selector.rho = rho_k
         
         expanded_centroids, query_centroids = selector.surrogatemix_expansion(
@@ -251,11 +260,15 @@ class ProtoFuse(BaseTrainer):
         return F.normalize(class_features.mean(dim=0), dim=-1)
 
     def build_visual_centroids(self, features, labels, num_classes):
-        centroids = torch.zeros(num_classes, self.embed_dim, device=self.device)
-        for i in range(num_classes):
-            mask = (labels == i)
-            if mask.any():
-                centroids[i] = self._visual_centroid(features[mask])
+        features = features.to(self.device).float()
+        labels = labels.to(self.device).long()
+        counts = torch.bincount(labels, minlength=num_classes).float().unsqueeze(-1)
+        sums = torch.zeros(num_classes, features.shape[-1], device=self.device, dtype=features.dtype)
+        sums.index_add_(0, labels, features)
+        valid = counts.squeeze(-1) > 0
+        centroids = torch.zeros(num_classes, features.shape[-1], device=self.device, dtype=features.dtype)
+        if valid.any():
+            centroids[valid] = F.normalize(sums[valid] / counts[valid], dim=-1)
         return centroids
 
     def generate_surrogate_mix(
@@ -459,16 +472,13 @@ class ProtoFuse(BaseTrainer):
             train_features[class_indices[class_idx][:k]].to(self.device)
             for class_idx in range(num_classes)
         ])
+        class_sum = class_features.sum(dim=1)
         targets = torch.arange(num_classes, device=self.device)
         score = torch.zeros((), device=self.device)
 
         for hold_idx in range(k):
             held = F.normalize(class_features[:, hold_idx, :], dim=-1)
-            keep = torch.arange(k, device=self.device) != hold_idx
-            fold_centroids = torch.stack([
-                self._visual_centroid(class_features[class_idx, keep])
-                for class_idx in range(num_classes)
-            ])
+            fold_centroids = F.normalize((class_sum - class_features[:, hold_idx, :]) / float(k - 1), dim=-1)
             if query_centroids is not None:
                 fold_centroids = self.expand_visual_centroids(
                     fold_centroids,
@@ -541,17 +551,13 @@ class ProtoFuse(BaseTrainer):
             class_feat = torch.stack([
                 train_features[class_indices[c][:k]].to(self.device) for c in range(num_classes)
             ])
+            class_sum = class_feat.sum(dim=1)
             net_scores = torch.zeros(len(self.alphas), device=self.device)
             targets = torch.arange(num_classes, device=self.device)
 
             for hold_idx in range(k):
                 held = F.normalize(class_feat[:, hold_idx, :], dim=-1)
-                V_minus = torch.stack([
-                    self._visual_centroid(
-                        class_feat[c, torch.arange(k, device=self.device) != hold_idx]
-                    )
-                    for c in range(num_classes)
-                ])
+                V_minus = F.normalize((class_sum - class_feat[:, hold_idx, :]) / float(k - 1), dim=-1)
                 if query_centroids is not None:
                     V_minus = self.expand_visual_centroids(
                         V_minus,
@@ -592,7 +598,10 @@ class ProtoFuse(BaseTrainer):
         lambda_gamma = 0.30
         lambda_rho = 0.50
         gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
-        rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
+        if self.rho is not None:
+            rho_k = float(self.rho)
+        else:
+            rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
         self.rho = rho_k
         
         selected_V, query_centroids = self.surrogatemix_expansion(

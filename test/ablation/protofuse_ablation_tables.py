@@ -1,4 +1,5 @@
 import copy
+import random
 import re
 import sys
 from pathlib import Path
@@ -14,6 +15,38 @@ import torch.nn.functional as F
 
 from src.models.protofuse import ProtoFuse
 from utils import get_config_value, iter_dataset_configs
+
+
+class ForkRNG:
+    """Snapshots and restores RNG states across PyTorch (CPU and CUDA), NumPy, and Python random."""
+
+    def __init__(self, device=None):
+        self.device = torch.device(device) if device is not None else None
+        self.torch_cpu = torch.get_rng_state()
+        self.torch_cuda = None
+        if torch.cuda.is_available():
+            try:
+                if self.device is not None and self.device.type == "cuda":
+                    self.torch_cuda = torch.cuda.get_rng_state(self.device)
+                else:
+                    self.torch_cuda = torch.cuda.get_rng_state()
+            except Exception:
+                self.torch_cuda = None
+        self.np_state = np.random.get_state()
+        self.py_state = random.getstate()
+
+    def restore(self):
+        torch.set_rng_state(self.torch_cpu)
+        if self.torch_cuda is not None and torch.cuda.is_available():
+            try:
+                if self.device is not None and self.device.type == "cuda":
+                    torch.cuda.set_rng_state(self.torch_cuda, self.device)
+                else:
+                    torch.cuda.set_rng_state(self.torch_cuda)
+            except Exception:
+                pass
+        np.random.set_state(self.np_state)
+        random.setstate(self.py_state)
 
 
 TABLE_DATASETS = (

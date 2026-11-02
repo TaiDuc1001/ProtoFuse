@@ -1,4 +1,5 @@
 import argparse
+import copy
 import gc
 import json
 import math
@@ -15,30 +16,25 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn.functional as F
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(REPO_ROOT))
 
+from protofuse import split_indices_for
 from protofuse_ablation_tables import (
+    ForkRNG,
     batched_variant_accuracies,
     table_dataset_configs,
 )
 from protofuse_candidates import (
     DEFAULT_CONFIG,
-    build_text_features,
-    extract_image_features,
-    load_datasets,
-    load_model,
     parse_float_list,
     parse_int_list,
     resolve_path,
-    split_positions_by_class,
-    support_positions,
 )
 from src.models.protofuse import ProtoFuse
+from src.pipelines.protofuse import ProtoFusePipeline
 from utils import (
     get_config_value,
     load_config_file,
@@ -49,6 +45,7 @@ from utils import (
 
 
 DEFAULT_SIGMAS = [0.0, 0.01, 0.02, 0.03, 0.05]
+DEFAULT_KSHOTS = [1, 2, 4, 8, 16]
 DEFAULT_SEEDS = [1, 10, 100, 1000, 10000]
 DATASET_DISPLAY_NAMES = {
     "FGVC-Aircraft": "Aircraft",
@@ -73,6 +70,9 @@ def custom_posthoc_fuse(
     gamma_max=0.45,
     lambda_gamma=0.30,
     lambda_rho=0.50,
+    visual_centroids=None,
+    fused_prototypes_init=None,
+    alpha_init=None,
 ):
     selector = ProtoFuse.from_precomputed(
         text_prototypes,
@@ -87,14 +87,17 @@ def custom_posthoc_fuse(
     class_counts = torch.bincount(train_labels, minlength=num_classes)
     is_one_shot = bool(class_counts.numel() == num_classes and class_counts.eq(1).all().item())
 
-    visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
-    fused_prototypes, alpha_init = selector.hopc_alpha(
-        selector.text_prototypes,
-        visual_centroids,
-        train_features,
-        train_labels,
-        num_classes,
-    )
+    if visual_centroids is None:
+        visual_centroids = selector.build_visual_centroids(train_features, train_labels, num_classes)
+    if fused_prototypes_init is None or alpha_init is None:
+        fused_prototypes_init, alpha_init = selector.hopc_alpha(
+            selector.text_prototypes,
+            visual_centroids,
+            train_features,
+            train_labels,
+            num_classes,
+        )
+    fused_prototypes = fused_prototypes_init
     kshot = int(class_counts.min().item())
     if kshot < 1:
         kshot = 1
@@ -178,9 +181,29 @@ def evaluate_sigmas(
     beta_values,
     eval_batch_size,
 ):
+    selector = ProtoFuse.from_precomputed(
+        text_features,
+        device,
+        alpha_steps=alpha_steps,
+        beta_values=beta_values,
+    )
+    support_features = F.normalize(support_features.to(device).float(), dim=-1)
+    support_labels = support_labels.to(device).long()
+    num_classes = selector.text_prototypes.shape[0]
+    base_visual = selector.build_visual_centroids(support_features, support_labels, num_classes)
+    base_fused, base_alpha_init = selector.hopc_alpha(
+        selector.text_prototypes,
+        base_visual,
+        support_features,
+        support_labels,
+        num_classes,
+    )
+
     variants = []
     metadata = {}
+    rng_fork = ForkRNG(device=device)
     for sigma in sigmas:
+        rng_fork.restore()
         selection = custom_posthoc_fuse(
             text_features,
             support_features,
@@ -189,6 +212,9 @@ def evaluate_sigmas(
             alpha_steps=alpha_steps,
             beta_values=beta_values,
             sigma=sigma,
+            visual_centroids=base_visual,
+            fused_prototypes_init=base_fused,
+            alpha_init=base_alpha_init,
         )
         name = f"sigma={sigma}"
         variants.append((name, selection["raw_fused_prototypes"]))
@@ -222,6 +248,10 @@ def parse_args():
         default=",".join(str(value) for value in DEFAULT_SIGMAS),
     )
     parser.add_argument(
+        "--kshots",
+        default=",".join(str(value) for value in DEFAULT_KSHOTS),
+    )
+    parser.add_argument(
         "--seeds",
         default=",".join(str(value) for value in DEFAULT_SEEDS),
     )
@@ -236,79 +266,84 @@ def parse_args():
     return parsed, parse_override_arguments(unknown)
 
 
-def run_dataset(args, table_name, config, console):
+def format_table(rows, columns):
+    if not rows:
+        return " ".join(columns)
+    widths = {
+        column: max(len(column), *(len(str(row.get(column, ""))) for row in rows))
+        for column in columns
+    }
+    lines = [
+        "  ".join(column.ljust(widths[column]) for column in columns),
+        "  ".join("-" * widths[column] for column in columns),
+    ]
+    for row in rows:
+        lines.append("  ".join(str(row.get(column, "")).ljust(widths[column]) for column in columns))
+    return "\n".join(lines)
+
+
+def run_dataset(args, table_name, config):
     sigmas = parse_float_list(args.sigmas, DEFAULT_SIGMAS)
     seeds = parse_int_list(args.seeds)
+    kshots = parse_int_list(args.kshots)
 
-    kshot = int(get_config_value(config, "data.kshot", 16))
     alpha_steps = int(get_config_value(config, "model.alpha_steps", 101))
     beta_values = get_config_value(config, "model.centroid_mix.beta_values", None)
-    device_name = str(get_config_value(config, "training.device", "cuda:0"))
-    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     batch_size = int(get_config_value(config, "training.batch_size", 128))
     eval_batch_size = args.eval_batch_size or max(batch_size, 1024)
-    num_workers = int(get_config_value(config, "data.num_workers", 4))
-    dataset_name = str(get_config_value(config, "data.dataset_name", table_name))
 
-    set_global_seed(1)
-    train_dataset, eval_dataset, val_fraction, dataset_root = load_datasets(config)
-    classnames = list(train_dataset.classes)
-    console.print(
-        f"{table_name}: root={dataset_root}, classes={len(classnames)}, "
-        f"kshot={kshot}, sigma={sigmas}, seeds={seeds}, device={device}"
+    dataset_config = copy.deepcopy(config)
+    data_cfg = dataset_config.setdefault("data", {})
+    data_cfg["kshot"] = int(max(kshots))
+    data_cfg["seed"] = int(seeds[0])
+
+    set_global_seed(int(seeds[0]))
+    pipeline = ProtoFusePipeline(dataset_config)
+    pipeline._prepare_directories()
+    pipeline._load_dataset()
+    pipeline._split_dataset()
+    pipeline._initialize_trainer()
+
+    dataset_root = pipeline.dataset_root
+    classnames = pipeline.classnames
+    device = pipeline.device
+    print(
+        f"\n{table_name}: root={dataset_root}, classes={len(classnames)}, "
+        f"kshots={kshots}, sigma={sigmas}, seeds={seeds}, device={device}",
+        flush=True,
     )
 
-    model = load_model(config, device)
-    train_features_all, train_labels_all = extract_image_features(
-        model,
-        train_dataset,
-        device,
-        batch_size,
-        num_workers,
-    )
-    if eval_dataset is None:
-        eval_features_all, eval_labels_all = train_features_all, train_labels_all
+    train_payload = pipeline._full_dataset_clip_features()
+    train_features_all = train_payload["image_features"]
+    train_labels_all = train_payload["labels"]
+    text_features = train_payload["text_features"]
+
+    if pipeline.val_fraction is None:
+        eval_features_all, eval_labels_all = pipeline._cached_val_features()
     else:
-        eval_features_all, eval_labels_all = extract_image_features(
-            model,
-            eval_dataset,
-            device,
-            batch_size,
-            num_workers,
-        )
-    text_features = build_text_features(model, classnames, dataset_name, device)
-    del model
+        eval_features_all, eval_labels_all = train_features_all, train_labels_all
+
+    if hasattr(pipeline.trainer, "clip_model"):
+        del pipeline.trainer.clip_model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     raw = []
-    progress_columns = [
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-    ]
-    with Progress(*progress_columns, console=console) as progress:
-        task = progress.add_task(f"{table_name}: sigma sweep", total=len(seeds))
+    print(flush=True)
+    for kshot in kshots:
         for seed in seeds:
-            progress.update(
-                task,
-                description=f"{table_name}: {kshot}-shot, seed {seed}",
-            )
             set_global_seed(seed)
-            if val_fraction is None:
-                train_idx = support_positions(train_labels_all, kshot, seed)
+            train_indices, val_indices = split_indices_for(pipeline, kshot, seed)
+            train_idx = torch.tensor(train_indices, dtype=torch.long)
+
+            if pipeline.val_fraction is None:
                 eval_features = eval_features_all
                 eval_labels = eval_labels_all
             else:
-                train_idx, val_idx = split_positions_by_class(
-                    train_labels_all,
-                    kshot,
-                    seed,
-                    val_fraction,
-                )
-                eval_features = train_features_all[val_idx].contiguous()
-                eval_labels = train_labels_all[val_idx].contiguous()
+                val_idx = torch.tensor(val_indices, dtype=torch.long)
+                eval_features = eval_features_all[val_idx].contiguous()
+                eval_labels = eval_labels_all[val_idx].contiguous()
 
             rows = evaluate_sigmas(
                 sigmas,
@@ -322,23 +357,56 @@ def run_dataset(args, table_name, config, console):
                 beta_values,
                 eval_batch_size,
             )
+            for row in rows:
+                sigma_val = float(row["sigma"])
+                acc = float(row["accuracy"])
+                print(
+                    f"{table_name} x ProtoFuse x seed {seed} x {kshot}-shot x sigma={sigma_val} x {acc:.2f}%",
+                    flush=True,
+                )
             raw.extend(
                 {
                     "dataset": table_name,
-                    "kshot": kshot,
+                    "kshot": int(kshot),
                     "seed": int(seed),
                     **row,
                 }
                 for row in rows
             )
-            progress.advance(task)
+
+    dataset_rows = [r for r in raw if r["dataset"] == table_name]
+    summary_by_sigma = []
+    shot_columns = [f"{k}-shot" for k in kshots]
+    for sigma_val in sigmas:
+        val_rows = [r for r in dataset_rows if np.isclose(r["sigma"], sigma_val)]
+        row_dict = {"sigma": str(sigma_val)}
+        shot_means = []
+        for k in kshots:
+            k_accs = [r["accuracy"] for r in val_rows if r["kshot"] == k]
+            k_mean = float(np.mean(k_accs)) if k_accs else 0.0
+            k_std = float(np.std(k_accs)) if k_accs else 0.0
+            row_dict[f"{k}-shot"] = f"{k_mean:.2f} ± {k_std:.2f}"
+            shot_means.append(k_mean)
+        row_dict["Avg."] = f"{np.mean(shot_means):.2f}" if shot_means else "N/A"
+        summary_by_sigma.append(row_dict)
+
+    print(f"\n{table_name} x ProtoFuse (sigma) x seed mean +/- std", flush=True)
+    table_cols = ["sigma", *shot_columns]
+    if len(kshots) > 1:
+        table_cols.append("Avg.")
+    print(format_table(summary_by_sigma, table_cols), flush=True)
+
     return raw, str(dataset_root)
 
 
 def aggregate_results(raw):
     frame = pd.DataFrame(raw)
+    seed_macros = (
+        frame.groupby(["sigma", "dataset", "seed"], as_index=False)["accuracy"]
+        .mean()
+    )
     summary = (
-        frame.groupby(["sigma", "dataset"], as_index=False)["accuracy"]
+        seed_macros.groupby(["sigma", "dataset"], as_index=False)["accuracy"]
         .agg(mean="mean", std="std", runs="count")
         .sort_values(["sigma", "dataset"])
     )
@@ -454,8 +522,8 @@ def save_bar_chart(summary, sigmas, datasets, output_path):
 def main():
     args, overrides = parse_args()
     config = merge_configs(load_config_file(args.config), overrides)
-    console = Console(no_color=args.disable_coloring)
     sigmas = parse_float_list(args.sigmas, DEFAULT_SIGMAS)
+    kshots = parse_int_list(args.kshots)
 
     raw = []
     dataset_roots = {}
@@ -466,20 +534,19 @@ def main():
             args,
             table_name,
             dataset_config,
-            console,
         )
         raw.extend(dataset_raw)
         dataset_roots[table_name] = dataset_root
 
     _, summary = aggregate_results(raw)
     final_table = build_final_table(summary, sigmas, dataset_names)
-    console.print()
-    console.print("ProtoFuse sigma sensitivity: seed mean ± std")
-    console.print(final_table.to_string(index=False))
+    shot_desc = f"macro-avg across {len(kshots)} shots: {','.join(str(k) for k in kshots)}" if len(kshots) > 1 else f"{kshots[0]}-shot"
+    print(f"\nProtoFuse sigma sensitivity: seed mean ± std ({shot_desc})", flush=True)
+    print(final_table.to_string(index=False), flush=True)
 
     figure_path = resolve_path(args.output_figure)
     save_bar_chart(summary, sigmas, dataset_names, figure_path)
-    console.print(f"Saved figure to {figure_path}")
+    print(f"\nSaved figure to {figure_path}", flush=True)
 
     if args.output_json:
         output_path = resolve_path(args.output_json)
@@ -489,7 +556,7 @@ def main():
                 {
                     "experiment": "protofuse_sigma",
                     "datasets": dataset_roots,
-                    "kshot": int(get_config_value(config, "data.kshot", 16)),
+                    "kshots": kshots,
                     "sigmas": sigmas,
                     "seeds": parse_int_list(args.seeds),
                     "raw": raw,
@@ -498,7 +565,7 @@ def main():
                 handle,
                 indent=2,
             )
-        console.print(f"Saved results to {output_path}")
+        print(f"Saved results to {output_path}", flush=True)
 
 
 if __name__ == "__main__":
