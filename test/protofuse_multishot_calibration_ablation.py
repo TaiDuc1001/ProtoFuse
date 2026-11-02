@@ -180,12 +180,14 @@ def evaluate_run(
     alpha_init = select_from_curve(selector.alphas, loo_curve)
 
     import math
-    beta_val = min(0.45, 0.30 / math.sqrt(kshot))
+    gamma_max = 0.45
+    lambda_gamma = 0.30
+    gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
     proto_before = F.normalize((1.0 - alpha_init) * text + alpha_init * visual, dim=-1)
     expanded_visual, query_centroids = selector.surrogatemix_expansion(
         visual,
         proto_before,
-        beta_val,
+        gamma_k,
         text,
         alpha_init,
         rho,

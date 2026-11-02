@@ -46,17 +46,18 @@ def tangent_direction(target, base, eps=1e-8):
     return F.normalize(d, dim=-1, eps=eps)
 
 
-def generate_cgse(V, proto_before, beta, device, top_k=5, samples_per_nb=2, std=0.02):
+def generate_cgse(V, proto_before, beta, device, l0=5, samples_per_nb=2, sigma=0.02):
     num_classes, D = V.shape
+    l0 = min(l0, num_classes - 1)
     sim = proto_before @ proto_before.T
     sim.fill_diagonal_(-float('inf'))
     Q = []
     for c in range(num_classes):
-        nbs = torch.topk(sim[c], k=top_k).indices
+        nbs = torch.topk(sim[c], k=l0).indices
         class_q = []
         for m in nbs:
             q_base = F.normalize((1.0 - beta) * proto_before[c] + beta * proto_before[m], dim=-1)
-            noise = torch.randn(samples_per_nb, D, device=device) * std
+            noise = torch.randn(samples_per_nb, D, device=device) * sigma
             q_candidates = F.normalize(q_base.unsqueeze(0) + noise, dim=-1)
             logits = q_candidates @ proto_before.T
             preds = logits.argmax(dim=-1)
@@ -166,9 +167,12 @@ def run_forensic_run(pipeline, train_features, train_labels, eval_features, eval
     
     acc_before_all = float(pred_before.eq(eval_labels.cpu()).float().mean().item() * 100.0)
 
-    beta_val = min(0.45, 0.30 / math.sqrt(kshot))
-    rho_val = min(1.0, 0.50 / math.sqrt(kshot))
-    Q_cgse = generate_cgse(V, proto_before, beta_val, device)
+    gamma_max = 0.45
+    lambda_gamma = 0.30
+    lambda_rho = 0.50
+    gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
+    rho_val = min(1.0, lambda_rho / math.sqrt(kshot))
+    Q_cgse = generate_cgse(V, proto_before, gamma_k, device)
     
     # 1. B1: fixed SQS-Adversarial
     query_centroids_syn = pipeline.trainer.pseudo_label_aggregation(Q_cgse.view(-1, Q_cgse.shape[-1]), T, V, alpha_init).to(device)

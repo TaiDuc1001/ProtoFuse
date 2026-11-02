@@ -160,17 +160,20 @@ class ProtoFuse(BaseTrainer):
         kshot = int(class_counts.min().item())
         if kshot < 1:
             kshot = 1
-        beta_val = min(0.45, 0.30 / math.sqrt(kshot))
-        rho = min(1.0, 0.50 / math.sqrt(kshot))
-        selector.rho = rho
+        gamma_max = 0.45
+        lambda_gamma = 0.30
+        lambda_rho = 0.50
+        gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
+        rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
+        selector.rho = rho_k
         
         expanded_centroids, query_centroids = selector.surrogatemix_expansion(
             visual_centroids,
             fused_prototypes,
-            beta_val,
+            gamma_k,
             selector.text_prototypes,
             alpha_init,
-            rho,
+            rho_k,
         )
         if is_one_shot:
             alpha = alpha_init
@@ -260,23 +263,23 @@ class ProtoFuse(BaseTrainer):
         V,
         anchor_features,
         beta,
-        top_k=1,
+        l0=1,
         samples_per_nb=1,
-        std=0.0,
+        sigma=0.0,
         filter_correct=False,
     ):
         num_classes, D = V.shape
-        top_k = min(top_k, num_classes - 1)
+        l0 = min(l0, num_classes - 1)
         sim = anchor_features @ anchor_features.T
         sim.fill_diagonal_(-float('inf'))
         Q = []
         for c in range(num_classes):
-            nbs = torch.topk(sim[c], k=top_k).indices
+            nbs = torch.topk(sim[c], k=l0).indices
             class_q = []
             for m in nbs:
                 q_base = F.normalize((1.0 - beta) * anchor_features[c] + beta * anchor_features[m], dim=-1)
-                if std > 0.0:
-                    noise = torch.randn(samples_per_nb, D, device=self.device) * std
+                if sigma > 0.0:
+                    noise = torch.randn(samples_per_nb, D, device=self.device) * sigma
                     q_candidates = F.normalize(q_base.unsqueeze(0) + noise, dim=-1)
                 else:
                     q_candidates = q_base.unsqueeze(0).expand(samples_per_nb, -1)
@@ -356,9 +359,9 @@ class ProtoFuse(BaseTrainer):
                 V,
                 V,
                 beta,
-                top_k=1,
+                l0=1,
                 samples_per_nb=1,
-                std=0.0,
+                sigma=0.0,
                 filter_correct=False,
             )
             pseudo_features = Q.squeeze(1)
@@ -379,14 +382,14 @@ class ProtoFuse(BaseTrainer):
                 best = {'score': score, 'alpha': alpha}
         return best['alpha']
 
-    def surrogatemix_expansion(self, V, proto_before, beta_val, T, alpha_init, rho_val):
+    def surrogatemix_expansion(self, V, proto_before, gamma_k, T, alpha_init, rho_k):
         Q = self.generate_surrogate_mix(
             V,
             proto_before,
-            beta_val,
-            top_k=5,
+            gamma_k,
+            l0=5,
             samples_per_nb=2,
-            std=0.02,
+            sigma=0.02,
             filter_correct=True,
         )
         query_centroids = self.pseudo_label_aggregation(
@@ -395,7 +398,7 @@ class ProtoFuse(BaseTrainer):
             V,
             alpha_init,
         )
-        expanded_visual = F.normalize((1.0 - rho_val) * V + rho_val * query_centroids, dim=-1)
+        expanded_visual = F.normalize((1.0 - rho_k) * V + rho_k * query_centroids, dim=-1)
         return expanded_visual, query_centroids
 
     def _centroid_mix_beta_values(self):
@@ -437,9 +440,9 @@ class ProtoFuse(BaseTrainer):
                     V_all,
                     V_all,
                     beta,
-                    top_k=1,
+                    l0=1,
                     samples_per_nb=1,
-                    std=0.0,
+                    sigma=0.0,
                     filter_correct=False,
                 )
                 pseudo_features = Q.squeeze(1)
@@ -585,17 +588,20 @@ class ProtoFuse(BaseTrainer):
         kshot = int(class_counts.min().item())
         if kshot < 1:
             kshot = 1
-        beta_val = min(0.45, 0.30 / math.sqrt(kshot))
-        rho = min(1.0, 0.50 / math.sqrt(kshot))
-        self.rho = rho
+        gamma_max = 0.45
+        lambda_gamma = 0.30
+        lambda_rho = 0.50
+        gamma_k = min(gamma_max, lambda_gamma / math.sqrt(kshot))
+        rho_k = min(1.0, lambda_rho / math.sqrt(kshot))
+        self.rho = rho_k
         
         selected_V, query_centroids = self.surrogatemix_expansion(
             V,
             proto_before,
-            beta_val,
+            gamma_k,
             T,
             alpha_init,
-            rho,
+            rho_k,
         )
         expanded_V = selected_V
         if is_one_shot:

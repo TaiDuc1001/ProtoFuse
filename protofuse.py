@@ -124,9 +124,9 @@ def _support_calibration_curve(trainer, T, V, train_features, train_labels, num_
                 V,
                 V,
                 beta,
-                top_k=1,
+                l0=1,
                 samples_per_nb=1,
-                std=0.0,
+                sigma=0.0,
                 filter_correct=False,
             )
             pseudo_features = Q.squeeze(1)
