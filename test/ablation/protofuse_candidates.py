@@ -22,15 +22,15 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from clip import clip
 from src.models.apt import CUSTOM_TEMPLATES
 from src.models.protofuse import ProtoFuse
 from utils import get_config_value, iter_dataset_configs, load_clip_to_cpu, load_config_file, merge_configs, parse_override_arguments, set_global_seed, fast_image_folder
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "protofuse.yaml"
 DEFAULT_ALPHA_STEPS = [11, 51, 101, 151, 201]
 DEFAULT_KSHOTS = [1, 2, 4, 8, 16]
