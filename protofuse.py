@@ -525,6 +525,13 @@ def format_table(rows, columns):
 
 
 def print_dataset_summary(dataset_name, results, kshots, seeds):
+    print()
+    for kshot in kshots:
+        for seed in seeds:
+            row = results.get((int(kshot), int(seed)), {})
+            acc = float(row.get("accuracy", 0.0))
+            print(f"{dataset_name} x ProtoFuse x seed {seed} x {int(kshot)}-shot x {acc:.2f}%")
+
     rows = build_summary_rows(results, kshots, seeds)
     print(f"\n{dataset_name} x ProtoFuse x seed mean +/- std")
     print(format_table(rows, ["kshot", "runs", "acc", "alpha"]), flush=True)

@@ -189,6 +189,13 @@ def _format_table(rows, columns):
 
 
 def print_summary(dataset_name, method_name, results, kshots, seeds):
+    print()
+    for kshot in kshots:
+        for seed in seeds:
+            member = results.get((int(kshot), int(seed)), {})
+            acc = float(member.get("accuracy", 0.0))
+            print(f"{dataset_name} x {method_name} x seed {seed} x {int(kshot)}-shot x {acc:.2f}%")
+
     rows = []
     include_protofuse_columns = True
     for kshot in kshots:
@@ -226,8 +233,8 @@ def print_summary(dataset_name, method_name, results, kshots, seeds):
 
     print(f"\n{dataset_name} x {method_name} x seed mean +/- std")
     columns = ["kshot", "runs", "acc"]
-    # if include_protofuse_columns:
-    #     columns.extend(["before ProtoFuse", "gain"])
+    if include_protofuse_columns and any("before ProtoFuse" in r for r in rows):
+        columns.extend(["before ProtoFuse", "gain"])
     print(_format_table(rows, columns), flush=True)
 
 
