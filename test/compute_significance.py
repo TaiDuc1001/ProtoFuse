@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import os
+import re
 import sys
 from pathlib import Path
 import numpy as np
@@ -17,80 +20,85 @@ from utils import (
 from protofuse_ablation_tables import table_dataset_configs
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "protofuse.yaml"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+DEFAULT_RESULTS_FILE = ASSETS_DIR / "standalone_baselines_results.txt"
 
-# OCR data from Table 2 and Table 3
-# Structure: DATA[dataset][method] = (means_list, stds_list)
-# Shots: 1, 2, 4, 8, 16
-DATA = {
-    "CUB-200-2011": {
-        "Tip-Adapter": ([59.00, 61.31, 65.73, 72.30, 74.93], [0.47, 0.41, 0.24, 0.30, 3.14]),
-        "Tip-Adapter (+ProtoFuse)": ([56.45, 61.87, 65.19, 71.11, 73.61], [1.41, 0.86, 1.22, 0.92, 2.14]),
-        "Proto-Adapter": ([57.63, 58.54, 59.15, 59.57, 60.16], [0.44, 0.32, 0.16, 0.18, 0.12]),
-        "Proto-Adapter (+ProtoFuse)": ([58.00, 62.14, 68.12, 73.08, 76.23], [0.86, 0.83, 0.63, 0.74, 0.45]),
-        "APE": ([54.87, 52.36, 61.00, 65.81, 71.58], [2.87, 5.17, 3.55, 0.86, 0.77]),
-        "APE (+ProtoFuse)": ([52.71, 55.59, 60.30, 67.58, 72.89], [5.29, 3.99, 2.42, 0.71, 0.50]),
-        "TIMO": ([39.43, 48.84, 60.85, 71.50, 78.35], [1.01, 1.24, 0.47, 1.30, 0.29]),
-        "TIMO (+ProtoFuse)": ([41.00, 48.91, 60.41, 71.30, 78.30], [0.79, 1.13, 0.36, 1.17, 0.34]),
-        "ProtoFuse": ([58.47, 60.77, 67.74, 72.66, 75.72], [0.94, 1.57, 0.63, 0.66, 0.41]),
-    },
-    "FGVC-Aircraft": {
-        "Tip-Adapter": ([26.81, 29.18, 32.85, 38.09, 43.18], [0.27, 0.46, 0.65, 1.00, 0.56]),
-        "Tip-Adapter (+ProtoFuse)": ([26.37, 29.36, 32.57, 36.57, 41.11], [0.39, 1.00, 1.45, 0.99, 0.75]),
-        "Proto-Adapter": ([26.70, 27.82, 28.45, 29.00, 29.45], [0.35, 0.30, 0.52, 0.40, 0.17]),
-        "Proto-Adapter (+ProtoFuse)": ([26.52, 28.72, 33.60, 37.15, 41.00], [0.42, 0.72, 0.79, 0.83, 0.87]),
-        "APE": ([22.11, 27.17, 31.72, 35.45, 39.34], [2.40, 2.03, 1.37, 1.17, 0.81]),
-        "APE (+ProtoFuse)": ([24.37, 26.92, 30.61, 35.85, 39.93], [1.64, 2.51, 0.52, 0.52, 0.98]),
-        "TIMO": ([20.53, 26.40, 33.03, 41.57, 49.30], [0.94, 0.86, 0.78, 0.74, 0.71]),
-        "TIMO (+ProtoFuse)": ([22.20, 26.75, 33.16, 41.59, 49.23], [0.81, 0.71, 0.62, 0.70, 0.73]),
-        "ProtoFuse": ([26.85, 27.90, 33.25, 37.04, 40.43], [0.51, 1.91, 0.83, 0.91, 0.76]),
-    },
-    "Stanford Cars": {
-        "Tip-Adapter": ([64.60, 66.05, 68.78, 73.68, 76.46], [0.43, 0.38, 0.37, 0.49, 2.80]),
-        "Tip-Adapter (+ProtoFuse)": ([62.69, 66.87, 70.41, 73.57, 77.86], [1.31, 0.49, 0.65, 1.41, 0.56]),
-        "Proto-Adapter": ([64.87, 65.64, 66.02, 66.56, 67.33], [0.34, 0.17, 0.19, 0.23, 0.05]),
-        "Proto-Adapter (+ProtoFuse)": ([63.01, 67.48, 70.93, 74.62, 77.78], [1.38, 0.17, 0.39, 0.71, 0.35]),
-        "APE": ([55.49, 62.76, 64.21, 67.30, 72.90], [5.35, 6.07, 4.64, 2.98, 0.83]),
-        "APE (+ProtoFuse)": ([58.06, 64.83, 64.63, 69.73, 74.27], [7.18, 2.31, 3.40, 1.65, 0.76]),
-        "TIMO": ([43.19, 50.69, 62.36, 72.53, 79.29], [0.69, 0.82, 0.56, 0.56, 0.63]),
-        "TIMO (+ProtoFuse)": ([46.27, 51.46, 62.59, 72.49, 79.19], [0.71, 0.81, 0.45, 0.51, 0.60]),
-        "ProtoFuse": ([63.86, 66.69, 70.26, 74.15, 77.12], [1.11, 0.70, 0.51, 0.57, 0.26]),
-    },
-    "Flowers102": {
-        "Tip-Adapter": ([78.99, 87.66, 91.50, 94.39, 96.60], [0.52, 1.06, 0.66, 0.44, 0.15]),
-        "Tip-Adapter (+ProtoFuse)": ([83.37, 85.68, 87.53, 91.72, 94.02], [0.65, 0.95, 0.95, 0.28, 0.58]),
-        "Proto-Adapter": ([73.48, 73.87, 74.25, 74.58, 75.21], [0.37, 0.28, 0.10, 0.30, 0.07]),
-        "Proto-Adapter (+ProtoFuse)": ([81.56, 88.81, 93.15, 94.67, 95.78], [0.25, 0.76, 0.70, 0.58, 0.31]),
-        "APE": ([71.35, 83.98, 88.37, 92.26, 93.93], [6.26, 4.13, 3.39, 0.97, 0.88]),
-        "APE (+ProtoFuse)": ([79.54, 85.38, 89.22, 93.55, 95.01], [1.99, 4.62, 5.79, 0.30, 0.20]),
-        "TIMO": ([76.49, 86.13, 92.36, 95.87, 97.13], [0.90, 1.00, 0.64, 0.55, 0.33]),
-        "TIMO (+ProtoFuse)": ([76.91, 84.80, 91.76, 95.68, 97.12], [0.73, 1.16, 0.71, 0.39, 0.35]),
-        "ProtoFuse": ([80.15, 88.38, 93.04, 94.52, 95.64], [0.21, 1.32, 0.62, 0.58, 0.33]),
-    },
-    "Food-101": {
-        "Tip-Adapter": ([85.65, 85.79, 86.09, 86.36, 86.84], [0.04, 0.06, 0.16, 0.18, 0.14]),
-        "Tip-Adapter (+ProtoFuse)": ([84.03, 85.87, 85.93, 86.04, 86.42], [1.02, 0.01, 0.22, 0.35, 0.28]),
-        "Proto-Adapter": ([85.22, 85.90, 86.09, 86.19, 86.29], [0.12, 0.06, 0.03, 0.03, 0.06]),
-        "Proto-Adapter (+ProtoFuse)": ([83.10, 85.88, 86.04, 86.27, 86.61], [1.31, 0.08, 0.14, 0.20, 0.22]),
-        "APE": ([75.32, 75.71, 73.26, 79.83, 81.98], [7.08, 6.28, 2.60, 2.28, 0.93]),
-        "APE (+ProtoFuse)": ([80.96, 77.92, 74.94, 79.47, 82.08], [1.96, 2.21, 1.85, 1.55, 0.65]),
-        "TIMO": ([67.49, 69.22, 74.07, 79.25, 82.61], [2.58, 0.74, 0.69, 0.39, 0.32]),
-        "TIMO (+ProtoFuse)": ([69.81, 69.41, 74.08, 79.27, 82.59], [1.99, 0.68, 0.66, 0.33, 0.30]),
-        "ProtoFuse": ([84.28, 85.85, 86.04, 86.30, 86.54], [0.96, 0.08, 0.27, 0.32, 0.17]),
-    },
-    "OxfordPets": {
-        "Tip-Adapter": ([89.41, 89.86, 90.15, 90.09, 92.05], [0.34, 0.49, 0.81, 1.42, 0.45]),
-        "Tip-Adapter (+ProtoFuse)": ([89.62, 89.72, 87.66, 88.87, 90.85], [0.44, 0.59, 1.52, 1.24, 1.06]),
-        "Proto-Adapter": ([89.46, 89.86, 89.99, 90.05, 90.08], [0.29, 0.33, 0.18, 0.12, 0.11]),
-        "Proto-Adapter (+ProtoFuse)": ([89.56, 90.23, 89.99, 91.64, 92.14], [0.43, 0.50, 0.96, 0.41, 0.30]),
-        "APE": ([83.04, 83.82, 80.28, 83.79, 87.58], [8.40, 4.58, 7.54, 4.85, 2.38]),
-        "APE (+ProtoFuse)": ([90.17, 85.95, 84.18, 85.56, 86.70], [1.29, 3.37, 3.45, 3.13, 2.24]),
-        "TIMO": ([69.36, 73.15, 79.77, 86.69, 89.33], [1.59, 1.78, 1.38, 0.59, 0.26]),
-        "TIMO (+ProtoFuse)": ([70.21, 72.82, 78.72, 86.36, 89.18], [1.24, 1.78, 0.77, 0.45, 0.29]),
-        "ProtoFuse": ([89.78, 90.10, 90.19, 91.44, 92.04], [0.53, 0.45, 0.79, 0.44, 0.32]),
-    }
+DATA = {}
+RAW_SEED_DATA = {}
+
+DATASET_MAPPINGS = {
+    "FGVCAircraft": "FGVC-Aircraft",
+    "StanfordCars": "Stanford Cars",
+    "CUB-200-2011": "CUB-200-2011",
+    "Flowers102": "Flowers102",
+    "Food-101": "Food-101",
+    "OxfordPets": "OxfordPets",
+}
+
+METHOD_MAPPINGS = {
+    "TipAdapter": "Tip-Adapter",
+    "ProtoAdapter": "Proto-Adapter",
+    "APE": "APE",
+    "TIMO": "TIMO",
+    "ProtoFuse": "ProtoFuse",
+    "TipAdapter+ProtoFuse": "Tip-Adapter (+ProtoFuse)",
+    "ProtoAdapter+ProtoFuse": "Proto-Adapter (+ProtoFuse)",
+    "APE+ProtoFuse": "APE (+ProtoFuse)",
+    "TIMO+ProtoFuse": "TIMO (+ProtoFuse)",
 }
 
 SHOTS = [1, 2, 4, 8, 16]
+
+def load_results_file(file_path):
+    path = Path(file_path)
+    if not path.is_file():
+        return 0
+        
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    pattern = re.compile(
+        r"([A-Za-z0-9\-]+)\s*x\s*([A-Za-z0-9\+\-]+)\s*x\s*seed\s*(\d+)\s*x\s*(\d+)-shot\s*x\s*([\d\.]+)%"
+    )
+    matches = pattern.findall(text)
+    if not matches:
+        return 0
+        
+    for raw_d, raw_m, s_str, k_str, acc_str in matches:
+        dataset_name = DATASET_MAPPINGS.get(raw_d, raw_d)
+        method_name = METHOD_MAPPINGS.get(raw_m, raw_m)
+        shot = int(k_str)
+        seed = int(s_str)
+        acc = float(acc_str)
+        
+        RAW_SEED_DATA.setdefault(dataset_name, {}).setdefault(method_name, {}).setdefault(shot, {})[seed] = acc
+
+    for d, d_methods in RAW_SEED_DATA.items():
+        if d not in DATA:
+            DATA[d] = {}
+        for m, m_shots in d_methods.items():
+            means = []
+            stds = []
+            for shot in SHOTS:
+                if shot in m_shots:
+                    seed_vals = list(m_shots[shot].values())
+                    means.append(round(float(np.mean(seed_vals)), 2))
+                    stds.append(round(float(np.std(seed_vals, ddof=0)), 2))
+                else:
+                    means.append(0.0)
+                    stds.append(0.0)
+            DATA[d][m] = (means, stds)
+            
+    return len(matches)
+
+def load_all_assets(assets_dir=ASSETS_DIR):
+    total = 0
+    if assets_dir.is_dir():
+        for file in sorted(assets_dir.glob("*.txt")):
+            count = load_results_file(file)
+            total += count
+    return total
+
+# Automatically parse and load all existing result files in assets directory
+load_all_assets(ASSETS_DIR)
 
 def holm_bonferroni_correction(p_values):
     m = len(p_values)
@@ -132,16 +140,33 @@ def compute_global_ocr_significance(active_datasets, baselines=None, alternative
         base_all_samples = []
         
         for dataset_name in active_datasets:
-            if dataset_name not in DATA:
+            if dataset_name not in DATA or "ProtoFuse" not in DATA[dataset_name] or base not in DATA[dataset_name]:
                 continue
             dataset_data = DATA[dataset_name]
-            pf_means, pf_stds = dataset_data["ProtoFuse"]
-            pf_samples = generate_simulated_samples(pf_means, pf_stds)
-            pf_all_samples.extend(pf_samples)
             
-            base_means, base_stds = dataset_data[base]
-            base_samples = generate_simulated_samples(base_means, base_stds)
-            base_all_samples.extend(base_samples)
+            raw_pf_shots = RAW_SEED_DATA.get(dataset_name, {}).get("ProtoFuse", {})
+            raw_base_shots = RAW_SEED_DATA.get(dataset_name, {}).get(base, {})
+            
+            has_raw = (
+                all(shot in raw_pf_shots and len(raw_pf_shots[shot]) == 5 for shot in SHOTS)
+                and all(shot in raw_base_shots and len(raw_base_shots[shot]) == 5 for shot in SHOTS)
+            )
+            
+            if has_raw:
+                # Direct paired comparison by identical seed ids
+                for shot in SHOTS:
+                    common_seeds = sorted(set(raw_pf_shots[shot].keys()) & set(raw_base_shots[shot].keys()))
+                    for s in common_seeds:
+                        pf_all_samples.append(raw_pf_shots[shot][s])
+                        base_all_samples.append(raw_base_shots[shot][s])
+            else:
+                pf_means, pf_stds = dataset_data["ProtoFuse"]
+                pf_samples = generate_simulated_samples(pf_means, pf_stds)
+                pf_all_samples.extend(pf_samples)
+                
+                base_means, base_stds = dataset_data[base]
+                base_samples = generate_simulated_samples(base_means, base_stds)
+                base_all_samples.extend(base_samples)
             
         if not pf_all_samples or not base_all_samples:
             continue
@@ -191,12 +216,21 @@ def compute_global_ocr_plugin_significance(active_datasets, base_adapters=None, 
         target_all_samples = []
         
         for dataset_name in active_datasets:
-            if dataset_name not in DATA or target not in DATA[dataset_name]:
+            if dataset_name not in DATA or target not in DATA[dataset_name] or base not in DATA[dataset_name]:
                 continue
             dataset_data = DATA[dataset_name]
-            base_means, base_stds = dataset_data[base]
-            base_samples = generate_simulated_samples(base_means, base_stds)
-            base_all_samples.extend(base_samples)
+            
+            raw_base_shots = RAW_SEED_DATA.get(dataset_name, {}).get(base, {})
+            has_raw = all(shot in raw_base_shots and len(raw_base_shots[shot]) == 5 for shot in SHOTS)
+            
+            if has_raw:
+                for shot in SHOTS:
+                    vals = [raw_base_shots[shot][s] for s in sorted(raw_base_shots[shot].keys())]
+                    base_all_samples.extend(sorted(vals))
+            else:
+                base_means, base_stds = dataset_data[base]
+                base_samples = generate_simulated_samples(base_means, base_stds)
+                base_all_samples.extend(base_samples)
             
             target_means, target_stds = dataset_data[target]
             target_samples = generate_simulated_samples(target_means, target_stds)
@@ -295,6 +329,9 @@ def print_plugin_accuracy_table(dataset_name):
             gain = tm - bm
             row[f"{shot}-shot"] = f"{tm:.2f} ± {ts:.2f} ({gain:+.2f})"
         rows.append(row)
+        
+    if not rows:
+        return
         
     df = pd.DataFrame(rows)
     print(f"\nPlug-in Accuracies and Gains (mean ± std (gain)) on {dataset_name}:")
@@ -420,8 +457,9 @@ def format_latex_plugin_global(sig_df, num_datasets):
     return "\n".join(lines)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ProtoFuse Paired Significance Testing Script from OCR'd Data")
+    parser = argparse.ArgumentParser(description="ProtoFuse Paired Significance Testing Script")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to config file.")
+    parser.add_argument("--results-file", default=None, help="Path to results txt file with per-seed accuracies.")
     parser.add_argument("--latex", "-l", action="store_true", help="Print LaTeX table code.")
     parser.add_argument("--verify-mock", action="store_true", help="Ignored (kept for backwards compatibility).")
     parser.add_argument("--disable-coloring", action="store_true", help="Ignored.")
@@ -431,6 +469,16 @@ def parse_args():
 def main():
     args, overrides = parse_args()
     config = merge_configs(load_config_file(args.config), overrides)
+    
+    results_path = getattr(args, "results_file", None)
+    if results_path:
+        count = load_results_file(results_path)
+        if count > 0:
+            print(f"Loaded {count} raw seed results from: {results_path}")
+    else:
+        count = sum(sum(len(seeds) for seeds in shots.values()) for d in RAW_SEED_DATA.values() for shots in d.values())
+        if count > 0:
+            print(f"Loaded {count} raw seed results from: {DEFAULT_RESULTS_FILE.name}")
     
     # Dynamically scan which datasets are currently present on the system
     try:
@@ -454,15 +502,18 @@ def main():
         if not detected_datasets:
             detected_datasets = list(DATA.keys())
             
-    # Keep only the datasets that are both detected on disk AND have hardcoded OCR values
+    # Keep only the datasets that are both detected on disk AND have values
     active_datasets = [d for d in detected_datasets if d in DATA]
     
     if not active_datasets:
-        print("No active/detected datasets found on the system matching the paper tables.")
+        print("No active/detected datasets found on the system matching the tables.")
         return
         
     print(f"Detected active datasets for analysis: {', '.join(active_datasets)}")
-    print("Computing paired significance tests directly from OCR'd accuracy tables...")
+    if count > 0:
+        print("Computing paired significance tests using raw baseline seed data...")
+    else:
+        print("Computing paired significance tests directly from accuracy tables...")
     
     for dataset in active_datasets:
         print("\n" + "=" * 60)

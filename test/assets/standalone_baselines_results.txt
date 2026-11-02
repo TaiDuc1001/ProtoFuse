@@ -1,0 +1,1055 @@
+FGVCAircraft x TipAdapter x seed 1 x 1-shot x 27.00%
+FGVCAircraft x TipAdapter x seed 10 x 1-shot x 26.49%
+FGVCAircraft x TipAdapter x seed 100 x 1-shot x 26.94%
+FGVCAircraft x TipAdapter x seed 1000 x 1-shot x 27.06%
+FGVCAircraft x TipAdapter x seed 10000 x 1-shot x 26.55%
+FGVCAircraft x TipAdapter x seed 1 x 2-shot x 29.49%
+FGVCAircraft x TipAdapter x seed 10 x 2-shot x 29.31%
+FGVCAircraft x TipAdapter x seed 100 x 2-shot x 29.34%
+FGVCAircraft x TipAdapter x seed 1000 x 2-shot x 28.98%
+FGVCAircraft x TipAdapter x seed 10000 x 2-shot x 28.65%
+FGVCAircraft x TipAdapter x seed 1 x 4-shot x 32.34%
+FGVCAircraft x TipAdapter x seed 10 x 4-shot x 32.91%
+FGVCAircraft x TipAdapter x seed 100 x 4-shot x 32.25%
+FGVCAircraft x TipAdapter x seed 1000 x 4-shot x 32.40%
+FGVCAircraft x TipAdapter x seed 10000 x 4-shot x 33.30%
+FGVCAircraft x TipAdapter x seed 1 x 8-shot x 39.18%
+FGVCAircraft x TipAdapter x seed 10 x 8-shot x 37.98%
+FGVCAircraft x TipAdapter x seed 100 x 8-shot x 37.50%
+FGVCAircraft x TipAdapter x seed 1000 x 8-shot x 39.51%
+FGVCAircraft x TipAdapter x seed 10000 x 8-shot x 38.97%
+FGVCAircraft x TipAdapter x seed 1 x 16-shot x 44.13%
+FGVCAircraft x TipAdapter x seed 10 x 16-shot x 42.48%
+FGVCAircraft x TipAdapter x seed 100 x 16-shot x 41.55%
+FGVCAircraft x TipAdapter x seed 1000 x 16-shot x 43.71%
+FGVCAircraft x TipAdapter x seed 10000 x 16-shot x 43.86%
+
+FGVCAircraft x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     26.81% +/- 0.24%
+2-shot   5     29.16% +/- 0.30%
+4-shot   5     32.64% +/- 0.40%
+8-shot   5     38.63% +/- 0.76%
+16-shot  5     43.15% +/- 0.98%
+
+StanfordCars x TipAdapter x seed 1 x 1-shot x 63.87%
+StanfordCars x TipAdapter x seed 10 x 1-shot x 64.78%
+StanfordCars x TipAdapter x seed 100 x 1-shot x 64.73%
+StanfordCars x TipAdapter x seed 1000 x 1-shot x 64.53%
+StanfordCars x TipAdapter x seed 10000 x 1-shot x 64.98%
+StanfordCars x TipAdapter x seed 1 x 2-shot x 65.34%
+StanfordCars x TipAdapter x seed 10 x 2-shot x 65.91%
+StanfordCars x TipAdapter x seed 100 x 2-shot x 66.50%
+StanfordCars x TipAdapter x seed 1000 x 2-shot x 65.70%
+StanfordCars x TipAdapter x seed 10000 x 2-shot x 65.20%
+StanfordCars x TipAdapter x seed 1 x 4-shot x 68.32%
+StanfordCars x TipAdapter x seed 10 x 4-shot x 69.07%
+StanfordCars x TipAdapter x seed 100 x 4-shot x 68.46%
+StanfordCars x TipAdapter x seed 1000 x 4-shot x 68.52%
+StanfordCars x TipAdapter x seed 10000 x 4-shot x 68.75%
+StanfordCars x TipAdapter x seed 1 x 8-shot x 73.44%
+StanfordCars x TipAdapter x seed 10 x 8-shot x 73.68%
+StanfordCars x TipAdapter x seed 100 x 8-shot x 73.93%
+StanfordCars x TipAdapter x seed 1000 x 8-shot x 72.95%
+StanfordCars x TipAdapter x seed 10000 x 8-shot x 73.13%
+StanfordCars x TipAdapter x seed 1 x 16-shot x 78.12%
+StanfordCars x TipAdapter x seed 10 x 16-shot x 77.94%
+StanfordCars x TipAdapter x seed 100 x 16-shot x 78.24%
+StanfordCars x TipAdapter x seed 1000 x 16-shot x 78.31%
+StanfordCars x TipAdapter x seed 10000 x 16-shot x 78.12%
+
+StanfordCars x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     64.58% +/- 0.38%
+2-shot   5     65.73% +/- 0.46%
+4-shot   5     68.63% +/- 0.26%
+8-shot   5     73.43% +/- 0.36%
+16-shot  5     78.15% +/- 0.13%
+
+CUB-200-2011 x TipAdapter x seed 1 x 1-shot x 59.30%
+CUB-200-2011 x TipAdapter x seed 10 x 1-shot x 58.84%
+CUB-200-2011 x TipAdapter x seed 100 x 1-shot x 59.25%
+CUB-200-2011 x TipAdapter x seed 1000 x 1-shot x 59.77%
+CUB-200-2011 x TipAdapter x seed 10000 x 1-shot x 58.37%
+CUB-200-2011 x TipAdapter x seed 1 x 2-shot x 60.63%
+CUB-200-2011 x TipAdapter x seed 10 x 2-shot x 62.00%
+CUB-200-2011 x TipAdapter x seed 100 x 2-shot x 60.87%
+CUB-200-2011 x TipAdapter x seed 1000 x 2-shot x 61.94%
+CUB-200-2011 x TipAdapter x seed 10000 x 2-shot x 61.65%
+CUB-200-2011 x TipAdapter x seed 1 x 4-shot x 65.45%
+CUB-200-2011 x TipAdapter x seed 10 x 4-shot x 66.47%
+CUB-200-2011 x TipAdapter x seed 100 x 4-shot x 65.26%
+CUB-200-2011 x TipAdapter x seed 1000 x 4-shot x 65.91%
+CUB-200-2011 x TipAdapter x seed 10000 x 4-shot x 65.79%
+CUB-200-2011 x TipAdapter x seed 1 x 8-shot x 72.26%
+CUB-200-2011 x TipAdapter x seed 10 x 8-shot x 72.78%
+CUB-200-2011 x TipAdapter x seed 100 x 8-shot x 71.75%
+CUB-200-2011 x TipAdapter x seed 1000 x 8-shot x 72.02%
+CUB-200-2011 x TipAdapter x seed 10000 x 8-shot x 73.28%
+CUB-200-2011 x TipAdapter x seed 1 x 16-shot x 76.84%
+CUB-200-2011 x TipAdapter x seed 10 x 16-shot x 76.96%
+CUB-200-2011 x TipAdapter x seed 100 x 16-shot x 77.39%
+CUB-200-2011 x TipAdapter x seed 1000 x 16-shot x 70.61%
+CUB-200-2011 x TipAdapter x seed 10000 x 16-shot x 73.37%
+
+CUB-200-2011 x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     59.11% +/- 0.47%
+2-shot   5     61.42% +/- 0.56%
+4-shot   5     65.77% +/- 0.42%
+8-shot   5     72.42% +/- 0.55%
+16-shot  5     75.03% +/- 2.64%
+
+Flowers102 x TipAdapter x seed 1 x 1-shot x 79.62%
+Flowers102 x TipAdapter x seed 10 x 1-shot x 79.29%
+Flowers102 x TipAdapter x seed 100 x 1-shot x 78.93%
+Flowers102 x TipAdapter x seed 1000 x 1-shot x 78.85%
+Flowers102 x TipAdapter x seed 10000 x 1-shot x 78.24%
+Flowers102 x TipAdapter x seed 1 x 2-shot x 88.06%
+Flowers102 x TipAdapter x seed 10 x 2-shot x 87.90%
+Flowers102 x TipAdapter x seed 100 x 2-shot x 88.43%
+Flowers102 x TipAdapter x seed 1000 x 2-shot x 87.82%
+Flowers102 x TipAdapter x seed 10000 x 2-shot x 86.60%
+Flowers102 x TipAdapter x seed 1 x 4-shot x 91.51%
+Flowers102 x TipAdapter x seed 10 x 4-shot x 91.03%
+Flowers102 x TipAdapter x seed 100 x 4-shot x 91.68%
+Flowers102 x TipAdapter x seed 1000 x 4-shot x 91.07%
+Flowers102 x TipAdapter x seed 10000 x 4-shot x 93.02%
+Flowers102 x TipAdapter x seed 1 x 8-shot x 94.68%
+Flowers102 x TipAdapter x seed 10 x 8-shot x 94.64%
+Flowers102 x TipAdapter x seed 100 x 8-shot x 94.60%
+Flowers102 x TipAdapter x seed 1000 x 8-shot x 95.05%
+Flowers102 x TipAdapter x seed 10000 x 8-shot x 95.21%
+Flowers102 x TipAdapter x seed 1 x 16-shot x 96.47%
+Flowers102 x TipAdapter x seed 10 x 16-shot x 95.94%
+Flowers102 x TipAdapter x seed 100 x 16-shot x 96.35%
+Flowers102 x TipAdapter x seed 1000 x 16-shot x 96.71%
+Flowers102 x TipAdapter x seed 10000 x 16-shot x 96.22%
+
+Flowers102 x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     78.98% +/- 0.46%
+2-shot   5     87.76% +/- 0.62%
+4-shot   5     91.66% +/- 0.72%
+8-shot   5     94.84% +/- 0.25%
+16-shot  5     96.34% +/- 0.26%
+
+Food-101 x TipAdapter x seed 1 x 1-shot x 85.61%
+Food-101 x TipAdapter x seed 10 x 1-shot x 85.72%
+Food-101 x TipAdapter x seed 100 x 1-shot x 85.63%
+Food-101 x TipAdapter x seed 1000 x 1-shot x 85.65%
+Food-101 x TipAdapter x seed 10000 x 1-shot x 85.63%
+Food-101 x TipAdapter x seed 1 x 2-shot x 85.75%
+Food-101 x TipAdapter x seed 10 x 2-shot x 85.84%
+Food-101 x TipAdapter x seed 100 x 2-shot x 85.84%
+Food-101 x TipAdapter x seed 1000 x 2-shot x 85.85%
+Food-101 x TipAdapter x seed 10000 x 2-shot x 85.77%
+Food-101 x TipAdapter x seed 1 x 4-shot x 86.09%
+Food-101 x TipAdapter x seed 10 x 4-shot x 85.82%
+Food-101 x TipAdapter x seed 100 x 4-shot x 86.11%
+Food-101 x TipAdapter x seed 1000 x 4-shot x 86.22%
+Food-101 x TipAdapter x seed 10000 x 4-shot x 86.08%
+Food-101 x TipAdapter x seed 1 x 8-shot x 86.52%
+Food-101 x TipAdapter x seed 10 x 8-shot x 86.07%
+Food-101 x TipAdapter x seed 100 x 8-shot x 85.93%
+Food-101 x TipAdapter x seed 1000 x 8-shot x 86.26%
+Food-101 x TipAdapter x seed 10000 x 8-shot x 86.49%
+Food-101 x TipAdapter x seed 1 x 16-shot x 86.69%
+Food-101 x TipAdapter x seed 10 x 16-shot x 86.79%
+Food-101 x TipAdapter x seed 100 x 16-shot x 86.64%
+Food-101 x TipAdapter x seed 1000 x 16-shot x 86.89%
+Food-101 x TipAdapter x seed 10000 x 16-shot x 87.08%
+
+Food-101 x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     85.65% +/- 0.04%
+2-shot   5     85.81% +/- 0.04%
+4-shot   5     86.06% +/- 0.13%
+8-shot   5     86.25% +/- 0.23%
+16-shot  5     86.82% +/- 0.16%
+
+OxfordPets x TipAdapter x seed 1 x 1-shot x 89.94%
+OxfordPets x TipAdapter x seed 10 x 1-shot x 89.42%
+OxfordPets x TipAdapter x seed 100 x 1-shot x 89.07%
+OxfordPets x TipAdapter x seed 1000 x 1-shot x 89.42%
+OxfordPets x TipAdapter x seed 10000 x 1-shot x 89.18%
+OxfordPets x TipAdapter x seed 1 x 2-shot x 90.11%
+OxfordPets x TipAdapter x seed 10 x 2-shot x 89.92%
+OxfordPets x TipAdapter x seed 100 x 2-shot x 89.21%
+OxfordPets x TipAdapter x seed 1000 x 2-shot x 90.49%
+OxfordPets x TipAdapter x seed 10000 x 2-shot x 89.59%
+OxfordPets x TipAdapter x seed 1 x 4-shot x 90.95%
+OxfordPets x TipAdapter x seed 10 x 4-shot x 89.37%
+OxfordPets x TipAdapter x seed 100 x 4-shot x 90.73%
+OxfordPets x TipAdapter x seed 1000 x 4-shot x 90.81%
+OxfordPets x TipAdapter x seed 10000 x 4-shot x 89.42%
+OxfordPets x TipAdapter x seed 1 x 8-shot x 91.28%
+OxfordPets x TipAdapter x seed 10 x 8-shot x 89.45%
+OxfordPets x TipAdapter x seed 100 x 8-shot x 90.54%
+OxfordPets x TipAdapter x seed 1000 x 8-shot x 89.81%
+OxfordPets x TipAdapter x seed 10000 x 8-shot x 89.56%
+OxfordPets x TipAdapter x seed 1 x 16-shot x 92.34%
+OxfordPets x TipAdapter x seed 10 x 16-shot x 92.45%
+OxfordPets x TipAdapter x seed 100 x 16-shot x 91.28%
+OxfordPets x TipAdapter x seed 1000 x 16-shot x 92.48%
+OxfordPets x TipAdapter x seed 10000 x 16-shot x 91.31%
+
+OxfordPets x TipAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     89.41% +/- 0.30%
+2-shot   5     89.86% +/- 0.44%
+4-shot   5     90.26% +/- 0.71%
+8-shot   5     90.13% +/- 0.69%
+16-shot  5     91.97% +/- 0.56%
+/kaggle/working/protofuse/.venv/lib/python3.12/site-packages/clip/clip.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import packaging
+
+FGVCAircraft x ProtoAdapter x seed 1 x 1-shot x 26.13%
+FGVCAircraft x ProtoAdapter x seed 10 x 1-shot x 26.76%
+FGVCAircraft x ProtoAdapter x seed 100 x 1-shot x 26.76%
+FGVCAircraft x ProtoAdapter x seed 1000 x 1-shot x 27.09%
+FGVCAircraft x ProtoAdapter x seed 10000 x 1-shot x 26.76%
+FGVCAircraft x ProtoAdapter x seed 1 x 2-shot x 27.36%
+FGVCAircraft x ProtoAdapter x seed 10 x 2-shot x 27.72%
+FGVCAircraft x ProtoAdapter x seed 100 x 2-shot x 27.87%
+FGVCAircraft x ProtoAdapter x seed 1000 x 2-shot x 28.11%
+FGVCAircraft x ProtoAdapter x seed 10000 x 2-shot x 28.02%
+FGVCAircraft x ProtoAdapter x seed 1 x 4-shot x 29.19%
+FGVCAircraft x ProtoAdapter x seed 10 x 4-shot x 28.44%
+FGVCAircraft x ProtoAdapter x seed 100 x 4-shot x 27.72%
+FGVCAircraft x ProtoAdapter x seed 1000 x 4-shot x 28.56%
+FGVCAircraft x ProtoAdapter x seed 10000 x 4-shot x 28.53%
+FGVCAircraft x ProtoAdapter x seed 1 x 8-shot x 29.28%
+FGVCAircraft x ProtoAdapter x seed 10 x 8-shot x 28.65%
+FGVCAircraft x ProtoAdapter x seed 100 x 8-shot x 28.47%
+FGVCAircraft x ProtoAdapter x seed 1000 x 8-shot x 29.55%
+FGVCAircraft x ProtoAdapter x seed 10000 x 8-shot x 29.01%
+FGVCAircraft x ProtoAdapter x seed 1 x 16-shot x 29.64%
+FGVCAircraft x ProtoAdapter x seed 10 x 16-shot x 29.22%
+FGVCAircraft x ProtoAdapter x seed 100 x 16-shot x 29.43%
+FGVCAircraft x ProtoAdapter x seed 1000 x 16-shot x 29.46%
+FGVCAircraft x ProtoAdapter x seed 10000 x 16-shot x 29.76%
+
+FGVCAircraft x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     26.70% +/- 0.31%
+2-shot   5     27.82% +/- 0.26%
+4-shot   5     28.49% +/- 0.47%
+8-shot   5     28.99% +/- 0.40%
+16-shot  5     29.50% +/- 0.19%
+
+StanfordCars x ProtoAdapter x seed 1 x 1-shot x 64.33%
+StanfordCars x ProtoAdapter x seed 10 x 1-shot x 65.08%
+StanfordCars x ProtoAdapter x seed 100 x 1-shot x 64.79%
+StanfordCars x ProtoAdapter x seed 1000 x 1-shot x 64.95%
+StanfordCars x ProtoAdapter x seed 10000 x 1-shot x 65.22%
+StanfordCars x ProtoAdapter x seed 1 x 2-shot x 65.79%
+StanfordCars x ProtoAdapter x seed 10 x 2-shot x 65.70%
+StanfordCars x ProtoAdapter x seed 100 x 2-shot x 65.84%
+StanfordCars x ProtoAdapter x seed 1000 x 2-shot x 65.37%
+StanfordCars x ProtoAdapter x seed 10000 x 2-shot x 65.58%
+StanfordCars x ProtoAdapter x seed 1 x 4-shot x 66.21%
+StanfordCars x ProtoAdapter x seed 10 x 4-shot x 66.02%
+StanfordCars x ProtoAdapter x seed 100 x 4-shot x 66.06%
+StanfordCars x ProtoAdapter x seed 1000 x 4-shot x 65.86%
+StanfordCars x ProtoAdapter x seed 10000 x 4-shot x 65.74%
+StanfordCars x ProtoAdapter x seed 1 x 8-shot x 66.76%
+StanfordCars x ProtoAdapter x seed 10 x 8-shot x 66.84%
+StanfordCars x ProtoAdapter x seed 100 x 8-shot x 66.55%
+StanfordCars x ProtoAdapter x seed 1000 x 8-shot x 66.34%
+StanfordCars x ProtoAdapter x seed 10000 x 8-shot x 66.42%
+StanfordCars x ProtoAdapter x seed 1 x 16-shot x 67.33%
+StanfordCars x ProtoAdapter x seed 10 x 16-shot x 67.40%
+StanfordCars x ProtoAdapter x seed 100 x 16-shot x 67.27%
+StanfordCars x ProtoAdapter x seed 1000 x 16-shot x 67.44%
+StanfordCars x ProtoAdapter x seed 10000 x 16-shot x 67.32%
+
+StanfordCars x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     64.88% +/- 0.30%
+2-shot   5     65.65% +/- 0.17%
+4-shot   5     65.98% +/- 0.16%
+8-shot   5     66.58% +/- 0.19%
+16-shot  5     67.35% +/- 0.06%
+
+CUB-200-2011 x ProtoAdapter x seed 1 x 1-shot x 57.01%
+CUB-200-2011 x ProtoAdapter x seed 10 x 1-shot x 57.32%
+CUB-200-2011 x ProtoAdapter x seed 100 x 1-shot x 57.97%
+CUB-200-2011 x ProtoAdapter x seed 1000 x 1-shot x 57.90%
+CUB-200-2011 x ProtoAdapter x seed 10000 x 1-shot x 57.96%
+CUB-200-2011 x ProtoAdapter x seed 1 x 2-shot x 58.16%
+CUB-200-2011 x ProtoAdapter x seed 10 x 2-shot x 58.77%
+CUB-200-2011 x ProtoAdapter x seed 100 x 2-shot x 58.77%
+CUB-200-2011 x ProtoAdapter x seed 1000 x 2-shot x 58.60%
+CUB-200-2011 x ProtoAdapter x seed 10000 x 2-shot x 58.35%
+CUB-200-2011 x ProtoAdapter x seed 1 x 4-shot x 59.04%
+CUB-200-2011 x ProtoAdapter x seed 10 x 4-shot x 59.29%
+CUB-200-2011 x ProtoAdapter x seed 100 x 4-shot x 59.32%
+CUB-200-2011 x ProtoAdapter x seed 1000 x 4-shot x 59.16%
+CUB-200-2011 x ProtoAdapter x seed 10000 x 4-shot x 59.16%
+CUB-200-2011 x ProtoAdapter x seed 1 x 8-shot x 59.37%
+CUB-200-2011 x ProtoAdapter x seed 10 x 8-shot x 59.65%
+CUB-200-2011 x ProtoAdapter x seed 100 x 8-shot x 59.68%
+CUB-200-2011 x ProtoAdapter x seed 1000 x 8-shot x 59.51%
+CUB-200-2011 x ProtoAdapter x seed 10000 x 8-shot x 59.72%
+CUB-200-2011 x ProtoAdapter x seed 1 x 16-shot x 60.01%
+CUB-200-2011 x ProtoAdapter x seed 10 x 16-shot x 60.25%
+CUB-200-2011 x ProtoAdapter x seed 100 x 16-shot x 60.20%
+CUB-200-2011 x ProtoAdapter x seed 1000 x 16-shot x 60.10%
+CUB-200-2011 x ProtoAdapter x seed 10000 x 16-shot x 60.34%
+
+CUB-200-2011 x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     57.63% +/- 0.40%
+2-shot   5     58.53% +/- 0.24%
+4-shot   5     59.20% +/- 0.10%
+8-shot   5     59.59% +/- 0.13%
+16-shot  5     60.18% +/- 0.12%
+
+Flowers102 x ProtoAdapter x seed 1 x 1-shot x 73.33%
+Flowers102 x ProtoAdapter x seed 10 x 1-shot x 73.08%
+Flowers102 x ProtoAdapter x seed 100 x 1-shot x 73.85%
+Flowers102 x ProtoAdapter x seed 1000 x 1-shot x 73.24%
+Flowers102 x ProtoAdapter x seed 10000 x 1-shot x 73.89%
+Flowers102 x ProtoAdapter x seed 1 x 2-shot x 74.30%
+Flowers102 x ProtoAdapter x seed 10 x 2-shot x 73.61%
+Flowers102 x ProtoAdapter x seed 100 x 2-shot x 73.97%
+Flowers102 x ProtoAdapter x seed 1000 x 2-shot x 73.69%
+Flowers102 x ProtoAdapter x seed 10000 x 2-shot x 73.77%
+Flowers102 x ProtoAdapter x seed 1 x 4-shot x 74.22%
+Flowers102 x ProtoAdapter x seed 10 x 4-shot x 74.18%
+Flowers102 x ProtoAdapter x seed 100 x 4-shot x 74.22%
+Flowers102 x ProtoAdapter x seed 1000 x 4-shot x 74.34%
+Flowers102 x ProtoAdapter x seed 10000 x 4-shot x 74.18%
+Flowers102 x ProtoAdapter x seed 1 x 8-shot x 74.54%
+Flowers102 x ProtoAdapter x seed 10 x 8-shot x 74.58%
+Flowers102 x ProtoAdapter x seed 100 x 8-shot x 75.15%
+Flowers102 x ProtoAdapter x seed 1000 x 8-shot x 74.42%
+Flowers102 x ProtoAdapter x seed 10000 x 8-shot x 74.30%
+Flowers102 x ProtoAdapter x seed 1 x 16-shot x 75.15%
+Flowers102 x ProtoAdapter x seed 10 x 16-shot x 75.27%
+Flowers102 x ProtoAdapter x seed 100 x 16-shot x 75.36%
+Flowers102 x ProtoAdapter x seed 1000 x 16-shot x 75.11%
+Flowers102 x ProtoAdapter x seed 10000 x 16-shot x 75.15%
+
+Flowers102 x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     73.48% +/- 0.33%
+2-shot   5     73.87% +/- 0.25%
+4-shot   5     74.23% +/- 0.06%
+8-shot   5     74.60% +/- 0.29%
+16-shot  5     75.21% +/- 0.09%
+
+Food-101 x ProtoAdapter x seed 1 x 1-shot x 85.61%
+Food-101 x ProtoAdapter x seed 10 x 1-shot x 85.67%
+Food-101 x ProtoAdapter x seed 100 x 1-shot x 85.70%
+Food-101 x ProtoAdapter x seed 1000 x 1-shot x 85.42%
+Food-101 x ProtoAdapter x seed 10000 x 1-shot x 85.50%
+Food-101 x ProtoAdapter x seed 1 x 2-shot x 85.85%
+Food-101 x ProtoAdapter x seed 10 x 2-shot x 85.92%
+Food-101 x ProtoAdapter x seed 100 x 2-shot x 85.97%
+Food-101 x ProtoAdapter x seed 1000 x 2-shot x 85.91%
+Food-101 x ProtoAdapter x seed 10000 x 2-shot x 85.83%
+Food-101 x ProtoAdapter x seed 1 x 4-shot x 86.10%
+Food-101 x ProtoAdapter x seed 10 x 4-shot x 86.05%
+Food-101 x ProtoAdapter x seed 100 x 4-shot x 86.12%
+Food-101 x ProtoAdapter x seed 1000 x 4-shot x 86.08%
+Food-101 x ProtoAdapter x seed 10000 x 4-shot x 86.11%
+Food-101 x ProtoAdapter x seed 1 x 8-shot x 86.16%
+Food-101 x ProtoAdapter x seed 10 x 8-shot x 86.17%
+Food-101 x ProtoAdapter x seed 100 x 8-shot x 86.19%
+Food-101 x ProtoAdapter x seed 1000 x 8-shot x 86.21%
+Food-101 x ProtoAdapter x seed 10000 x 8-shot x 86.22%
+Food-101 x ProtoAdapter x seed 1 x 16-shot x 86.19%
+Food-101 x ProtoAdapter x seed 10 x 16-shot x 86.31%
+Food-101 x ProtoAdapter x seed 100 x 16-shot x 86.25%
+Food-101 x ProtoAdapter x seed 1000 x 16-shot x 86.36%
+Food-101 x ProtoAdapter x seed 10000 x 16-shot x 86.32%
+
+Food-101 x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     85.58% +/- 0.11%
+2-shot   5     85.90% +/- 0.05%
+4-shot   5     86.09% +/- 0.03%
+8-shot   5     86.19% +/- 0.02%
+16-shot  5     86.29% +/- 0.06%
+
+OxfordPets x ProtoAdapter x seed 1 x 1-shot x 89.78%
+OxfordPets x ProtoAdapter x seed 10 x 1-shot x 89.40%
+OxfordPets x ProtoAdapter x seed 100 x 1-shot x 89.18%
+OxfordPets x ProtoAdapter x seed 1000 x 1-shot x 89.75%
+OxfordPets x ProtoAdapter x seed 10000 x 1-shot x 89.18%
+OxfordPets x ProtoAdapter x seed 1 x 2-shot x 90.05%
+OxfordPets x ProtoAdapter x seed 10 x 2-shot x 89.56%
+OxfordPets x ProtoAdapter x seed 100 x 2-shot x 89.53%
+OxfordPets x ProtoAdapter x seed 1000 x 2-shot x 90.32%
+OxfordPets x ProtoAdapter x seed 10000 x 2-shot x 89.83%
+OxfordPets x ProtoAdapter x seed 1 x 4-shot x 90.27%
+OxfordPets x ProtoAdapter x seed 10 x 4-shot x 89.86%
+OxfordPets x ProtoAdapter x seed 100 x 4-shot x 90.00%
+OxfordPets x ProtoAdapter x seed 1000 x 4-shot x 90.00%
+OxfordPets x ProtoAdapter x seed 10000 x 4-shot x 89.81%
+OxfordPets x ProtoAdapter x seed 1 x 8-shot x 90.19%
+OxfordPets x ProtoAdapter x seed 10 x 8-shot x 89.97%
+OxfordPets x ProtoAdapter x seed 100 x 8-shot x 90.08%
+OxfordPets x ProtoAdapter x seed 1000 x 8-shot x 90.00%
+OxfordPets x ProtoAdapter x seed 10000 x 8-shot x 89.81%
+OxfordPets x ProtoAdapter x seed 1 x 16-shot x 90.22%
+OxfordPets x ProtoAdapter x seed 10 x 16-shot x 90.08%
+OxfordPets x ProtoAdapter x seed 100 x 16-shot x 90.19%
+OxfordPets x ProtoAdapter x seed 1000 x 16-shot x 90.16%
+OxfordPets x ProtoAdapter x seed 10000 x 16-shot x 89.97%
+
+OxfordPets x ProtoAdapter x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     89.46% +/- 0.26%
+2-shot   5     89.86% +/- 0.30%
+4-shot   5     89.99% +/- 0.16%
+8-shot   5     90.01% +/- 0.13%
+16-shot  5     90.12% +/- 0.09%
+/kaggle/working/protofuse/.venv/lib/python3.12/site-packages/clip/clip.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import packaging
+
+FGVCAircraft x APE x seed 1 x 1-shot x 24.69%
+FGVCAircraft x APE x seed 10 x 1-shot x 22.05%
+FGVCAircraft x APE x seed 100 x 1-shot x 25.14%
+FGVCAircraft x APE x seed 1000 x 1-shot x 20.31%
+FGVCAircraft x APE x seed 10000 x 1-shot x 20.94%
+FGVCAircraft x APE x seed 1 x 2-shot x 24.06%
+FGVCAircraft x APE x seed 10 x 2-shot x 28.80%
+FGVCAircraft x APE x seed 100 x 2-shot x 29.25%
+FGVCAircraft x APE x seed 1000 x 2-shot x 26.82%
+FGVCAircraft x APE x seed 10000 x 2-shot x 27.87%
+FGVCAircraft x APE x seed 1 x 4-shot x 32.16%
+FGVCAircraft x APE x seed 10 x 4-shot x 29.28%
+FGVCAircraft x APE x seed 100 x 4-shot x 32.16%
+FGVCAircraft x APE x seed 1000 x 4-shot x 33.48%
+FGVCAircraft x APE x seed 10000 x 4-shot x 31.47%
+FGVCAircraft x APE x seed 1 x 8-shot x 34.59%
+FGVCAircraft x APE x seed 10 x 8-shot x 35.25%
+FGVCAircraft x APE x seed 100 x 8-shot x 34.59%
+FGVCAircraft x APE x seed 1000 x 8-shot x 36.63%
+FGVCAircraft x APE x seed 10000 x 8-shot x 37.11%
+FGVCAircraft x APE x seed 1 x 16-shot x 40.62%
+FGVCAircraft x APE x seed 10 x 16-shot x 38.85%
+FGVCAircraft x APE x seed 100 x 16-shot x 38.49%
+FGVCAircraft x APE x seed 1000 x 16-shot x 39.51%
+FGVCAircraft x APE x seed 10000 x 16-shot x 39.33%
+
+FGVCAircraft x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     22.63% +/- 1.96%
+2-shot   5     27.36% +/- 1.85%
+4-shot   5     31.71% +/- 1.38%
+8-shot   5     35.64% +/- 1.05%
+16-shot  5     39.36% +/- 0.73%
+
+StanfordCars x APE x seed 1 x 1-shot x 58.05%
+StanfordCars x APE x seed 10 x 1-shot x 56.73%
+StanfordCars x APE x seed 100 x 1-shot x 57.39%
+StanfordCars x APE x seed 1000 x 1-shot x 59.35%
+StanfordCars x APE x seed 10000 x 1-shot x 50.79%
+StanfordCars x APE x seed 1 x 2-shot x 52.08%
+StanfordCars x APE x seed 10 x 2-shot x 67.22%
+StanfordCars x APE x seed 100 x 2-shot x 65.73%
+StanfordCars x APE x seed 1000 x 2-shot x 61.85%
+StanfordCars x APE x seed 10000 x 2-shot x 67.73%
+StanfordCars x APE x seed 1 x 4-shot x 70.55%
+StanfordCars x APE x seed 10 x 4-shot x 69.80%
+StanfordCars x APE x seed 100 x 4-shot x 69.95%
+StanfordCars x APE x seed 1000 x 4-shot x 68.29%
+StanfordCars x APE x seed 10000 x 4-shot x 68.57%
+StanfordCars x APE x seed 1 x 8-shot x 74.11%
+StanfordCars x APE x seed 10 x 8-shot x 69.48%
+StanfordCars x APE x seed 100 x 8-shot x 69.78%
+StanfordCars x APE x seed 1000 x 8-shot x 70.91%
+StanfordCars x APE x seed 10000 x 8-shot x 71.50%
+StanfordCars x APE x seed 1 x 16-shot x 75.30%
+StanfordCars x APE x seed 10 x 16-shot x 75.45%
+StanfordCars x APE x seed 100 x 16-shot x 76.97%
+StanfordCars x APE x seed 1000 x 16-shot x 73.97%
+StanfordCars x APE x seed 10000 x 16-shot x 74.57%
+
+StanfordCars x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     56.46% +/- 2.97%
+2-shot   5     62.92% +/- 5.80%
+4-shot   5     69.43% +/- 0.86%
+8-shot   5     71.16% +/- 1.65%
+16-shot  5     75.25% +/- 1.01%
+
+CUB-200-2011 x APE x seed 1 x 1-shot x 42.42%
+CUB-200-2011 x APE x seed 10 x 1-shot x 57.97%
+CUB-200-2011 x APE x seed 100 x 1-shot x 49.71%
+CUB-200-2011 x APE x seed 1000 x 1-shot x 53.24%
+CUB-200-2011 x APE x seed 10000 x 1-shot x 55.45%
+CUB-200-2011 x APE x seed 1 x 2-shot x 57.56%
+CUB-200-2011 x APE x seed 10 x 2-shot x 58.94%
+CUB-200-2011 x APE x seed 100 x 2-shot x 46.17%
+CUB-200-2011 x APE x seed 1000 x 2-shot x 59.79%
+CUB-200-2011 x APE x seed 10000 x 2-shot x 53.07%
+CUB-200-2011 x APE x seed 1 x 4-shot x 66.21%
+CUB-200-2011 x APE x seed 10 x 4-shot x 60.53%
+CUB-200-2011 x APE x seed 100 x 4-shot x 58.18%
+CUB-200-2011 x APE x seed 1000 x 4-shot x 65.98%
+CUB-200-2011 x APE x seed 10000 x 4-shot x 60.27%
+CUB-200-2011 x APE x seed 1 x 8-shot x 68.07%
+CUB-200-2011 x APE x seed 10 x 8-shot x 68.21%
+CUB-200-2011 x APE x seed 100 x 8-shot x 69.33%
+CUB-200-2011 x APE x seed 1000 x 8-shot x 66.59%
+CUB-200-2011 x APE x seed 10000 x 8-shot x 68.02%
+CUB-200-2011 x APE x seed 1 x 16-shot x 73.02%
+CUB-200-2011 x APE x seed 10 x 16-shot x 73.04%
+CUB-200-2011 x APE x seed 100 x 16-shot x 72.83%
+CUB-200-2011 x APE x seed 1000 x 16-shot x 71.99%
+CUB-200-2011 x APE x seed 10000 x 16-shot x 72.76%
+
+CUB-200-2011 x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     51.76% +/- 5.40%
+2-shot   5     55.11% +/- 5.03%
+4-shot   5     62.23% +/- 3.26%
+8-shot   5     68.04% +/- 0.87%
+16-shot  5     72.73% +/- 0.39%
+
+Flowers102 x APE x seed 1 x 1-shot x 78.89%
+Flowers102 x APE x seed 10 x 1-shot x 70.97%
+Flowers102 x APE x seed 100 x 1-shot x 72.63%
+Flowers102 x APE x seed 1000 x 1-shot x 71.38%
+Flowers102 x APE x seed 10000 x 1-shot x 71.58%
+Flowers102 x APE x seed 1 x 2-shot x 85.83%
+Flowers102 x APE x seed 10 x 2-shot x 86.72%
+Flowers102 x APE x seed 100 x 2-shot x 87.74%
+Flowers102 x APE x seed 1000 x 2-shot x 83.11%
+Flowers102 x APE x seed 10000 x 2-shot x 80.11%
+Flowers102 x APE x seed 1 x 4-shot x 89.61%
+Flowers102 x APE x seed 10 x 4-shot x 84.33%
+Flowers102 x APE x seed 100 x 4-shot x 91.03%
+Flowers102 x APE x seed 1000 x 4-shot x 88.31%
+Flowers102 x APE x seed 10000 x 4-shot x 90.34%
+Flowers102 x APE x seed 1 x 8-shot x 92.12%
+Flowers102 x APE x seed 10 x 8-shot x 91.27%
+Flowers102 x APE x seed 100 x 8-shot x 92.33%
+Flowers102 x APE x seed 1000 x 8-shot x 92.25%
+Flowers102 x APE x seed 10000 x 8-shot x 93.63%
+Flowers102 x APE x seed 1 x 16-shot x 94.07%
+Flowers102 x APE x seed 10 x 16-shot x 93.83%
+Flowers102 x APE x seed 100 x 16-shot x 94.28%
+Flowers102 x APE x seed 1000 x 16-shot x 92.41%
+Flowers102 x APE x seed 10000 x 16-shot x 94.64%
+
+Flowers102 x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     73.09% +/- 2.95%
+2-shot   5     84.70% +/- 2.77%
+4-shot   5     88.72% +/- 2.37%
+8-shot   5     92.32% +/- 0.75%
+16-shot  5     93.84% +/- 0.77%
+
+Food-101 x APE x seed 1 x 1-shot x 84.07%
+Food-101 x APE x seed 10 x 1-shot x 79.16%
+Food-101 x APE x seed 100 x 1-shot x 69.68%
+Food-101 x APE x seed 1000 x 1-shot x 75.79%
+Food-101 x APE x seed 10000 x 1-shot x 80.48%
+Food-101 x APE x seed 1 x 2-shot x 76.35%
+Food-101 x APE x seed 10 x 2-shot x 78.55%
+Food-101 x APE x seed 100 x 2-shot x 75.06%
+Food-101 x APE x seed 1000 x 2-shot x 73.23%
+Food-101 x APE x seed 10000 x 2-shot x 81.34%
+Food-101 x APE x seed 1 x 4-shot x 76.03%
+Food-101 x APE x seed 10 x 4-shot x 75.67%
+Food-101 x APE x seed 100 x 4-shot x 75.29%
+Food-101 x APE x seed 1000 x 4-shot x 83.88%
+Food-101 x APE x seed 10000 x 4-shot x 74.48%
+Food-101 x APE x seed 1 x 8-shot x 78.39%
+Food-101 x APE x seed 10 x 8-shot x 80.81%
+Food-101 x APE x seed 100 x 8-shot x 78.22%
+Food-101 x APE x seed 1000 x 8-shot x 82.41%
+Food-101 x APE x seed 10000 x 8-shot x 78.73%
+Food-101 x APE x seed 1 x 16-shot x 81.12%
+Food-101 x APE x seed 10 x 16-shot x 81.39%
+Food-101 x APE x seed 100 x 16-shot x 84.99%
+Food-101 x APE x seed 1000 x 16-shot x 81.87%
+Food-101 x APE x seed 10000 x 16-shot x 81.86%
+
+Food-101 x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     77.84% +/- 4.86%
+2-shot   5     76.91% +/- 2.82%
+4-shot   5     77.07% +/- 3.44%
+8-shot   5     79.71% +/- 1.64%
+16-shot  5     82.25% +/- 1.40%
+
+OxfordPets x APE x seed 1 x 1-shot x 71.60%
+OxfordPets x APE x seed 10 x 1-shot x 86.64%
+OxfordPets x APE x seed 100 x 1-shot x 85.80%
+OxfordPets x APE x seed 1000 x 1-shot x 83.46%
+OxfordPets x APE x seed 10000 x 1-shot x 87.27%
+OxfordPets x APE x seed 1 x 2-shot x 81.17%
+OxfordPets x APE x seed 10 x 2-shot x 86.48%
+OxfordPets x APE x seed 100 x 2-shot x 89.78%
+OxfordPets x APE x seed 1000 x 2-shot x 81.47%
+OxfordPets x APE x seed 10000 x 2-shot x 87.44%
+OxfordPets x APE x seed 1 x 4-shot x 83.70%
+OxfordPets x APE x seed 10 x 4-shot x 89.86%
+OxfordPets x APE x seed 100 x 4-shot x 83.18%
+OxfordPets x APE x seed 1000 x 4-shot x 76.51%
+OxfordPets x APE x seed 10000 x 4-shot x 79.07%
+OxfordPets x APE x seed 1 x 8-shot x 91.91%
+OxfordPets x APE x seed 10 x 8-shot x 86.81%
+OxfordPets x APE x seed 100 x 8-shot x 85.83%
+OxfordPets x APE x seed 1000 x 8-shot x 87.68%
+OxfordPets x APE x seed 10000 x 8-shot x 84.27%
+OxfordPets x APE x seed 1 x 16-shot x 87.19%
+OxfordPets x APE x seed 10 x 16-shot x 86.92%
+OxfordPets x APE x seed 100 x 16-shot x 84.96%
+OxfordPets x APE x seed 1000 x 16-shot x 89.70%
+OxfordPets x APE x seed 10000 x 16-shot x 90.08%
+
+OxfordPets x APE x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     82.95% +/- 5.82%
+2-shot   5     85.27% +/- 3.40%
+4-shot   5     82.46% +/- 4.56%
+8-shot   5     87.30% +/- 2.57%
+16-shot  5     87.77% +/- 1.90%
+/kaggle/working/protofuse/.venv/lib/python3.12/site-packages/clip/clip.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import packaging
+
+FGVCAircraft x TIMO x seed 1 x 1-shot x 21.45%
+FGVCAircraft x TIMO x seed 10 x 1-shot x 19.50%
+FGVCAircraft x TIMO x seed 100 x 1-shot x 20.40%
+FGVCAircraft x TIMO x seed 1000 x 1-shot x 19.74%
+FGVCAircraft x TIMO x seed 10000 x 1-shot x 21.54%
+FGVCAircraft x TIMO x seed 1 x 2-shot x 25.71%
+FGVCAircraft x TIMO x seed 10 x 2-shot x 27.24%
+FGVCAircraft x TIMO x seed 100 x 2-shot x 26.97%
+FGVCAircraft x TIMO x seed 1000 x 2-shot x 25.26%
+FGVCAircraft x TIMO x seed 10000 x 2-shot x 26.82%
+FGVCAircraft x TIMO x seed 1 x 4-shot x 32.79%
+FGVCAircraft x TIMO x seed 10 x 4-shot x 33.36%
+FGVCAircraft x TIMO x seed 100 x 4-shot x 32.73%
+FGVCAircraft x TIMO x seed 1000 x 4-shot x 32.10%
+FGVCAircraft x TIMO x seed 10000 x 4-shot x 34.17%
+FGVCAircraft x TIMO x seed 1 x 8-shot x 41.76%
+FGVCAircraft x TIMO x seed 10 x 8-shot x 41.10%
+FGVCAircraft x TIMO x seed 100 x 8-shot x 40.65%
+FGVCAircraft x TIMO x seed 1000 x 8-shot x 41.73%
+FGVCAircraft x TIMO x seed 10000 x 8-shot x 42.60%
+FGVCAircraft x TIMO x seed 1 x 16-shot x 50.44%
+FGVCAircraft x TIMO x seed 10 x 16-shot x 49.05%
+FGVCAircraft x TIMO x seed 100 x 16-shot x 48.51%
+FGVCAircraft x TIMO x seed 1000 x 16-shot x 49.29%
+FGVCAircraft x TIMO x seed 10000 x 16-shot x 49.17%
+
+FGVCAircraft x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     20.53% +/- 0.84%
+2-shot   5     26.40% +/- 0.77%
+4-shot   5     33.03% +/- 0.70%
+8-shot   5     41.57% +/- 0.66%
+16-shot  5     49.29% +/- 0.63%
+
+StanfordCars x TIMO x seed 1 x 1-shot x 42.48%
+StanfordCars x TIMO x seed 10 x 1-shot x 43.54%
+StanfordCars x TIMO x seed 100 x 1-shot x 44.01%
+StanfordCars x TIMO x seed 1000 x 1-shot x 42.47%
+StanfordCars x TIMO x seed 10000 x 1-shot x 43.46%
+StanfordCars x TIMO x seed 1 x 2-shot x 51.98%
+StanfordCars x TIMO x seed 10 x 2-shot x 50.01%
+StanfordCars x TIMO x seed 100 x 2-shot x 50.94%
+StanfordCars x TIMO x seed 1000 x 2-shot x 50.02%
+StanfordCars x TIMO x seed 10000 x 2-shot x 50.52%
+StanfordCars x TIMO x seed 1 x 4-shot x 62.33%
+StanfordCars x TIMO x seed 10 x 4-shot x 62.79%
+StanfordCars x TIMO x seed 100 x 4-shot x 63.00%
+StanfordCars x TIMO x seed 1000 x 4-shot x 62.06%
+StanfordCars x TIMO x seed 10000 x 4-shot x 61.60%
+StanfordCars x TIMO x seed 1 x 8-shot x 72.53%
+StanfordCars x TIMO x seed 10 x 8-shot x 72.98%
+StanfordCars x TIMO x seed 100 x 8-shot x 73.19%
+StanfordCars x TIMO x seed 1000 x 8-shot x 72.03%
+StanfordCars x TIMO x seed 10000 x 8-shot x 71.94%
+StanfordCars x TIMO x seed 1 x 16-shot x 78.41%
+StanfordCars x TIMO x seed 10 x 16-shot x 78.90%
+StanfordCars x TIMO x seed 100 x 16-shot x 79.90%
+StanfordCars x TIMO x seed 1000 x 16-shot x 79.89%
+StanfordCars x TIMO x seed 10000 x 16-shot x 79.13%
+
+StanfordCars x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     43.19% +/- 0.62%
+2-shot   5     50.69% +/- 0.73%
+4-shot   5     62.36% +/- 0.50%
+8-shot   5     72.53% +/- 0.49%
+16-shot  5     79.25% +/- 0.58%
+
+CUB-200-2011 x TIMO x seed 1 x 1-shot x 40.70%
+CUB-200-2011 x TIMO x seed 10 x 1-shot x 40.14%
+CUB-200-2011 x TIMO x seed 100 x 1-shot x 39.42%
+CUB-200-2011 x TIMO x seed 1000 x 1-shot x 38.47%
+CUB-200-2011 x TIMO x seed 10000 x 1-shot x 38.42%
+CUB-200-2011 x TIMO x seed 1 x 2-shot x 47.70%
+CUB-200-2011 x TIMO x seed 10 x 2-shot x 50.07%
+CUB-200-2011 x TIMO x seed 100 x 2-shot x 49.60%
+CUB-200-2011 x TIMO x seed 1000 x 2-shot x 47.31%
+CUB-200-2011 x TIMO x seed 10000 x 2-shot x 49.50%
+CUB-200-2011 x TIMO x seed 1 x 4-shot x 60.79%
+CUB-200-2011 x TIMO x seed 10 x 4-shot x 61.49%
+CUB-200-2011 x TIMO x seed 100 x 4-shot x 60.23%
+CUB-200-2011 x TIMO x seed 1000 x 4-shot x 61.08%
+CUB-200-2011 x TIMO x seed 10000 x 4-shot x 60.68%
+CUB-200-2011 x TIMO x seed 1 x 8-shot x 73.09%
+CUB-200-2011 x TIMO x seed 10 x 8-shot x 72.71%
+CUB-200-2011 x TIMO x seed 100 x 8-shot x 70.28%
+CUB-200-2011 x TIMO x seed 1000 x 8-shot x 70.50%
+CUB-200-2011 x TIMO x seed 10000 x 8-shot x 70.94%
+CUB-200-2011 x TIMO x seed 1 x 16-shot x 78.82%
+CUB-200-2011 x TIMO x seed 10 x 16-shot x 78.31%
+CUB-200-2011 x TIMO x seed 100 x 16-shot x 78.06%
+CUB-200-2011 x TIMO x seed 1000 x 16-shot x 78.20%
+CUB-200-2011 x TIMO x seed 10000 x 16-shot x 78.37%
+
+CUB-200-2011 x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     39.43% +/- 0.90%
+2-shot   5     48.84% +/- 1.11%
+4-shot   5     60.86% +/- 0.42%
+8-shot   5     71.51% +/- 1.17%
+16-shot  5     78.35% +/- 0.26%
+
+Flowers102 x TIMO x seed 1 x 1-shot x 76.05%
+Flowers102 x TIMO x seed 10 x 1-shot x 75.27%
+Flowers102 x TIMO x seed 100 x 1-shot x 76.70%
+Flowers102 x TIMO x seed 1000 x 1-shot x 77.71%
+Flowers102 x TIMO x seed 10000 x 1-shot x 76.70%
+Flowers102 x TIMO x seed 1 x 2-shot x 84.73%
+Flowers102 x TIMO x seed 10 x 2-shot x 86.20%
+Flowers102 x TIMO x seed 100 x 2-shot x 87.05%
+Flowers102 x TIMO x seed 1000 x 2-shot x 85.59%
+Flowers102 x TIMO x seed 10000 x 2-shot x 87.09%
+Flowers102 x TIMO x seed 1 x 4-shot x 92.04%
+Flowers102 x TIMO x seed 10 x 4-shot x 92.04%
+Flowers102 x TIMO x seed 100 x 4-shot x 92.20%
+Flowers102 x TIMO x seed 1000 x 4-shot x 92.04%
+Flowers102 x TIMO x seed 10000 x 4-shot x 93.50%
+Flowers102 x TIMO x seed 1 x 8-shot x 95.13%
+Flowers102 x TIMO x seed 10 x 8-shot x 96.22%
+Flowers102 x TIMO x seed 100 x 8-shot x 95.45%
+Flowers102 x TIMO x seed 1000 x 8-shot x 96.35%
+Flowers102 x TIMO x seed 10000 x 8-shot x 96.22%
+Flowers102 x TIMO x seed 1 x 16-shot x 97.20%
+Flowers102 x TIMO x seed 10 x 16-shot x 97.40%
+Flowers102 x TIMO x seed 100 x 16-shot x 96.55%
+Flowers102 x TIMO x seed 1000 x 16-shot x 97.24%
+Flowers102 x TIMO x seed 10000 x 16-shot x 97.28%
+
+Flowers102 x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     76.48% +/- 0.81%
+2-shot   5     86.13% +/- 0.90%
+4-shot   5     92.37% +/- 0.57%
+8-shot   5     95.87% +/- 0.49%
+16-shot  5     97.13% +/- 0.30%
+
+Food-101 x TIMO x seed 1 x 1-shot x 68.83%
+Food-101 x TIMO x seed 10 x 1-shot x 66.41%
+Food-101 x TIMO x seed 100 x 1-shot x 69.96%
+Food-101 x TIMO x seed 1000 x 1-shot x 63.50%
+Food-101 x TIMO x seed 10000 x 1-shot x 68.76%
+Food-101 x TIMO x seed 1 x 2-shot x 68.41%
+Food-101 x TIMO x seed 10 x 2-shot x 69.00%
+Food-101 x TIMO x seed 100 x 2-shot x 69.17%
+Food-101 x TIMO x seed 1000 x 2-shot x 69.07%
+Food-101 x TIMO x seed 10000 x 2-shot x 70.43%
+Food-101 x TIMO x seed 1 x 4-shot x 73.67%
+Food-101 x TIMO x seed 10 x 4-shot x 73.34%
+Food-101 x TIMO x seed 100 x 4-shot x 73.83%
+Food-101 x TIMO x seed 1000 x 4-shot x 75.07%
+Food-101 x TIMO x seed 10000 x 4-shot x 74.45%
+Food-101 x TIMO x seed 1 x 8-shot x 79.06%
+Food-101 x TIMO x seed 10 x 8-shot x 78.91%
+Food-101 x TIMO x seed 100 x 8-shot x 79.80%
+Food-101 x TIMO x seed 1000 x 8-shot x 78.97%
+Food-101 x TIMO x seed 10000 x 8-shot x 79.50%
+Food-101 x TIMO x seed 1 x 16-shot x 82.34%
+Food-101 x TIMO x seed 10 x 16-shot x 82.44%
+Food-101 x TIMO x seed 100 x 16-shot x 82.89%
+Food-101 x TIMO x seed 1000 x 16-shot x 82.37%
+Food-101 x TIMO x seed 10000 x 16-shot x 83.01%
+
+Food-101 x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     67.49% +/- 2.31%
+2-shot   5     69.22% +/- 0.66%
+4-shot   5     74.07% +/- 0.61%
+8-shot   5     79.25% +/- 0.34%
+16-shot  5     82.61% +/- 0.28%
+
+OxfordPets x TIMO x seed 1 x 1-shot x 68.17%
+OxfordPets x TIMO x seed 10 x 1-shot x 68.25%
+OxfordPets x TIMO x seed 100 x 1-shot x 71.65%
+OxfordPets x TIMO x seed 1000 x 1-shot x 68.30%
+OxfordPets x TIMO x seed 10000 x 1-shot x 70.43%
+OxfordPets x TIMO x seed 1 x 2-shot x 72.28%
+OxfordPets x TIMO x seed 10 x 2-shot x 72.25%
+OxfordPets x TIMO x seed 100 x 2-shot x 76.23%
+OxfordPets x TIMO x seed 1000 x 2-shot x 71.87%
+OxfordPets x TIMO x seed 10000 x 2-shot x 73.13%
+OxfordPets x TIMO x seed 1 x 4-shot x 80.13%
+OxfordPets x TIMO x seed 10 x 4-shot x 78.28%
+OxfordPets x TIMO x seed 100 x 4-shot x 81.88%
+OxfordPets x TIMO x seed 1000 x 4-shot x 78.85%
+OxfordPets x TIMO x seed 10000 x 4-shot x 79.69%
+OxfordPets x TIMO x seed 1 x 8-shot x 87.41%
+OxfordPets x TIMO x seed 10 x 8-shot x 86.24%
+OxfordPets x TIMO x seed 100 x 8-shot x 86.75%
+OxfordPets x TIMO x seed 1000 x 8-shot x 85.96%
+OxfordPets x TIMO x seed 10000 x 8-shot x 87.08%
+OxfordPets x TIMO x seed 1 x 16-shot x 89.15%
+OxfordPets x TIMO x seed 10 x 16-shot x 89.75%
+OxfordPets x TIMO x seed 100 x 16-shot x 89.07%
+OxfordPets x TIMO x seed 1000 x 16-shot x 89.37%
+OxfordPets x TIMO x seed 10000 x 16-shot x 89.29%
+
+OxfordPets x TIMO x seed mean +/- std
+kshot    runs  acc             
+-------  ----  ----------------
+1-shot   5     69.36% +/- 1.43%
+2-shot   5     73.15% +/- 1.59%
+4-shot   5     79.77% +/- 1.24%
+8-shot   5     86.69% +/- 0.53%
+16-shot  5     89.33% +/- 0.24%
+
+FGVCAircraft x ProtoFuse x seed 1 x 1-shot x 27.21%
+FGVCAircraft x ProtoFuse x seed 10 x 1-shot x 26.31%
+FGVCAircraft x ProtoFuse x seed 100 x 1-shot x 27.42%
+FGVCAircraft x ProtoFuse x seed 1000 x 1-shot x 26.16%
+FGVCAircraft x ProtoFuse x seed 10000 x 1-shot x 27.12%
+FGVCAircraft x ProtoFuse x seed 1 x 2-shot x 26.94%
+FGVCAircraft x ProtoFuse x seed 10 x 2-shot x 24.18%
+FGVCAircraft x ProtoFuse x seed 100 x 2-shot x 27.27%
+FGVCAircraft x ProtoFuse x seed 1000 x 2-shot x 28.95%
+FGVCAircraft x ProtoFuse x seed 10000 x 2-shot x 29.70%
+FGVCAircraft x ProtoFuse x seed 1 x 4-shot x 34.83%
+FGVCAircraft x ProtoFuse x seed 10 x 4-shot x 32.49%
+FGVCAircraft x ProtoFuse x seed 100 x 4-shot x 33.24%
+FGVCAircraft x ProtoFuse x seed 1000 x 4-shot x 32.76%
+FGVCAircraft x ProtoFuse x seed 10000 x 4-shot x 32.91%
+FGVCAircraft x ProtoFuse x seed 1 x 8-shot x 37.59%
+FGVCAircraft x ProtoFuse x seed 10 x 8-shot x 37.35%
+FGVCAircraft x ProtoFuse x seed 100 x 8-shot x 35.31%
+FGVCAircraft x ProtoFuse x seed 1000 x 8-shot x 37.05%
+FGVCAircraft x ProtoFuse x seed 10000 x 8-shot x 37.89%
+FGVCAircraft x ProtoFuse x seed 1 x 16-shot x 41.25%
+FGVCAircraft x ProtoFuse x seed 10 x 16-shot x 39.99%
+FGVCAircraft x ProtoFuse x seed 100 x 16-shot x 39.33%
+FGVCAircraft x ProtoFuse x seed 1000 x 16-shot x 41.31%
+FGVCAircraft x ProtoFuse x seed 10000 x 16-shot x 40.26%
+
+FGVCAircraft x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     26.85% +/- 0.51%  0.390 +/- 0.050
+2-shot   5     27.41% +/- 1.91%  0.190 +/- 0.192
+4-shot   5     33.25% +/- 0.83%  0.636 +/- 0.198
+8-shot   5     37.04% +/- 0.91%  0.766 +/- 0.111
+16-shot  5     40.43% +/- 0.76%  0.804 +/- 0.076
+
+StanfordCars x ProtoFuse x seed 1 x 1-shot x 62.04%
+StanfordCars x ProtoFuse x seed 10 x 1-shot x 64.47%
+StanfordCars x ProtoFuse x seed 100 x 1-shot x 63.66%
+StanfordCars x ProtoFuse x seed 1000 x 1-shot x 63.67%
+StanfordCars x ProtoFuse x seed 10000 x 1-shot x 65.43%
+StanfordCars x ProtoFuse x seed 1 x 2-shot x 67.06%
+StanfordCars x ProtoFuse x seed 10 x 2-shot x 67.19%
+StanfordCars x ProtoFuse x seed 100 x 2-shot x 65.30%
+StanfordCars x ProtoFuse x seed 1000 x 2-shot x 66.86%
+StanfordCars x ProtoFuse x seed 10000 x 2-shot x 67.04%
+StanfordCars x ProtoFuse x seed 1 x 4-shot x 70.74%
+StanfordCars x ProtoFuse x seed 10 x 4-shot x 70.86%
+StanfordCars x ProtoFuse x seed 100 x 4-shot x 70.39%
+StanfordCars x ProtoFuse x seed 1000 x 4-shot x 69.66%
+StanfordCars x ProtoFuse x seed 10000 x 4-shot x 69.67%
+StanfordCars x ProtoFuse x seed 1 x 8-shot x 74.61%
+StanfordCars x ProtoFuse x seed 10 x 8-shot x 74.24%
+StanfordCars x ProtoFuse x seed 100 x 8-shot x 74.65%
+StanfordCars x ProtoFuse x seed 1000 x 8-shot x 73.08%
+StanfordCars x ProtoFuse x seed 10000 x 8-shot x 74.19%
+StanfordCars x ProtoFuse x seed 1 x 16-shot x 77.18%
+StanfordCars x ProtoFuse x seed 10 x 16-shot x 76.91%
+StanfordCars x ProtoFuse x seed 100 x 16-shot x 77.59%
+StanfordCars x ProtoFuse x seed 1000 x 16-shot x 77.01%
+StanfordCars x ProtoFuse x seed 10000 x 16-shot x 76.91%
+
+StanfordCars x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     63.86% +/- 1.11%  0.264 +/- 0.050
+2-shot   5     66.69% +/- 0.70%  0.184 +/- 0.061
+4-shot   5     70.26% +/- 0.51%  0.344 +/- 0.084
+8-shot   5     74.15% +/- 0.57%  0.530 +/- 0.075
+16-shot  5     77.12% +/- 0.26%  0.590 +/- 0.054
+
+CUB-200-2011 x ProtoFuse x seed 1 x 1-shot x 56.70%
+CUB-200-2011 x ProtoFuse x seed 10 x 1-shot x 59.25%
+CUB-200-2011 x ProtoFuse x seed 100 x 1-shot x 58.47%
+CUB-200-2011 x ProtoFuse x seed 1000 x 1-shot x 59.25%
+CUB-200-2011 x ProtoFuse x seed 10000 x 1-shot x 58.70%
+CUB-200-2011 x ProtoFuse x seed 1 x 2-shot x 59.61%
+CUB-200-2011 x ProtoFuse x seed 10 x 2-shot x 59.06%
+CUB-200-2011 x ProtoFuse x seed 100 x 2-shot x 59.98%
+CUB-200-2011 x ProtoFuse x seed 1000 x 2-shot x 62.01%
+CUB-200-2011 x ProtoFuse x seed 10000 x 2-shot x 63.20%
+CUB-200-2011 x ProtoFuse x seed 1 x 4-shot x 67.26%
+CUB-200-2011 x ProtoFuse x seed 10 x 4-shot x 67.17%
+CUB-200-2011 x ProtoFuse x seed 100 x 4-shot x 67.24%
+CUB-200-2011 x ProtoFuse x seed 1000 x 4-shot x 68.47%
+CUB-200-2011 x ProtoFuse x seed 10000 x 4-shot x 68.54%
+CUB-200-2011 x ProtoFuse x seed 1 x 8-shot x 72.76%
+CUB-200-2011 x ProtoFuse x seed 10 x 8-shot x 73.66%
+CUB-200-2011 x ProtoFuse x seed 100 x 8-shot x 71.66%
+CUB-200-2011 x ProtoFuse x seed 1000 x 8-shot x 72.87%
+CUB-200-2011 x ProtoFuse x seed 10000 x 8-shot x 72.33%
+CUB-200-2011 x ProtoFuse x seed 1 x 16-shot x 76.35%
+CUB-200-2011 x ProtoFuse x seed 10 x 16-shot x 75.77%
+CUB-200-2011 x ProtoFuse x seed 100 x 16-shot x 75.08%
+CUB-200-2011 x ProtoFuse x seed 1000 x 16-shot x 75.80%
+CUB-200-2011 x ProtoFuse x seed 10000 x 16-shot x 75.58%
+
+CUB-200-2011 x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     58.47% +/- 0.94%  0.362 +/- 0.040
+2-shot   5     60.77% +/- 1.57%  0.250 +/- 0.126
+4-shot   5     67.74% +/- 0.63%  0.628 +/- 0.071
+8-shot   5     72.66% +/- 0.66%  0.696 +/- 0.027
+16-shot  5     75.72% +/- 0.41%  0.802 +/- 0.062
+
+Flowers102 x ProtoFuse x seed 1 x 1-shot x 80.11%
+Flowers102 x ProtoFuse x seed 10 x 1-shot x 79.86%
+Flowers102 x ProtoFuse x seed 100 x 1-shot x 80.19%
+Flowers102 x ProtoFuse x seed 1000 x 1-shot x 80.11%
+Flowers102 x ProtoFuse x seed 10000 x 1-shot x 80.51%
+Flowers102 x ProtoFuse x seed 1 x 2-shot x 88.71%
+Flowers102 x ProtoFuse x seed 10 x 2-shot x 88.88%
+Flowers102 x ProtoFuse x seed 100 x 2-shot x 88.63%
+Flowers102 x ProtoFuse x seed 1000 x 2-shot x 89.81%
+Flowers102 x ProtoFuse x seed 10000 x 2-shot x 85.87%
+Flowers102 x ProtoFuse x seed 1 x 4-shot x 91.88%
+Flowers102 x ProtoFuse x seed 10 x 4-shot x 93.18%
+Flowers102 x ProtoFuse x seed 100 x 4-shot x 93.02%
+Flowers102 x ProtoFuse x seed 1000 x 4-shot x 93.46%
+Flowers102 x ProtoFuse x seed 10000 x 4-shot x 93.67%
+Flowers102 x ProtoFuse x seed 1 x 8-shot x 93.91%
+Flowers102 x ProtoFuse x seed 10 x 8-shot x 95.53%
+Flowers102 x ProtoFuse x seed 100 x 8-shot x 94.19%
+Flowers102 x ProtoFuse x seed 1000 x 8-shot x 94.76%
+Flowers102 x ProtoFuse x seed 10000 x 8-shot x 94.19%
+Flowers102 x ProtoFuse x seed 1 x 16-shot x 95.33%
+Flowers102 x ProtoFuse x seed 10 x 16-shot x 95.74%
+Flowers102 x ProtoFuse x seed 100 x 16-shot x 96.22%
+Flowers102 x ProtoFuse x seed 1000 x 16-shot x 95.57%
+Flowers102 x ProtoFuse x seed 10000 x 16-shot x 95.33%
+
+Flowers102 x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     80.15% +/- 0.21%  0.366 +/- 0.026
+2-shot   5     88.38% +/- 1.32%  0.636 +/- 0.090
+4-shot   5     93.04% +/- 0.62%  0.752 +/- 0.059
+8-shot   5     94.52% +/- 0.58%  0.840 +/- 0.087
+16-shot  5     95.64% +/- 0.33%  0.872 +/- 0.053
+
+Food-101 x ProtoFuse x seed 1 x 1-shot x 84.63%
+Food-101 x ProtoFuse x seed 10 x 1-shot x 84.24%
+Food-101 x ProtoFuse x seed 100 x 1-shot x 85.16%
+Food-101 x ProtoFuse x seed 1000 x 1-shot x 82.48%
+Food-101 x ProtoFuse x seed 10000 x 1-shot x 84.92%
+Food-101 x ProtoFuse x seed 1 x 2-shot x 85.85%
+Food-101 x ProtoFuse x seed 10 x 2-shot x 85.72%
+Food-101 x ProtoFuse x seed 100 x 2-shot x 85.64%
+Food-101 x ProtoFuse x seed 1000 x 2-shot x 85.71%
+Food-101 x ProtoFuse x seed 10000 x 2-shot x 85.84%
+Food-101 x ProtoFuse x seed 1 x 4-shot x 85.91%
+Food-101 x ProtoFuse x seed 10 x 4-shot x 86.09%
+Food-101 x ProtoFuse x seed 100 x 4-shot x 85.59%
+Food-101 x ProtoFuse x seed 1000 x 4-shot x 86.26%
+Food-101 x ProtoFuse x seed 10000 x 4-shot x 86.33%
+Food-101 x ProtoFuse x seed 1 x 8-shot x 86.20%
+Food-101 x ProtoFuse x seed 10 x 8-shot x 86.16%
+Food-101 x ProtoFuse x seed 100 x 8-shot x 85.59%
+Food-101 x ProtoFuse x seed 1000 x 8-shot x 86.40%
+Food-101 x ProtoFuse x seed 10000 x 8-shot x 85.68%
+Food-101 x ProtoFuse x seed 1 x 16-shot x 86.43%
+Food-101 x ProtoFuse x seed 10 x 16-shot x 86.28%
+Food-101 x ProtoFuse x seed 100 x 16-shot x 86.53%
+Food-101 x ProtoFuse x seed 1000 x 16-shot x 86.76%
+Food-101 x ProtoFuse x seed 10000 x 16-shot x 86.68%
+
+Food-101 x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     84.28% +/- 0.96%  0.230 +/- 0.037
+2-shot   5     85.75% +/- 0.08%  0.034 +/- 0.016
+4-shot   5     86.04% +/- 0.27%  0.162 +/- 0.086
+8-shot   5     86.00% +/- 0.32%  0.150 +/- 0.124
+16-shot  5     86.54% +/- 0.17%  0.324 +/- 0.093
+
+OxfordPets x ProtoFuse x seed 1 x 1-shot x 90.46%
+OxfordPets x ProtoFuse x seed 10 x 1-shot x 89.40%
+OxfordPets x ProtoFuse x seed 100 x 1-shot x 89.18%
+OxfordPets x ProtoFuse x seed 1000 x 1-shot x 90.38%
+OxfordPets x ProtoFuse x seed 10000 x 1-shot x 89.51%
+OxfordPets x ProtoFuse x seed 1 x 2-shot x 90.08%
+OxfordPets x ProtoFuse x seed 10 x 2-shot x 90.27%
+OxfordPets x ProtoFuse x seed 100 x 2-shot x 89.23%
+OxfordPets x ProtoFuse x seed 1000 x 2-shot x 90.43%
+OxfordPets x ProtoFuse x seed 10000 x 2-shot x 90.46%
+OxfordPets x ProtoFuse x seed 1 x 4-shot x 89.86%
+OxfordPets x ProtoFuse x seed 10 x 4-shot x 90.81%
+OxfordPets x ProtoFuse x seed 100 x 4-shot x 90.11%
+OxfordPets x ProtoFuse x seed 1000 x 4-shot x 91.22%
+OxfordPets x ProtoFuse x seed 10000 x 4-shot x 88.93%
+OxfordPets x ProtoFuse x seed 1 x 8-shot x 92.10%
+OxfordPets x ProtoFuse x seed 10 x 8-shot x 91.77%
+OxfordPets x ProtoFuse x seed 100 x 8-shot x 91.09%
+OxfordPets x ProtoFuse x seed 1000 x 8-shot x 91.31%
+OxfordPets x ProtoFuse x seed 10000 x 8-shot x 90.92%
+OxfordPets x ProtoFuse x seed 1 x 16-shot x 92.10%
+OxfordPets x ProtoFuse x seed 10 x 16-shot x 91.82%
+OxfordPets x ProtoFuse x seed 100 x 16-shot x 92.61%
+OxfordPets x ProtoFuse x seed 1000 x 16-shot x 91.93%
+OxfordPets x ProtoFuse x seed 10000 x 16-shot x 91.71%
+
+OxfordPets x ProtoFuse x seed mean +/- std
+kshot    runs  acc               alpha          
+-------  ----  ----------------  ---------------
+1-shot   5     89.78% +/- 0.53%  0.122 +/- 0.028
+2-shot   5     90.10% +/- 0.45%  0.162 +/- 0.104
+4-shot   5     90.19% +/- 0.79%  0.332 +/- 0.130
+8-shot   5     91.44% +/- 0.44%  0.268 +/- 0.097
+16-shot  5     92.04% +/- 0.32%  0.334 +/- 0.067

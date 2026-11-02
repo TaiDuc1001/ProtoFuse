@@ -12,7 +12,7 @@ wheels/
 datasets
 !src/datasets/
 run.sh
-*.txt
+/*.txt
 models
 !src/models/
 outputs
