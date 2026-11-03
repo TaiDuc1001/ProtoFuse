@@ -31,6 +31,7 @@ from src.models.apt import CUSTOM_TEMPLATES
 from src.models.proto_adapter import ProtoAdapter
 from src.models.protofuse import ProtoFuse
 from src.models.timo import TIMO, _gda, _image_guide_text, _vec_sort
+from src.models.tarp import TARP
 from src.models.tip_adapter import TipAdapter
 from utils import (
     ConfigNode,
@@ -47,7 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "configs"
 KSHOTS = [1, 2, 4, 8, 16]
 SEEDS = [1, 10, 100, 1000, 10000]
-METHODS = ["zeroshot", "tip", "protoadapter", "ape", "timo", "protofuse"]
+METHODS = ["zeroshot", "tip", "protoadapter", "ape", "timo", "tarp", "protofuse"]
 MB = 1024.0 * 1024.0
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
@@ -86,6 +87,7 @@ def load_method_config(method, args, kshot, seed, dataset_root, dataset_name):
         "protoadapter": "proto_adapter",
         "ape": "ape",
         "timo": "timo",
+        "tarp": "tarp",
         "protofuse": "protofuse",
     }[method]
     config = load_config_file(CONFIG_DIR / f"{config_name}.yaml")
@@ -588,6 +590,66 @@ def run_timo(cfg, classnames, text_features, train_features, train_labels, devic
     return (*setup_metrics, logits_fn)
 
 
+def make_tarp_trainer(cfg, classnames, text_features, device):
+    trainer = TARP.__new__(TARP)
+    trainer.cfg = cfg
+    trainer.training_cfg = cfg.get("training", ConfigNode())
+    trainer.model_cfg = cfg.get("model", ConfigNode())
+    trainer.data_cfg = cfg.get("data", ConfigNode())
+    trainer.classnames = classnames
+    trainer.device = device
+    trainer.num_classes = len(classnames)
+    trainer.text_prior_tau = trainer._cfg_float(4.0, "model.text_prior_tau")
+    trainer.augment_epoch = trainer._cfg_int(10, "model.augment_epoch")
+    trainer.extra_text_shots = trainer._cfg_bool(True, "model.extra_text_shots")
+    scale_default = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0]
+    alpha_default = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    trainer.scale_list = trainer._cfg_float_list(scale_default, "model.scale_list")
+    trainer.alpha_list = [int(a) for a in trainer._cfg_float_list(alpha_default, "model.alpha_list")]
+    trainer.text_features = text_features.to(device).float()
+    trainer.clip_weights = text_features.to(device).float().t().contiguous()
+    trainer.train_vecs = None
+    trainer.train_labels = None
+    trainer.last_tarp_params = None
+    return trainer
+
+
+def run_tarp(cfg, classnames, text_features, train_features, train_labels, device):
+    trainer = make_tarp_trainer(cfg, classnames, text_features, device)
+
+    def setup():
+        support_features, support_labels = trainer.build_augmented_cache(
+            train_features, train_labels, text_prototypes=trainer.text_features
+        )
+        W_clip, class_means = trainer.compute_projection_and_prototypes(
+            support_features, support_labels, text_prototypes=trainer.text_features
+        )
+        best_scale, best_alpha1, best_alpha2, val_acc = trainer.tune_hyperparameters(
+            train_features, train_labels, W_clip, class_means, clip_weights=trainer.clip_weights
+        )
+        gamma = best_scale * (best_alpha2 / best_alpha1)
+        trainer.benchmark_state = SimpleNamespace(
+            W_clip=W_clip,
+            class_means=class_means,
+            gamma=gamma,
+            clip_weights=trainer.clip_weights,
+        )
+        return tensor_bytes(W_clip) + tensor_bytes(class_means)
+
+    setup_metrics = benchmark_setup(device, setup)
+
+    def logits_fn(features):
+        state = trainer.benchmark_state
+        feat = features.to(device).float()
+        fld = feat @ state.W_clip
+        dist = torch.cdist(fld, state.class_means)
+        fld_logits = 1.0 / (dist + 1e-6)
+        clip_logits = 100.0 * (feat @ state.clip_weights)
+        return clip_logits + state.gamma * fld_logits
+
+    return (*setup_metrics, logits_fn)
+
+
 def run_protofuse(
     cfg,
     classnames,
@@ -637,6 +699,7 @@ RUNNERS = {
     "protoadapter": run_proto_adapter,
     "ape": run_ape,
     "timo": run_timo,
+    "tarp": run_tarp,
     "protofuse": run_protofuse,
 }
 
@@ -663,6 +726,7 @@ def method_label(method):
         "protoadapter": "ProtoAdapter",
         "ape": "APE",
         "timo": "TIMO",
+        "tarp": "TARP",
         "protofuse": "ProtoFuse",
     }[method]
 

@@ -6,3 +6,4 @@ from .tip_adapter import TipAdapter
 from .ape import APE, APETrainingModule, SmoothCrossEntropy
 from .timo import TIMO
 from .proto_adapter import ProtoAdapter
+from .tarp import TARP
