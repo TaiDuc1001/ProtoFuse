@@ -7,3 +7,4 @@ from .ape import APEPipeline
 from .timo import TIMOPipeline, TIMOSPipeline
 from .proto_adapter import ProtoAdapterPipeline
 from .tarp import TARPPipeline
+from .cdps import CDPSPipeline

@@ -32,6 +32,7 @@ from src.models.proto_adapter import ProtoAdapter
 from src.models.protofuse import ProtoFuse
 from src.models.timo import TIMO, _gda, _image_guide_text, _vec_sort
 from src.models.tarp import TARP
+from src.models.cdps import CDPS, construct_cdps_feats
 from src.models.tip_adapter import TipAdapter
 from utils import (
     ConfigNode,
@@ -48,7 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "configs"
 KSHOTS = [1, 2, 4, 8, 16]
 SEEDS = [1, 10, 100, 1000, 10000]
-METHODS = ["zeroshot", "tip", "protoadapter", "ape", "timo", "tarp", "protofuse"]
+METHODS = ["zeroshot", "tip", "protoadapter", "ape", "timo", "tarp", "cdps", "protofuse"]
 MB = 1024.0 * 1024.0
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
@@ -88,6 +89,7 @@ def load_method_config(method, args, kshot, seed, dataset_root, dataset_name):
         "ape": "ape",
         "timo": "timo",
         "tarp": "tarp",
+        "cdps": "cdps",
         "protofuse": "protofuse",
     }[method]
     config = load_config_file(CONFIG_DIR / f"{config_name}.yaml")
@@ -650,6 +652,67 @@ def run_tarp(cfg, classnames, text_features, train_features, train_labels, devic
     return (*setup_metrics, logits_fn)
 
 
+def make_cdps_trainer(cfg, classnames, text_features, device):
+    trainer = CDPS.__new__(CDPS)
+    trainer.cfg = cfg
+    trainer.training_cfg = cfg.get("training", ConfigNode())
+    trainer.model_cfg = cfg.get("model", ConfigNode())
+    trainer.data_cfg = cfg.get("data", ConfigNode())
+    trainer.classnames = classnames
+    trainer.device = device
+    trainer.num_classes = len(classnames)
+    trainer.omega = trainer._cfg_float(0.1, "model.omega")
+    trainer.num_confuse = trainer._cfg_int(5, "model.num_confuse")
+    trainer.topk = trainer._cfg_int(20, "model.topk")
+    trainer.batch_size = trainer._cfg_int(32, "training.batch_size", "model.batch_size")
+    lambda_default = [round(float(v), 2) for v in np.arange(0.0, 1.05, 0.1)]
+    trainer.lambda_list = trainer._cfg_float_list(lambda_default, "model.lambda_list")
+    trainer.text_features = text_features.to(device).float()
+    trainer.clip_weights = text_features.to(device).float().t().contiguous()
+    trainer.cdps_feats = None
+    trainer.last_cdps_params = None
+    return trainer
+
+
+def run_cdps(cfg, classnames, text_features, train_features, train_labels, device):
+    trainer = make_cdps_trainer(cfg, classnames, text_features, device)
+
+    def setup():
+        topk = trainer.topk
+        mock_train_patches = [
+            train_features[i].unsqueeze(0).repeat(topk, 1).to(device)
+            for i in range(train_features.shape[0])
+        ]
+        cdps_feats = construct_cdps_feats(
+            mock_train_patches,
+            train_features,
+            len(classnames),
+            train_labels,
+            omega=trainer.omega,
+            num_confuse=trainer.num_confuse,
+            topk=topk,
+            device=device,
+        )
+        trainer.benchmark_state = SimpleNamespace(
+            cdps_feats=cdps_feats,
+            clip_weights=trainer.clip_weights,
+            best_lambda=0.5,
+        )
+        return tensor_bytes(cdps_feats)
+
+    setup_metrics = benchmark_setup(device, setup)
+
+    def logits_fn(features):
+        state = trainer.benchmark_state
+        feat = features.to(device).float()
+        text_probs = F.softmax(100.0 * (feat @ state.clip_weights), dim=-1)
+        sim = feat @ state.cdps_feats.mean(dim=1).t()
+        patch_probs = F.softmax(sim, dim=-1)
+        return state.best_lambda * text_probs + (1.0 - state.best_lambda) * patch_probs
+
+    return (*setup_metrics, logits_fn)
+
+
 def run_protofuse(
     cfg,
     classnames,
@@ -700,6 +763,7 @@ RUNNERS = {
     "ape": run_ape,
     "timo": run_timo,
     "tarp": run_tarp,
+    "cdps": run_cdps,
     "protofuse": run_protofuse,
 }
 
@@ -727,6 +791,7 @@ def method_label(method):
         "ape": "APE",
         "timo": "TIMO",
         "tarp": "TARP",
+        "cdps": "CDPS",
         "protofuse": "ProtoFuse",
     }[method]
 

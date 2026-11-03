@@ -3,3 +3,4 @@ uv run proto_adapter.py --config configs/proto_adapter_protofuse.yaml --data.all
 uv run ape.py --config configs/ape_protofuse.yaml --data.all True
 uv run timo.py --config configs/timo_protofuse.yaml --data.all True
 uv run tarp.py --config configs/tarp_protofuse.yaml --data.all True
+uv run cdps.py --config configs/cdps_protofuse.yaml --data.all True

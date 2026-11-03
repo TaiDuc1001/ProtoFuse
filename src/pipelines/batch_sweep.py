@@ -86,6 +86,7 @@ def _reset_trainer_for_run(pipeline, defaults, kshot, seed):
         "last_ape_params",
         "last_timo_params",
         "last_tarp_params",
+        "last_cdps_params",
         "benchmark_state",
     ):
         if hasattr(trainer, name):
