@@ -10,6 +10,7 @@ import pandas as pd
 from scipy.stats import wilcoxon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ablation"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils import (
@@ -40,11 +41,13 @@ METHOD_MAPPINGS = {
     "ProtoAdapter": "Proto-Adapter",
     "APE": "APE",
     "TIMO": "TIMO",
+    "TARP": "TARP",
     "ProtoFuse": "ProtoFuse",
     "TipAdapter+ProtoFuse": "Tip-Adapter (+ProtoFuse)",
     "ProtoAdapter+ProtoFuse": "Proto-Adapter (+ProtoFuse)",
     "APE+ProtoFuse": "APE (+ProtoFuse)",
     "TIMO+ProtoFuse": "TIMO (+ProtoFuse)",
+    "TARP+ProtoFuse": "TARP (+ProtoFuse)",
 }
 
 SHOTS = [1, 2, 4, 8, 16]
@@ -130,7 +133,7 @@ def generate_simulated_samples(means, stds):
 
 def compute_global_ocr_significance(active_datasets, baselines=None, alternative="greater"):
     if baselines is None:
-        baselines = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO"]
+        baselines = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP"]
         
     rows = []
     raw_p = []
@@ -205,7 +208,7 @@ def compute_global_ocr_significance(active_datasets, baselines=None, alternative
 
 def compute_global_ocr_plugin_significance(active_datasets, base_adapters=None, alternative="greater"):
     if base_adapters is None:
-        base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO"]
+        base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP"]
         
     rows = []
     raw_p = []
@@ -296,7 +299,7 @@ def print_accuracy_table(dataset_name):
         
     rows = []
     # Only standalone baselines and ProtoFuse
-    standalone_methods = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "ProtoFuse"]
+    standalone_methods = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP", "ProtoFuse"]
     for method in standalone_methods:
         if method not in dataset_data:
             continue
@@ -316,7 +319,7 @@ def print_plugin_accuracy_table(dataset_name):
         return
         
     rows = []
-    base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO"]
+    base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP"]
     for base in base_adapters:
         target = f"{base} (+ProtoFuse)"
         if base not in dataset_data or target not in dataset_data:
@@ -357,7 +360,7 @@ def format_latex_accuracy(dataset_name):
     lines.append(header)
     lines.append(r"\midrule")
     
-    standalone_methods = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "ProtoFuse"]
+    standalone_methods = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP", "ProtoFuse"]
     for method in standalone_methods:
         if method not in dataset_data:
             continue
@@ -391,7 +394,7 @@ def format_latex_plugin_accuracy(dataset_name):
     lines.append(header)
     lines.append(r"\midrule")
     
-    base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO"]
+    base_adapters = ["Tip-Adapter", "Proto-Adapter", "APE", "TIMO", "TARP"]
     for base in base_adapters:
         target = f"{base} (+ProtoFuse)"
         if base not in dataset_data or target not in dataset_data:

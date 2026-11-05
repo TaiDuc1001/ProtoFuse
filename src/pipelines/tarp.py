@@ -112,7 +112,7 @@ class TARPPipeline(PosthocProtoFuseMixin, BaseTrainingPipeline):
             test_features,
             test_labels,
             clip_weights=fused_clip_weights,
-            text_prototypes=fused_prototypes,
+            text_prototypes=None,
         )
         gap_to_tarp = metrics.get('accuracy', 0.0) - baseline_metrics.get('accuracy', 0.0)
         logger.info(
